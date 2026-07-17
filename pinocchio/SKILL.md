@@ -20,9 +20,10 @@ Read [references/protocol.md](references/protocol.md) before starting. Use its i
 
 ## Start
 
-1. Resolve the repository, leaf issue, approved artifact, base SHA, branch convention, authorities, coordinator task ID, and this task's exact ID.
-2. Register this task as `implementation` with the protocol command supplied by Gepetto.
-3. Confirm the worktree, branch, and leaf have no competing writer or overlapping delivery.
+1. Resolve the project, repository, leaf issue or PR, approved artifact, base SHA, branch convention, authorities, coordinator task ID, and this task's exact ID.
+2. Rename this task `<Project> - Pinocchio - <issue or PR>`.
+3. Register this task as `implementation` with the protocol command supplied by Gepetto.
+4. Confirm the worktree, branch, and leaf have no competing writer or overlapping delivery.
 
 ## Deliver
 

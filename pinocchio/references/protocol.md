@@ -1,6 +1,6 @@
 # Pinocchio delivery protocol
 
-Require the live leaf issue URL, approved research artifact, repository path, default branch and base SHA, branch convention, commit/push/PR and issue-update authority, coordinator task ID, and implementation task ID. Never copy the full research contract into chat.
+Require the project name, live leaf issue or PR URL, approved research artifact, repository path, default branch and base SHA, branch convention, commit/push/PR and issue-update authority, coordinator task ID, and implementation task ID. Use the canonical title `<Project> - Pinocchio - <issue or PR>`. Never copy the full research contract into chat.
 
 Register the task immediately after creation:
 
