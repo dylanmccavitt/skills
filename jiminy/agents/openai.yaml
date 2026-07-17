@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jiminy"
+  short_description: "Monitor Gepetto and merge approved pull requests"
+  default_prompt: "Use $jiminy to monitor the active Gepetto task and merge pull requests after every gate is green."
