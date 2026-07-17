@@ -7,7 +7,7 @@ Use these packets as contracts between app tasks. Keep values concrete; use `nul
 Include the project path, issue URL, current default-branch SHA, repository instructions, and `coordinatorThreadId` when Gepetto resolved it. Use this request:
 
 ```text
-You are a Gepetto research lane for <issue-url>. Work code-read-only. Refresh the live issue and repository first. Spawn researcher_<issue> to inspect the issue contract, relevant code/history, tests, dependencies, linked work, and conventions, then decide keep, split, clarify, or block. Issue-write authority is <persist|propose-only>. With persist authority, GitHub is the canonical output: preserve unrelated issue text and idempotently append or replace a `<!-- gepetto-research:start -->` … `<!-- gepetto-research:end -->` section containing the full readable research contract. For keep, clarify, or block, update the source issue. For split, search duplicates, create each leaf with its full contract, link it when supported, and update the parent with the decision and child URLs. Re-read every written issue and record its live URL and updatedAt. Do not edit code, create branches/PRs, or perform unrelated GitHub mutations. A chat-only packet is failure. Wait for the researcher and verify GitHub persistence. Send the RESEARCH_PACKET receipt to <coordinator-thread-id> when present and finish with the same receipt. Never search for the parent by title.
+You are a Gepetto research lane for <issue-url>. Work code-read-only. Refresh the live issue and repository first. Spawn researcher_<issue> to inspect the issue contract, relevant code/history, tests, dependencies, linked work, and conventions, then decide keep, split, clarify, or block. Issue-write authority is <persist|propose-only>. With persist authority, GitHub is the canonical output: preserve unrelated issue text and idempotently append or replace a `<!-- gepetto-research:start -->` … `<!-- gepetto-research:end -->` section containing the full readable research contract. For keep, clarify, or block, update the source issue. For split, search duplicates, create each leaf with its full contract, link it when supported, and update the parent with the decision and child URLs. Re-read every written issue and record its live URL and updatedAt. With propose-only authority, or when an attempted issue write is blocked, put the full contract in a uniquely named temporary Markdown file under `${TMPDIR:-/tmp}` and record its absolute path; a blocked persist attempt still has status blocked. Do not edit code, create branches/PRs, or perform unrelated GitHub mutations. A chat-only contract is failure. Wait for the researcher and verify the referenced artifact. Send only the compact RESEARCH_PACKET pointer receipt below to <coordinator-thread-id> when present and finish with exactly that receipt. Never paste the research contract, evidence, acceptance criteria, managed issue section, or temporary Markdown contents into chat. Never search for the parent by title.
 ```
 
 ## RESEARCH_PACKET
@@ -15,43 +15,21 @@ You are a Gepetto research lane for <issue-url>. Work code-read-only. Refresh th
 ```yaml
 RESEARCH_PACKET:
   issue_url: <live URL>
-  observed_issue_updated_at: <timestamp>
   repository: <owner/name>
   base_sha: <full SHA>
   issue_write_authority: persist|propose-only
   decision: keep|split|clarify|block
-  evidence:
-    - <file, issue, PR, test, or history fact>
-  problem_statement: <concise statement>
-  in_scope:
-    - <item>
-  out_of_scope:
-    - <item>
-  dependencies:
-    - <issue/PR/component or none>
-  leaf_issues:
-    - issue_url: <live URL when created or existing; null only for propose-only>
-      title: <leaf title>
-      purpose: <one independently reviewable result>
-      depends_on: <leaf title/ID or none>
-      acceptance_criteria:
-        - <observable criterion>
-      validation:
-        - <test or proof>
-  clarification_additions:
-    - <criterion/test/edge case/documentation need>
-  blockers:
-    - <missing fact or authority>
-  github_persistence:
+  artifact:
+    kind: github_issue|tmp_markdown
     status: persisted|propose-only|blocked
-    marker: gepetto-research
-    issues:
-      - issue_url: <raw live URL, not Markdown>
-        action: created|updated
+    marker: <gepetto-research for GitHub, null for temporary Markdown>
+    locations:
+      - issue_url: <raw live URL, present for a GitHub artifact>
         observed_updated_at: <timestamp after re-read>
+        path: <absolute path, present for a temporary Markdown artifact>
 ```
 
-For `keep`, return one leaf matching the existing issue. For `split`, return at least two non-overlapping leaves and create them when authorized. For `clarify`, update the existing issue with concrete clarification additions. For `block`, persist the blocker without inventing leaves. URLs in packets must be raw strings, not Markdown links. Gepetto may advance only when `github_persistence.status` is `persisted`, except in an explicitly analysis-only run.
+The full artifact, not this receipt, contains the problem statement, evidence, scope, dependencies, leaf specifications, acceptance criteria, validation, clarifications, and blockers. For `keep`, the artifact defines one leaf matching the existing issue. For `split`, it defines at least two non-overlapping leaves and the receipt lists every created/updated issue location. For `clarify`, update the existing issue with concrete clarification additions. For `block`, persist the blocker without inventing leaves. URLs in receipts must be raw strings, not Markdown links. Gepetto may advance only when `artifact.status` is `persisted`, except in an explicitly analysis-only run using a verified temporary Markdown artifact.
 
 ## Jiminy task prompt
 
@@ -71,10 +49,10 @@ When any watched task sends CHECKPOINT_CONTINUATION, replace the old task ID wit
 
 ## Implementation task prompt
 
-Include the actual leaf issue URL, approved research packet, project path, default branch, base SHA, branch convention, authority to commit/push/open one PR, and `coordinatorThreadId` when available. Use this request:
+Include the actual leaf issue URL, the approved research artifact URL or absolute temporary Markdown path, its compact receipt, project path, default branch, base SHA, branch convention, authority to commit/push/open one PR and update the leaf issue, and `coordinatorThreadId` when available. Do not embed the full research contract in the task prompt. Use this request:
 
 ```text
-You are the implementation lane for <leaf-issue-url>. Refresh remote and issue state. Spawn one internal implementor agent named puppet_<issue> as the sole writer for this worktree and branch. It must implement only this leaf, add proportionate tests, run repository checks, inspect the final diff, commit with repository convention, push without force, and open one linked PR. It must not merge or close the issue. Wait for the implementor, verify its diff, checks, and live PR, then produce IMPLEMENTATION_PACKET. If <coordinator-thread-id> is present, send the packet there with codex_app__send_message_to_thread. Finish with exactly the same packet.
+You are the implementation lane for <leaf-issue-url>. Refresh remote and issue state, then read the approved research contract directly from <research-artifact-url-or-absolute-path>; do not ask for or reproduce it inline. Spawn one internal implementor agent named puppet_<issue> as the sole writer for this worktree and branch. It must implement only this leaf, add proportionate tests, run repository checks, inspect the final diff, commit with repository convention, push without force, and open one linked PR. It must not merge or close the issue. Wait for the implementor and verify its diff, checks, and live PR. Then preserve unrelated issue text and idempotently append or replace a `<!-- gepetto-implementation:start -->` … `<!-- gepetto-implementation:end -->` section on the leaf issue containing the full implementation proof: branch/base/commit/head SHAs, PR URL, changed files, exact checks and results, criterion-by-criterion proof, and caveats. Re-read the issue and record its live URL and updatedAt. If the issue write is blocked, put that full proof in a uniquely named temporary Markdown file under `${TMPDIR:-/tmp}` and record its absolute path; persistence status remains blocked. Send only the compact IMPLEMENTATION_PACKET pointer receipt below to <coordinator-thread-id> when present and finish with exactly that receipt. Never paste changed-file lists, checks, acceptance proof, the managed issue section, or temporary Markdown contents into chat.
 ```
 
 ## IMPLEMENTATION_PACKET
@@ -83,23 +61,18 @@ You are the implementation lane for <leaf-issue-url>. Refresh remote and issue s
 IMPLEMENTATION_PACKET:
   issue_url: <live URL>
   task_role: puppet
-  branch: <head branch>
-  base_branch: <base branch>
-  base_sha: <full SHA used to begin>
-  commit_sha: <full final commit SHA>
   pr_url: <live URL>
   pr_head_sha: <full live PR head SHA>
-  changed_files:
-    - <path>
-  checks:
-    - command: <exact command>
-      result: pass|fail|blocked
-  acceptance_criteria:
-    - criterion: <criterion>
-      proof: <test, diff, or behavior>
-  caveats:
-    - <remaining caveat or none>
+  artifact:
+    kind: github_issue|tmp_markdown
+    status: persisted|blocked
+    marker: <gepetto-implementation for GitHub, null for temporary Markdown>
+    issue_url: <raw live URL, present for a GitHub artifact>
+    observed_updated_at: <timestamp after re-read, present for a GitHub artifact>
+    path: <absolute path, present for a temporary Markdown artifact>
 ```
+
+The full artifact, not this receipt, contains branch/base/commit/head SHAs, changed files, exact checks and results, criterion-by-criterion proof, and caveats. Gepetto may dispatch review only after re-reading a persisted GitHub artifact and independently verifying its live PR head SHA. A temporary Markdown artifact preserves blocked work but does not satisfy the implementation persistence gate.
 
 ## Review task prompt
 

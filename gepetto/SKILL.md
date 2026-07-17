@@ -16,7 +16,7 @@ Read [references/protocol.md](references/protocol.md) before creating a child ta
 - Create one app task per delivery lane. Each delivery task spawns its named internal agent and waits for it; Jiminy is the separate watchdog task.
 - Reuse a matching live task; never duplicate a role/issue/branch lane.
 - Keep one writer per branch and worktree. Implementation and reviewer fix work use separate project worktrees tied to the correct branch.
-- Pass `coordinatorThreadId` when uniquely resolved. Require every child task to send its packet to Gepetto and finish with the same packet; otherwise read the final packet directly.
+- Pass `coordinatorThreadId` when uniquely resolved. Require research and implementation tasks to send their compact artifact receipts to Gepetto and finish with the same receipt; reviewer tasks still send their review packet. Otherwise read the final response directly. Full research contracts and implementation proofs belong only in their referenced artifacts, never inline in task chat.
 - Bind review and CI proof to the exact PR head SHA. Any push invalidates both.
 - Treat `CHECKPOINT_CONTINUATION` as a task-ID replacement, not a new lane. Keep the source task unarchived, give its successor the lane's canonical title, update the ledger, and tell Jiminy the exact replacement ID.
 
@@ -33,13 +33,13 @@ Control flow: Gepetto launches Jiminy with the first research task; Gepetto then
 
 If Gepetto itself checkpoints, rename the source `<canonical title> - checkpoint <short source id>`, rename the successor to the canonical title, keep both tasks unarchived, and send Jiminy `CHECKPOINT_CONTINUATION role=gepetto` with both exact IDs. Resume only after Jiminy is watching the successor.
 
-If the user requested analysis only, return the issue map without tracker mutations. End-to-end Gepetto authority includes creating leaf issues, updating issue bodies with research contracts, and delegating merge approval and execution to Jiminy; pass issue-write authority to research lanes and merge authority to Jiminy. Do not invent a monitoring-only restriction from the absence of the literal word “merge,” and do not require a second user instruction after Jiminy approves the PR. Only an explicit user restriction removes Jiminy's merge authority.
+If the user requested analysis only, return the issue map without tracker mutations. End-to-end Gepetto authority includes creating leaf issues, updating issue bodies with managed research contracts and implementation proofs, and delegating merge approval and execution to Jiminy; pass the corresponding issue-write authority to research and implementation lanes and merge authority to Jiminy. Do not invent a monitoring-only restriction from the absence of the literal word “merge,” and do not require a second user instruction after Jiminy approves the PR. Only an explicit user restriction removes Jiminy's merge authority.
 
 ## Phase 1: research
 
 When creating the first research task, create or reuse one dedicated Jiminy Codex app task in the same project's local environment. This is one dispatch step: Jiminy must be running no later than the first researcher. Pass the exact `coordinatorThreadId`, repository/issues, expected phase order, current child-task IDs, and merge-authority scope. Default that scope to every Gepetto-managed PR in this delivery and tell Jiminy to approve and merge ready PRs without waiting for a second user instruction. Use monitoring-only only when quoting the user's explicit restriction. Record `jiminyThreadId` in Gepetto's ledger.
 
-Create all required research tasks in the project's local environment. Each task must spawn `researcher_<issue>`, remain code-read-only, and return `RESEARCH_PACKET` with one evidence-backed decision. End-to-end research has authority to create and update GitHub issues but may not edit code, create branches/PRs, or perform unrelated GitHub mutations.
+Create all required research tasks in the project's local environment. Each task must spawn `researcher_<issue>`, remain code-read-only, persist one evidence-backed decision as an artifact, and return only a compact `RESEARCH_PACKET` receipt pointing to that artifact. End-to-end research has authority to create and update GitHub issues but may not edit code, create branches/PRs, or perform unrelated GitHub mutations.
 
 - `keep`: the issue is one reviewable leaf.
 - `split`: create ordered, non-overlapping leaf specifications.
@@ -51,13 +51,17 @@ The GitHub issue body is the canonical research artifact. Before returning, ever
 - `keep`, `clarify`, or `block`: update the source issue body with the full research contract.
 - `split`: create each justified leaf with its full contract, then update the parent with the decision and live child links.
 
-The chat `RESEARCH_PACKET` is only a receipt. It must include persistence status and the re-read issue URLs/timestamps. A chat-only packet is incomplete. Gepetto must re-read the issues and verify persisted content before implementation; only analysis-only `propose-only` runs may skip GitHub writes.
+When issue writes are explicitly `propose-only`, or an attempted write is blocked, write the full contract to a uniquely named temporary Markdown file and return its absolute path. A blocked write remains blocked for end-to-end delivery; the temporary file preserves the work but does not satisfy the GitHub persistence gate.
+
+The chat `RESEARCH_PACKET` is only a pointer receipt. It must include the decision, persistence status, and re-read issue URLs/timestamps or temporary Markdown path. Never copy the contract, evidence list, acceptance criteria, managed issue section, or Markdown file contents into chat. A chat-only packet is incomplete. Gepetto must re-read the referenced artifact and verify its content before implementation; only analysis-only `propose-only` runs may advance from a temporary Markdown artifact.
 
 ## Phase 2: implementation
 
-For every approved leaf, create a project worktree task from the correct base branch. Each task must spawn `puppet_<issue>` as the sole writer, implement only that leaf, test it, commit, push without force, open one linked PR, and return `IMPLEMENTATION_PACKET`.
+For every approved leaf, create a project worktree task from the correct base branch. Each task must spawn `puppet_<issue>` as the sole writer, implement only that leaf, test it, commit, push without force, open one linked PR, persist the full implementation proof in an idempotent `gepetto-implementation` section on the leaf issue, and return only a compact `IMPLEMENTATION_PACKET` pointer receipt. Preserve the issue's unrelated text and research section.
 
-Respect dependencies and use one leaf → one branch → one worktree → one PR. Verify each returned PR and live head SHA before review.
+If the leaf issue cannot be updated, write the full implementation proof to a uniquely named temporary Markdown file and return its absolute path. The chat receipt must never repeat changed-file lists, check output, acceptance-criteria proof, or the Markdown contents. A failed required issue write remains a blocked persistence gate even when the temporary file preserves the proof.
+
+Respect dependencies and use one leaf → one branch → one worktree → one PR. Re-read the referenced implementation artifact and verify the returned PR and live head SHA before review.
 
 ## Phase 3: review and fixes
 
