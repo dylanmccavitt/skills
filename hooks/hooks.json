@@ -1,0 +1,68 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "^compact$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 /Users/dylanmccavitt/projects/codex-orchestration-skills/hooks/orchestration_hook.py",
+            "timeout": 10,
+            "statusMessage": "Checking checkpoint policy"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 /Users/dylanmccavitt/projects/codex-orchestration-skills/hooks/orchestration_hook.py",
+            "timeout": 10,
+            "statusMessage": "Loading lane contract"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 /Users/dylanmccavitt/projects/codex-orchestration-skills/hooks/orchestration_hook.py",
+            "timeout": 10,
+            "statusMessage": "Checking lane receipt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 /Users/dylanmccavitt/projects/codex-orchestration-skills/hooks/orchestration_hook.py",
+            "timeout": 10,
+            "statusMessage": "Checking orchestration result"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|apply_patch|Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 /Users/dylanmccavitt/projects/codex-orchestration-skills/hooks/orchestration_hook.py",
+            "timeout": 10,
+            "statusMessage": "Checking orchestration guard"
+          }
+        ]
+      }
+    ]
+  }
+}

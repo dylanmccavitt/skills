@@ -1,4 +1,4 @@
 interface:
   display_name: "Gepetto"
   short_description: "Orchestrate issue research, delivery, and review"
-  default_prompt: "Use $gepetto to coordinate this issue from research through review-ready pull requests."
+  default_prompt: "Use $gepetto to coordinate this issue through research, implementation, review, and Jiminy completion."
