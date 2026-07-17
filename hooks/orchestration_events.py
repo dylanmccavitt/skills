@@ -25,7 +25,7 @@ AGENT_CONTRACTS = {
         "then return only RESEARCH_PACKET."
     ),
     "implementation": (
-        "Remain the sole writer. Deliver one leaf, branch, and PR; persist proof and return only "
+        "Use Pinocchio as the sole writer. Deliver one leaf, branch, and PR; persist proof and return only "
         "IMPLEMENTATION_PACKET."
     ),
     "reviewer": (

@@ -1,6 +1,6 @@
 ---
 name: gepetto
-description: Coordinate tracked repository work through separate research, implementation, review, and Jiminy watchdog tasks. Use only when the user invokes Gepetto or explicitly requests this orchestration.
+description: Coordinate tracked repository work through separate research, Pinocchio implementation, review, and Jiminy watchdog tasks. Use only when the user invokes Gepetto or explicitly requests this orchestration.
 ---
 
 # Gepetto
@@ -12,7 +12,7 @@ Read [references/protocol.md](references/protocol.md) before dispatching a task.
 ## Invariants
 
 - Refresh Git, GitHub, repository instructions, task state, and the current head before decisions.
-- Run research → approved leaf map → implementation → review → Jiminy.
+- Run research → approved leaf map → Pinocchio → review → Jiminy.
 - Use one app task per lane and reuse matching live tasks.
 - Keep one writer per branch and worktree.
 - Treat chat packets as pointers; reread their persisted artifacts.
@@ -33,7 +33,7 @@ Delivery authority includes issue persistence and Jiminy merge authority unless 
 
 1. Create all required research tasks. With the first researcher, create or reuse one Jiminy task and register every returned task ID before waiting.
 2. Verify every `RESEARCH_PACKET` against its artifact. Approve the leaf map only when all required research gates pass.
-3. Create one worktree implementation task per approved leaf; register it and verify its `IMPLEMENTATION_PACKET`, persisted proof, PR, and live head.
+3. Create one Pinocchio worktree task per approved leaf; register it as `implementation` and verify its `IMPLEMENTATION_PACKET`, persisted proof, PR, and live head.
 4. Create one reviewer worktree task per verified PR; register it and verify its final `REVIEW_PACKET` against the live head and CI.
 5. Correct drift through the owning task. Replace a task only when unusable.
 

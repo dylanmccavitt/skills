@@ -64,7 +64,7 @@ Create or reuse one project-local Codex app task when dispatching the first rese
 
 ```text
 Use $jiminy to watch Gepetto task <coordinator-thread-id> for <repository-and-issues>.
-Gepetto is the sole delivery orchestrator. Monitor its research → implementation → review → reviewer-owned-fixer sequence. Message Gepetto with exact corrections when work stalls or drifts; do not create or direct delivery agents yourself.
+Gepetto is the sole delivery orchestrator. Monitor its research → Pinocchio implementation → review → reviewer-owned-fixer sequence. Message Gepetto with exact corrections when work stalls or drifts; do not create or direct delivery agents yourself.
 Current child tasks: <task-ids-or-none>.
 
 Merge authority: every Gepetto-managed PR in this delivery. The user's request to use Gepetto grants this authority; do not wait for a second user instruction. After Gepetto sends JIMINY_READY, independently decide whether each PR is approved to merge. Merge every approved PR in dependency order. For any PR not approved, report the exact blocker to Gepetto.
@@ -76,30 +76,15 @@ When any watched task sends CHECKPOINT_CONTINUATION, replace the old task ID wit
 
 ## Implementation task prompt
 
-Include the actual leaf issue URL, the approved research artifact URL or absolute temporary Markdown path, its compact receipt, project path, default branch, base SHA, branch convention, authority to commit/push/open one PR and update the leaf issue, and `coordinatorThreadId` when available. Do not embed the full research contract in the task prompt. Use this request:
+Read [../../pinocchio/references/protocol.md](../../pinocchio/references/protocol.md) before dispatching. Include the actual leaf issue URL, approved research artifact URL or absolute temporary Markdown path, its compact receipt, project path, default branch, base SHA, branch convention, authority to commit/push/open one PR and update the leaf issue, and `coordinatorThreadId`. Do not embed the full research contract. Use this request:
 
 ```text
-You are the implementation lane for <leaf-issue-url>. Refresh remote and issue state, then read the approved research contract directly from <research-artifact-url-or-absolute-path>; do not ask for or reproduce it inline. Spawn one internal implementor agent named puppet_<issue> as the sole writer for this worktree and branch. It must implement only this leaf, add proportionate tests, run repository checks, inspect the final diff, commit with repository convention, push without force, and open one linked PR. It must not merge or close the issue. Wait for the implementor and verify its diff, checks, and live PR. Then preserve unrelated issue text and idempotently append or replace a `<!-- gepetto-implementation:start -->` … `<!-- gepetto-implementation:end -->` section on the leaf issue containing the full implementation proof: branch/base/commit/head SHAs, PR URL, changed files, exact checks and results, criterion-by-criterion proof, and caveats. Re-read the issue and record its live URL and updatedAt. If the issue write is blocked, put that full proof in a uniquely named temporary Markdown file under `${TMPDIR:-/tmp}` and record its absolute path; persistence status remains blocked. Send only the compact IMPLEMENTATION_PACKET pointer receipt below to <coordinator-thread-id> when present and finish with exactly that receipt. Never paste changed-file lists, checks, acceptance proof, the managed issue section, or temporary Markdown contents into chat.
+Use $pinocchio to deliver <leaf-issue-url> from the approved contract at <research-artifact-url-or-absolute-path>. Work in a dedicated worktree from <default-branch>@<base-sha>. You may commit, push without force, open one linked PR, and update the leaf issue; you may not merge or close it. Register this task as `implementation` under <coordinator-thread-id>, send the exact `IMPLEMENTATION_PACKET` there, and finish with the same receipt.
 ```
 
 ## IMPLEMENTATION_PACKET
 
-```yaml
-IMPLEMENTATION_PACKET:
-  issue_url: <live URL>
-  task_role: puppet
-  pr_url: <live URL>
-  pr_head_sha: <full live PR head SHA>
-  artifact:
-    kind: github_issue|tmp_markdown
-    status: persisted|blocked
-    marker: <gepetto-implementation for GitHub, null for temporary Markdown>
-    issue_url: <raw live URL, present for a GitHub artifact>
-    observed_updated_at: <timestamp after re-read, present for a GitHub artifact>
-    path: <absolute path, present for a temporary Markdown artifact>
-```
-
-The full artifact, not this receipt, contains branch/base/commit/head SHAs, changed files, exact checks and results, criterion-by-criterion proof, and caveats. Gepetto may dispatch review only after re-reading a persisted GitHub artifact and independently verifying its live PR head SHA. A temporary Markdown artifact preserves blocked work but does not satisfy the implementation persistence gate.
+Use Pinocchio's packet schema and gates exactly. Gepetto may dispatch review only after rereading the persisted artifact and independently verifying its live PR head SHA.
 
 ## Review task prompt
 

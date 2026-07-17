@@ -12,6 +12,8 @@ from pathlib import Path
 
 HOOK = Path(__file__).with_name("orchestration_hook.py")
 STATE = Path(__file__).with_name("orchestration_state.py")
+CONFIG = Path(__file__).with_name("hooks.json")
+PYTHON = "/opt/homebrew/bin/python3"
 SHA = "a" * 40
 
 
@@ -23,9 +25,20 @@ class OrchestrationHookTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_hook_config_pins_tested_python(self) -> None:
+        config = json.loads(CONFIG.read_text(encoding="utf-8"))
+        commands = [
+            hook["command"]
+            for entries in config["hooks"].values()
+            for entry in entries
+            for hook in entry["hooks"]
+        ]
+        self.assertTrue(commands)
+        self.assertTrue(all(command.startswith(f"{PYTHON} ") for command in commands))
+
     def register(self, role: str, *extra: str) -> None:
         subprocess.run(
-            ["python3", str(STATE), "register", "--session-id", "session-1", "--role", role, *extra],
+            [PYTHON, str(STATE), "register", "--session-id", "session-1", "--role", role, *extra],
             env=self.env,
             text=True,
             capture_output=True,
@@ -34,7 +47,7 @@ class OrchestrationHookTest(unittest.TestCase):
 
     def hook(self, event: str, **fields: object) -> dict[str, object] | None:
         result = subprocess.run(
-            ["python3", str(HOOK)],
+            [PYTHON, str(HOOK)],
             input=json.dumps({"session_id": "session-1", "hook_event_name": event, **fields}),
             env=self.env,
             text=True,
@@ -60,7 +73,7 @@ class OrchestrationHookTest(unittest.TestCase):
     def test_complete_disables_compaction_handoff(self) -> None:
         self.register("jiminy")
         subprocess.run(
-            ["python3", str(STATE), "complete", "--session-id", "session-1"],
+            [PYTHON, str(STATE), "complete", "--session-id", "session-1"],
             env=self.env,
             text=True,
             capture_output=True,
@@ -115,7 +128,7 @@ class OrchestrationHookTest(unittest.TestCase):
     def test_checkpoint_moves_active_role_state(self) -> None:
         self.register("review")
         subprocess.run(
-            ["python3", str(STATE), "continue", "--source-id", "session-1", "--successor-id", "session-2"],
+            [PYTHON, str(STATE), "continue", "--source-id", "session-1", "--successor-id", "session-2"],
             env=self.env,
             text=True,
             capture_output=True,
@@ -123,7 +136,7 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         self.assertIsNone(self.hook("SessionStart", source="compact"))
         result = subprocess.run(
-            ["python3", str(HOOK)],
+            [PYTHON, str(HOOK)],
             input=json.dumps({"session_id": "session-2", "hook_event_name": "SessionStart", "source": "compact"}),
             env=self.env,
             text=True,

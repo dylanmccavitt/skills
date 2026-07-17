@@ -1,8 +1,9 @@
 # Codex orchestration skills
 
-Source control for three locally installed Codex skills:
+Source control for four locally installed Codex skills:
 
 - `gepetto` — coordinates tracked repository delivery work
+- `pinocchio` — delivers one approved leaf as a verified pull request
 - `jiminy` — monitors Gepetto work and validates merge gates
 - `checkpoint` — continues long-running work in a fresh task
 

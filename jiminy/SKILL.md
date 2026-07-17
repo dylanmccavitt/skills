@@ -1,6 +1,6 @@
 ---
 name: jiminy
-description: Watch a live Gepetto delivery, detect phase or proof drift, validate exact-head merge gates, and merge only within recorded authority. Use when the user invokes Jiminy or Gepetto starts its watchdog.
+description: Watch a live Gepetto delivery across research, Pinocchio implementation, review, and merge; detect phase or proof drift, validate exact-head merge gates, and merge only within recorded authority. Use when the user invokes Jiminy or Gepetto starts its watchdog.
 ---
 
 # Jiminy
@@ -20,10 +20,11 @@ Read [references/runtime-state.md](references/runtime-state.md) when attaching. 
 On every wake or state change:
 
 1. Refresh Gepetto, its lanes, each PR head, checks, approvals, mergeability, and required conversations.
-2. Enforce research → implementation → review → serial fixer → fresh review.
-3. Treat proof from an earlier SHA as stale.
-4. Log only new facts or actions.
-5. Send Gepetto one exact correction when a gate stalls or drifts; do not direct lane tasks.
+2. Enforce research → Pinocchio implementation → review → serial fixer → fresh review.
+3. Require Pinocchio's persisted implementation artifact and writer handoff before review.
+4. Treat proof from an earlier SHA as stale.
+5. Log only new facts or actions.
+6. Send Gepetto one exact correction when a gate stalls or drifts; do not direct lane tasks.
 
 On `CHECKPOINT_CONTINUATION`, replace the watched ID, preserve the role title and log, leave both tasks unarchived, and acknowledge the successor.
 
