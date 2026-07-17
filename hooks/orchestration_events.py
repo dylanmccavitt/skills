@@ -100,7 +100,7 @@ def session_start(context: HookContext) -> HookResult:
         return None
     return additional_context(
         "SessionStart",
-        f"This {context.role} task was compacted. Use $checkpoint-handoff now. "
+        f"This {context.role} task was compacted. Use $checkpoint now. "
         "Preserve the registered role and task relationships; leave both tasks unarchived.",
     )
 

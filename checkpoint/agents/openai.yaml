@@ -1,0 +1,4 @@
+interface:
+  display_name: "Checkpoint"
+  short_description: "Continue compacted work without archiving"
+  default_prompt: "Use $checkpoint to continue this task in a fresh, correctly named Codex task without archiving either task."

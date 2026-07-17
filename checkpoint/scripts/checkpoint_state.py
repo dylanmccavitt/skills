@@ -14,5 +14,5 @@ if __name__ == "__main__":
         raise SystemExit(checkpoint_hook())
     if command in {"hook-precompact", "hook-stop"}:
         raise SystemExit(0)
-    print("checkpoint-handoff: retired command", file=sys.stderr)
+    print("checkpoint: retired command", file=sys.stderr)
     raise SystemExit(1)
