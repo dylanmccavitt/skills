@@ -54,7 +54,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.register("gepetto")
         result = self.hook("SessionStart", source="compact")
         context = result["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("$checkpoint-handoff", context)
+        self.assertIn("$checkpoint", context)
         self.assertIn("gepetto", context)
 
     def test_complete_disables_compaction_handoff(self) -> None:

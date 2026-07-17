@@ -47,7 +47,7 @@ class CheckpointHookTest(unittest.TestCase):
     def test_compaction_requests_minimal_unarchived_handoff(self) -> None:
         self.register()
         output = self.run_hook("compact").stdout
-        self.assertIn("$checkpoint-handoff", output)
+        self.assertIn("$checkpoint", output)
         self.assertIn("gepetto", output)
         self.assertIn("unarchived", output)
 

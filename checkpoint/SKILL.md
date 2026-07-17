@@ -1,9 +1,9 @@
 ---
-name: checkpoint-handoff
+name: checkpoint
 description: Continue long-running work in a fresh Codex task after compaction or an explicit checkpoint request. Preserve the live checkout, task role, and exact next action without archiving either task.
 ---
 
-# Checkpoint Handoff
+# Checkpoint
 
 Create one fresh task with `create_thread`; never fork. Keep the handoff small.
 
