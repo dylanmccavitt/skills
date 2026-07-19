@@ -2,6 +2,19 @@
 
 Use these packets as contracts between app tasks. Keep values concrete; use `null` only when the fact is genuinely unavailable. Never report a proposed URL, branch, task ID, or SHA as live.
 
+## Machine-readable flow
+
+[`workflow.json`](workflow.json) is the canonical machine-readable topology for this protocol. Validate it with `python3 hooks/orchestration_graph.py` from the repository root before dispatch. The skills remain the behavioral contracts for active tasks; the graph only records nodes, events, guards, invalidation routes, and terminal states.
+
+Maintain each live lane's current node, prior node as `resume_node` when blocked, review/fix cycle count, and last accepted packet/head in Gepetto's ledger. Apply these graph events explicitly:
+
+- `MATERIAL_CONTRACT_CHANGED` returns the affected work to research.
+- `MATERIAL_BASE_CHANGED` returns it to Pinocchio implementation.
+- `PR_HEAD_CHANGED` invalidates head-bound proof and requires fresh review.
+- `FLOW_BLOCKED` and `AUTHORITY_REQUIRED` preserve `resume_node`; resume only after the blocking fact or authority changes.
+- `REVIEW_FIX_LIMIT_EXCEEDED` enters `needs_decision` using the workflow policy limit.
+- `DELIVERY_CANCELLED` is terminal and does not imply destructive cleanup.
+
 Resolve `project_id` from the live Codex project list. Resolve completion scope from the user's request plus the current issue graph; stop for direction only when those conflict materially.
 
 ## Hook registration
@@ -94,6 +107,8 @@ Include the issue URL, PR URL, exact expected head SHA, repository instructions,
 You are the independent review lane for <pr-url>. Refresh the PR and stop if its live head differs from <expected-head-sha>. Spawn one internal reviewer agent named reviewer_<pr>. It must inspect the issue contract, diff, surrounding code, tests, security/reliability implications, and repository rules, binding findings to the exact head SHA. The reviewer owns repairs: for actionable findings, it spawns bounded fixer_<pr>_<finding-id> subagents serially on this PR branch, waits for and verifies each tested, pushed fix, then independently re-reviews the new head. Repeat until blocked or no actionable findings remain and required CI is green. Do not merge. Wait for the reviewer, verify its evidence, then produce REVIEW_PACKET. If <coordinator-thread-id> is present, send the packet there with codex_app__send_message_to_thread. Finish with exactly the same packet.
 ```
 
+Limit the complete review → fixer → fresh-review cycle to `policies.max_review_fix_cycles` from `workflow.json`. If the limit is reached with actionable findings remaining, set `ready_for_jiminy: false`, include `review_fix_limit_exceeded` in `blockers`, and return control to Gepetto for a user decision.
+
 ## REVIEW_PACKET
 
 ```yaml
@@ -151,3 +166,45 @@ JIMINY_READY:
 ```
 
 Every listed PR must have a verified persisted implementation artifact and a `REVIEW_PACKET` bound to `reviewed_head_sha`. Any false or unknown required gate keeps the PR out of merge-ready state and must be reported as a blocker.
+
+## JIMINY_INTEGRATION_FAILED
+
+```yaml
+JIMINY_INTEGRATION_FAILED:
+  coordinator_thread_id: <exact Gepetto task ID>
+  repository: <owner/name>
+  default_branch: <branch>
+  observed_head_sha: <full SHA>
+  expected_merge_commits:
+    - <full SHA>
+  failed_checks:
+    - name: <check or verification step>
+      result: failure|blocked
+      evidence: <live URL or exact command result>
+  remediation_required: true
+```
+
+This event creates a new remediation leaf. Jiminy never fixes the failure; Gepetto routes the leaf through the unchanged research → Pinocchio → review → Jiminy pipeline.
+
+## JIMINY_COMPLETE
+
+```yaml
+JIMINY_COMPLETE:
+  coordinator_thread_id: <exact Gepetto task ID>
+  repository: <owner/name>
+  default_branch: <branch>
+  verified_default_head_sha: <full SHA>
+  pull_requests:
+    - pr_url: <live URL>
+      state: MERGED
+      merge_commit_sha: <full SHA>
+  integration:
+    expected_merges_present: true
+    required_checks_green: true
+    linked_issues_verified: true
+    runtime_ready_for_completion: true
+  blockers: []
+  private_log_path: <absolute path>
+```
+
+Jiminy may send `JIMINY_COMPLETE` only when every integration field is true. `runtime_ready_for_completion` means every lane is terminal or safely handed off; Jiminy and Gepetto still complete only their own registrations after the packet. Worktree removal remains subject to separate cleanup authority and the repository hygiene rules, and is never forced.

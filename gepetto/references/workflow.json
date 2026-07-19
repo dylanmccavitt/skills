@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "workflow": "gepetto-delivery",
+  "initial_node": "research",
+  "policies": {
+    "max_review_fix_cycles": 3,
+    "one_writer_per_leaf": true,
+    "proof_bound_to_live_head": true
+  },
+  "nodes": {
+    "research": {"owner": "gepetto", "lane_role": "research"},
+    "implementation": {"owner": "pinocchio", "lane_role": "implementation", "fanout": "approved_leaves"},
+    "review": {"owner": "reviewer", "lane_role": "review", "fanout": "pull_requests"},
+    "fixer": {"owner": "reviewer", "lane_role": "fixer", "serial_per_pull_request": true},
+    "merge": {"owner": "jiminy", "lane_role": "jiminy", "dependency_ordered": true},
+    "integration_verification": {"owner": "jiminy", "lane_role": "jiminy"},
+    "blocked": {"owner": "gepetto", "resumable": true},
+    "needs_decision": {"owner": "gepetto", "resumable": true},
+    "cancelled": {"terminal": true},
+    "complete": {"terminal": true}
+  },
+  "transitions": [
+    {
+      "id": "research-approved",
+      "from": ["research"],
+      "event": "RESEARCH_PACKET",
+      "to": "implementation",
+      "all": [
+        {"path": "packet.artifact.status", "equals": "persisted"},
+        {"path": "packet.delivery_issue_urls", "non_empty": true}
+      ]
+    },
+    {
+      "id": "implementation-proved",
+      "from": ["implementation"],
+      "event": "IMPLEMENTATION_PACKET",
+      "to": "review",
+      "all": [
+        {"path": "packet.artifact.status", "equals": "persisted"},
+        {"path": "packet.pr_head_sha", "equals_path": "live.pr_head_sha"}
+      ]
+    },
+    {
+      "id": "review-found-issues",
+      "from": ["review"],
+      "event": "ACTIONABLE_FINDINGS",
+      "to": "fixer"
+    },
+    {
+      "id": "fix-pushed",
+      "from": ["fixer"],
+      "event": "FIX_PUSHED",
+      "to": "review"
+    },
+    {
+      "id": "review-approved",
+      "from": ["review"],
+      "event": "REVIEW_PACKET",
+      "to": "merge",
+      "all": [
+        {"path": "packet.ready_for_jiminy", "equals": true},
+        {"path": "packet.reviewed_head_sha", "equals_path": "live.pr_head_sha"}
+      ]
+    },
+    {
+      "id": "merge-set-verified",
+      "from": ["merge"],
+      "event": "MERGES_VERIFIED",
+      "to": "integration_verification"
+    },
+    {
+      "id": "integration-passed",
+      "from": ["integration_verification"],
+      "event": "JIMINY_COMPLETE",
+      "to": "complete",
+      "all": [
+        {"path": "verification.expected_merges_present", "equals": true},
+        {"path": "verification.required_checks_green", "equals": true},
+        {"path": "verification.linked_issues_verified", "equals": true},
+        {"path": "verification.runtime_ready_for_completion", "equals": true}
+      ]
+    },
+    {
+      "id": "integration-failed",
+      "from": ["integration_verification"],
+      "event": "JIMINY_INTEGRATION_FAILED",
+      "to": "research",
+      "set": {"research_mode": "remediation_leaf"}
+    },
+    {
+      "id": "contract-invalidated",
+      "from": ["implementation", "review", "fixer", "merge", "integration_verification"],
+      "event": "MATERIAL_CONTRACT_CHANGED",
+      "to": "research"
+    },
+    {
+      "id": "base-invalidated",
+      "from": ["review", "fixer", "merge"],
+      "event": "MATERIAL_BASE_CHANGED",
+      "to": "implementation"
+    },
+    {
+      "id": "head-invalidated",
+      "from": ["review", "merge"],
+      "event": "PR_HEAD_CHANGED",
+      "to": "review"
+    },
+    {
+      "id": "repair-limit-reached",
+      "from": ["review", "fixer"],
+      "event": "REVIEW_FIX_LIMIT_EXCEEDED",
+      "to": "needs_decision"
+    },
+    {
+      "id": "authority-required",
+      "from": ["research", "implementation", "review", "fixer", "merge", "integration_verification"],
+      "event": "AUTHORITY_REQUIRED",
+      "to": "needs_decision"
+    },
+    {
+      "id": "lane-blocked",
+      "from": ["research", "implementation", "review", "fixer", "merge", "integration_verification"],
+      "event": "FLOW_BLOCKED",
+      "to": "blocked"
+    },
+    {
+      "id": "resume",
+      "from": ["blocked", "needs_decision"],
+      "event": "RESUME_AUTHORIZED",
+      "to_path": "resume_node"
+    },
+    {
+      "id": "cancel",
+      "from": ["research", "implementation", "review", "fixer", "merge", "integration_verification", "blocked", "needs_decision"],
+      "event": "DELIVERY_CANCELLED",
+      "to": "cancelled"
+    }
+  ]
+}
