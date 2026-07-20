@@ -22,14 +22,14 @@ Resolve `project_id` from the live Codex project list. Resolve completion scope 
 Register the coordinator after resolving its exact task ID:
 
 ```bash
-python3 /Users/dylanmccavitt/projects/codex-orchestration-skills/hooks/orchestration_state.py register --session-id <gepetto-task-id> --role gepetto
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_state.py" register --session-id <gepetto-task-id> --role gepetto
 ```
 
 Immediately after `create_thread` returns, register each child before waiting or dispatching the next phase:
 
 ```bash
 # Add --merge-authorized only when Jiminy has that authority.
-python3 /Users/dylanmccavitt/projects/codex-orchestration-skills/hooks/orchestration_state.py register --session-id <task-id> --role <research|implementation|review|jiminy> --coordinator-thread-id <gepetto-task-id> [--merge-authorized]
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_state.py" register --session-id <task-id> --role <research|implementation|review|jiminy> --coordinator-thread-id <gepetto-task-id> [--merge-authorized]
 ```
 
 Registration activates role-aware compaction, subagent contracts, receipt checks, and merge guards. A registration failure blocks that lane; report it separately from delivery proof.
@@ -37,7 +37,7 @@ Registration activates role-aware compaction, subagent contracts, receipt checks
 After a terminal Gepetto or Jiminy result, disable its hooks:
 
 ```bash
-python3 /Users/dylanmccavitt/projects/codex-orchestration-skills/hooks/orchestration_state.py complete --session-id <task-id>
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_state.py" complete --session-id <task-id>
 ```
 
 ## Research task prompt
