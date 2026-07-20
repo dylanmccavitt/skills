@@ -7,6 +7,76 @@ Four skills in codex I have created for agent orchestration work. The orchestrat
 - `$jiminy` — supervisor, and pr manager - monitors the work and validates exact-head merge gates
 - `$checkpoint` — compaction - continues long-running work in a fresh Codex task. When a thread starts to exceed the context window, a checkpoint/handoff forms so work continues in a fresh thread, with the appropriate context needed for the next agent to kick off.
 
+<h2 align="center">Thread-driven agent graph</h2>
+
+<p align="center">
+  Each stage runs in a dedicated Codex thread with a focused responsibility.
+</p>
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <strong>Gepetto</strong><br>
+      <sub>Coordinates delivery</sub>
+    </td>
+    <td align="center">→</td>
+    <td align="center">
+      <strong>Research</strong><br>
+      <sub>Defines the work</sub>
+    </td>
+    <td align="center">→</td>
+    <td align="center">
+      <strong>Pinocchio</strong><br>
+      <sub>Implements one leaf</sub>
+    </td>
+  </tr>
+  <tr>
+    <td></td>
+    <td></td>
+    <td colspan="3" align="center">↓</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <strong>Complete</strong><br>
+      <sub>PR merged</sub>
+    </td>
+    <td align="center">←</td>
+    <td align="center">
+      <strong>Jiminy</strong><br>
+      <sub>Enforces merge gates</sub>
+    </td>
+    <td align="center">←</td>
+    <td align="center">
+      <strong>Review</strong><br>
+      <sub>Validates the exact head</sub>
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <sub>
+    Review findings return to the Pinocchio thread for repair, followed by a fresh review.
+  </sub>
+</p>
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <strong>Checkpoint</strong><br>
+      <sub>
+        Continues any active role in a fresh Codex thread after compaction.
+      </sub>
+    </td>
+  </tr>
+</table>
+
+<p>
+  Gepetto launches the research, implementation, review, and supervision threads,
+  supplies each thread with a focused contract, and routes structured results through
+  the graph. The orchestration happens through active Codex thread creation—not a
+  background automation or CI pipeline.
+</p>
+
 ## Install
 
 Run one of these commands:
