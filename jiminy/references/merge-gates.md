@@ -59,3 +59,16 @@ git fetch --prune
 ```
 
 Require `state: MERGED` and a merge commit before reporting success. Check every linked issue independently. Do not close an open issue without separate authority. Fast-forward a clean local default-branch checkout when safe; never disturb unrelated user changes.
+
+## Post-merge integration gate
+
+After every dependency-ordered PR is verified merged:
+
+1. Fetch the remote and resolve the current default-branch SHA.
+2. Verify every expected merge result is represented on the default branch; account for squash and rebase merges using the live merge commits rather than pre-merge ancestry assumptions.
+3. Refresh required default-branch CI and wait for a terminal result. Pending, missing, cancelled, timed-out, or action-required checks are not green.
+4. Verify the linked issue state for each PR independently. Do not close an issue without separate authority.
+5. Verify every delivery lane is terminal or safely handed off. Jiminy and Gepetto each complete only their own runtime registration after the final packet.
+6. Refresh only a clean default-branch checkout. Record worktrees eligible for cleanup, but do not remove them without separate cleanup authority.
+
+If any integration condition fails, send `JIMINY_INTEGRATION_FAILED` with the default-branch SHA and exact evidence. Remain read-only and active. Gepetto owns creation of a remediation leaf through research → Pinocchio → review → Jiminy. Send `JIMINY_COMPLETE` only after all integration fields in the coordination protocol are true.

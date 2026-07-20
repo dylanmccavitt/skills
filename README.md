@@ -22,5 +22,15 @@ git status
 Run the checkpoint handoff tests with:
 
 ```sh
-python3 -m unittest checkpoint/scripts/test_checkpoint_hook.py hooks/test_orchestration_hooks.py
+python3 -m unittest checkpoint/scripts/test_checkpoint_hook.py hooks/test_orchestration_hooks.py hooks/test_orchestration_graph.py
 ```
+
+Validate the machine-readable Gepetto delivery graph with:
+
+```sh
+python3 hooks/orchestration_graph.py
+```
+
+The graph at `gepetto/references/workflow.json` describes the existing task flow,
+guards, invalidation routes, and terminal states. It does not automate or replace
+the active Gepetto, Pinocchio, review, or Jiminy tasks.
