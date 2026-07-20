@@ -5,7 +5,7 @@ Require the project name, live leaf issue or PR URL, approved research artifact,
 Register the task immediately after creation:
 
 ```bash
-python3 /Users/dylanmccavitt/projects/codex-orchestration-skills/hooks/orchestration_state.py register --session-id <pinocchio-task-id> --role implementation --coordinator-thread-id <gepetto-task-id>
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_state.py" register --session-id <pinocchio-task-id> --role implementation --coordinator-thread-id <gepetto-task-id>
 ```
 
 ## Persisted proof

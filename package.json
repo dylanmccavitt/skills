@@ -1,0 +1,49 @@
+{
+  "name": "@dylanmccavitt/skills",
+  "version": "0.1.0",
+  "description": "Install the Gepetto, Pinocchio, Jiminy, and Checkpoint orchestration skills for Codex.",
+  "license": "MIT",
+  "author": "Dylan McCavitt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dylanmccavitt/skills.git"
+  },
+  "homepage": "https://github.com/dylanmccavitt/skills#readme",
+  "bugs": "https://github.com/dylanmccavitt/skills/issues",
+  "type": "module",
+  "bin": {
+    "skills": "bin/install.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin/",
+    "checkpoint/SKILL.md",
+    "checkpoint/agents/",
+    "checkpoint/scripts/checkpoint_hook.py",
+    "checkpoint/scripts/checkpoint_state.py",
+    "gepetto/",
+    "hooks/hooks.json",
+    "hooks/orchestration_events.py",
+    "hooks/orchestration_graph.py",
+    "hooks/orchestration_hook.py",
+    "hooks/orchestration_state.py",
+    "jiminy/",
+    "pinocchio/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs && python3 -m unittest checkpoint/scripts/test_checkpoint_hook.py hooks/test_orchestration_hooks.py hooks/test_orchestration_graph.py && python3 hooks/orchestration_graph.py",
+    "prepack": "npm test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "codex",
+    "codex-skills",
+    "orchestration"
+  ]
+}

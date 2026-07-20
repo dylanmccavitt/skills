@@ -13,7 +13,8 @@ from pathlib import Path
 HOOK = Path(__file__).with_name("orchestration_hook.py")
 STATE = Path(__file__).with_name("orchestration_state.py")
 CONFIG = Path(__file__).with_name("hooks.json")
-PYTHON = "/opt/homebrew/bin/python3"
+PYTHON = "python3"
+HOOK_COMMAND = '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_hook.py"'
 SHA = "a" * 40
 
 
@@ -25,7 +26,7 @@ class OrchestrationHookTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_hook_config_pins_tested_python(self) -> None:
+    def test_hook_config_uses_portable_codex_home(self) -> None:
         config = json.loads(CONFIG.read_text(encoding="utf-8"))
         commands = [
             hook["command"]
@@ -34,7 +35,7 @@ class OrchestrationHookTest(unittest.TestCase):
             for hook in entry["hooks"]
         ]
         self.assertTrue(commands)
-        self.assertTrue(all(command.startswith(f"{PYTHON} ") for command in commands))
+        self.assertTrue(all(command == HOOK_COMMAND for command in commands))
 
     def register(self, role: str, *extra: str) -> None:
         subprocess.run(
