@@ -123,6 +123,52 @@ Inspect the files that will be published:
 npm pack --dry-run
 ```
 
+### Releases
+
+Releases are tag-driven. A `vX.Y.Z` tag must point to a commit on `main` and
+must match the version in `package.json`. The release workflow tests and packs
+that exact commit, publishes it to npm through npm Trusted Publishing, and then
+creates the matching GitHub Release.
+
+The first publication needs a one-time bootstrap because the npm package does
+not exist yet:
+
+```sh
+npm login
+npm publish --access public
+npm trust github @dylanmccavitt/skills \
+  --file release.yml \
+  --repo dylanmccavitt/skills \
+  --allow-publish
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Run those commands from an up-to-date, clean `main` branch after this workflow
+has been merged. The initial `npm publish` creates the package; the trust command
+authorizes only `.github/workflows/release.yml` to publish later versions. The
+`v0.1.0` workflow run will recognize the existing npm version and create its
+GitHub Release without publishing it twice.
+
+For subsequent releases, update the package version in a pull request:
+
+```sh
+npm version patch --no-git-tag-version
+```
+
+After that pull request is merged, update `main`, tag the merge commit using the
+same version, and push the tag:
+
+```sh
+git switch main
+git pull --ff-only origin main
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+Pushing the tag is the public release action. Do not reuse or move a published
+release tag; publish a new package version instead.
+
 The machine-readable delivery graph at
 `gepetto/references/workflow.json` records task flow, guards, invalidation
 routes, and terminal states. Validate it directly with:
