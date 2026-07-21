@@ -14,7 +14,7 @@ HOOK = Path(__file__).with_name("orchestration_hook.py")
 STATE = Path(__file__).with_name("orchestration_state.py")
 CONFIG = Path(__file__).with_name("hooks.json")
 PYTHON = "python3"
-HOOK_COMMAND = '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_hook.py"'
+HOOK_COMMAND = '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py"'
 SHA = "a" * 40
 
 
@@ -70,6 +70,11 @@ class OrchestrationHookTest(unittest.TestCase):
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertIn("$checkpoint", context)
         self.assertIn("gepetto", context)
+        self.assertIn("unarchived", context)
+
+    def test_registered_non_compact_session_start_is_ignored(self) -> None:
+        self.register("gepetto")
+        self.assertIsNone(self.hook("SessionStart", source="startup"))
 
     def test_complete_disables_compaction_handoff(self) -> None:
         self.register("jiminy")
@@ -98,7 +103,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.register("review")
         self.hook("SubagentStart", agent_id="reviewer", agent_type="default")
         fixer = self.hook("SubagentStart", agent_id="fixer", agent_type="default")
-        self.assertIn("assigned finding", fixer["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("assigned fixes", fixer["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.hook("SubagentStop", agent_id="fixer", last_assistant_message="fixed", stop_hook_active=False), {})
 
     def test_lane_stop_requires_packet(self) -> None:
@@ -145,6 +150,73 @@ class OrchestrationHookTest(unittest.TestCase):
             check=True,
         )
         self.assertIn("review", result.stdout)
+
+    def state_command(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [PYTHON, str(STATE), *arguments],
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=check,
+        )
+
+    def test_read_only_roles_cannot_edit_or_write(self) -> None:
+        for role in ("gepetto", "jiminy", "research"):
+            self.register(role)
+            for tool in ("Edit", "Write"):
+                result = self.hook("PreToolUse", tool_name=tool, tool_input={"file_path": "/tmp/x", "content": "y"})
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny", (role, tool))
+
+    def test_implementation_can_edit_and_write(self) -> None:
+        self.register("implementation")
+        for tool in ("Edit", "Write"):
+            self.assertIsNone(self.hook("PreToolUse", tool_name=tool, tool_input={"file_path": "/tmp/x", "content": "y"}))
+
+    def test_api_merge_is_denied_even_for_authorized_jiminy(self) -> None:
+        self.register("jiminy", "--merge-authorized")
+        rest = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "gh api repos/o/r/pulls/1/merge -X PUT"})
+        self.assertEqual(rest["hookSpecificOutput"]["permissionDecision"], "deny")
+        graphql = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_input={"command": "gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'"},
+        )
+        self.assertEqual(graphql["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_non_merge_gh_api_is_allowed(self) -> None:
+        self.register("jiminy", "--merge-authorized")
+        self.assertIsNone(self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "gh api repos/o/r/pulls/1"}))
+
+    def test_ledger_set_deep_merges_and_show_round_trips(self) -> None:
+        self.register("gepetto")
+        self.state_command("ledger", "set", "--session-id", "session-1", "--lane", "lane-1", "--json", '{"role": "review", "gates": {"ci": "pending"}}')
+        self.state_command("ledger", "set", "--session-id", "session-1", "--lane", "lane-1", "--json", '{"gates": {"ci": "green"}, "node": "review"}')
+        shown = json.loads(self.state_command("ledger", "show", "--session-id", "session-1").stdout)
+        self.assertEqual(shown, {"lane-1": {"role": "review", "gates": {"ci": "green"}, "node": "review"}})
+
+    def test_ledger_show_without_ledger_prints_empty_object(self) -> None:
+        self.register("gepetto")
+        self.assertEqual(json.loads(self.state_command("ledger", "show", "--session-id", "session-1").stdout), {})
+
+    def test_ledger_set_requires_registered_session(self) -> None:
+        result = self.state_command("ledger", "set", "--session-id", "missing", "--lane", "lane-1", "--json", "{}", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing", result.stderr)
+
+    def test_ledger_survives_checkpoint_continuation(self) -> None:
+        self.register("gepetto")
+        self.state_command("ledger", "set", "--session-id", "session-1", "--lane", "lane-1", "--json", '{"node": "review"}')
+        self.state_command("continue", "--source-id", "session-1", "--successor-id", "session-2")
+        shown = json.loads(self.state_command("ledger", "show", "--session-id", "session-2").stdout)
+        self.assertEqual(shown, {"lane-1": {"node": "review"}})
+
+    def test_status_lists_sessions(self) -> None:
+        self.register("gepetto")
+        self.state_command("register", "--session-id", "session-2", "--role", "review", "--coordinator-thread-id", "session-1")
+        self.state_command("complete", "--session-id", "session-2")
+        lines = self.state_command("status").stdout.splitlines()
+        self.assertIn("session-1 role=gepetto active=true coordinator=-", lines)
+        self.assertIn("session-2 role=review active=false coordinator=session-1", lines)
 
     def test_merge_requires_authorized_jiminy_and_bound_head(self) -> None:
         self.register("gepetto")

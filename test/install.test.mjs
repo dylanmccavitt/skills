@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { installSuite } from "../bin/install.mjs";
+import { doctorSuite, installSuite, uninstallSuite } from "../bin/install.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -90,4 +90,62 @@ test("refuses to replace symlinked hook configuration", () => {
     () => installSuite({ codexHome, sourceRoot: repositoryRoot }),
     /Refusing to replace symlinked hook configuration/,
   );
+});
+
+test("uninstall removes managed pieces and preserves foreign entries", () => {
+  const codexHome = temporaryCodexHome();
+  const hooksPath = join(codexHome, "hooks.json");
+  writeFileSync(hooksPath, `${JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "existing" }] }] } })}\n`);
+  installSuite({ codexHome, sourceRoot: repositoryRoot });
+  const foreignLink = join(codexHome, "skills", "other-skill");
+  symlinkSync(join(codexHome, "elsewhere"), foreignLink);
+
+  const result = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
+
+  assert.equal(result.removed.length > 0, true);
+  for (const skill of ["gepetto", "pinocchio", "jiminy", "checkpoint"]) {
+    assert.equal(existsSync(join(codexHome, "skills", skill)), false);
+  }
+  assert.equal(lstatSync(foreignLink).isSymbolicLink(), true);
+  assert.equal(existsSync(join(codexHome, "orchestration-skills")), false);
+  const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
+  assert.deepEqual(hooks.hooks.Stop, [{ hooks: [{ type: "command", command: "existing" }] }]);
+  assert.equal(hooks.hooks.SessionStart, undefined);
+  assert.equal(hooks.hooks.PreToolUse, undefined);
+});
+
+test("uninstall on an empty home is a no-op", () => {
+  const codexHome = temporaryCodexHome();
+  const result = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
+  assert.deepEqual(result.removed, []);
+});
+
+test("uninstall refuses an unmanaged install directory", () => {
+  const codexHome = temporaryCodexHome();
+  mkdirSync(join(codexHome, "orchestration-skills"), { recursive: true });
+  assert.throws(
+    () => uninstallSuite({ codexHome, sourceRoot: repositoryRoot }),
+    /Refusing to remove unmanaged directory/,
+  );
+});
+
+test("doctor passes on a fresh install", () => {
+  const codexHome = temporaryCodexHome();
+  installSuite({ codexHome, sourceRoot: repositoryRoot });
+  const result = doctorSuite({ codexHome, sourceRoot: repositoryRoot });
+  assert.equal(result.ok, true, JSON.stringify(result.problems));
+  assert.equal(result.problems.length, 0);
+});
+
+test("doctor reports tampered installs and missing installs", () => {
+  const codexHome = temporaryCodexHome();
+  const missing = doctorSuite({ codexHome, sourceRoot: repositoryRoot });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.problems.length > 0, true);
+
+  installSuite({ codexHome, sourceRoot: repositoryRoot });
+  writeFileSync(join(codexHome, "hooks.json"), "{\"hooks\":{}}\n");
+  const tampered = doctorSuite({ codexHome, sourceRoot: repositoryRoot });
+  assert.equal(tampered.ok, false);
+  assert.equal(tampered.problems.some((problem) => problem.includes("hook entr")), true);
 });

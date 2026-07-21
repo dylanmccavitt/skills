@@ -5,7 +5,9 @@
   "policies": {
     "max_review_fix_cycles": 3,
     "one_writer_per_leaf": true,
-    "proof_bound_to_live_head": true
+    "proof_bound_to_live_head": true,
+    "inline_research": "single_leaf_keep",
+    "packet_authoritative_when_head_matches": true
   },
   "nodes": {
     "research": {"owner": "gepetto", "lane_role": "research"},

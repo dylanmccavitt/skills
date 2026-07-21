@@ -1,4 +1,4 @@
 interface:
   display_name: "Jiminy"
-  short_description: "Watch Gepetto, Pinocchio, and exact-head merge gates"
-  default_prompt: "Use $jiminy to monitor the active Gepetto task and merge pull requests after every gate is green."
+  short_description: "Merge Gepetto-verified PRs behind exact-head gates"
+  default_prompt: "Use $jiminy to execute this delivery's JIMINY_READY merge set after every gate is green on the live heads."

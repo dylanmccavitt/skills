@@ -175,8 +175,135 @@ export function installSuite({ codexHome, sourceRoot = packageRoot } = {}) {
   return { codexHome: resolvedHome, installRoot, skills: SKILLS };
 }
 
+function resolveCodexHome(codexHome) {
+  return resolve(codexHome || process.env.CODEX_HOME || join(homedir(), ".codex"));
+}
+
+function managedHookEntries(sourceRoot) {
+  return readJson(join(sourceRoot, "hooks", "hooks.json")).hooks;
+}
+
+export function uninstallSuite({ codexHome, sourceRoot = packageRoot } = {}) {
+  const resolvedHome = resolveCodexHome(codexHome);
+  const installRoot = join(resolvedHome, "orchestration-skills");
+  const skillsRoot = join(resolvedHome, "skills");
+  const hooksPath = join(resolvedHome, "hooks.json");
+  const removed = [];
+
+  for (const skill of SKILLS) {
+    const linkPath = join(skillsRoot, skill);
+    if (managedLink(linkPath, join(installRoot, skill))) {
+      rmSync(linkPath);
+      removed.push(linkPath);
+    }
+  }
+
+  if (pathExists(installRoot)) {
+    const markerPath = join(installRoot, ".codex-orchestration-install.json");
+    if (!pathExists(markerPath) || readJson(markerPath).package !== PACKAGE_NAME) {
+      throw new Error(`Refusing to remove unmanaged directory: ${installRoot}`);
+    }
+    rmSync(installRoot, { recursive: true });
+    removed.push(installRoot);
+  }
+
+  if (pathExists(hooksPath)) {
+    const config = parseExistingHooks(hooksPath);
+    const managed = managedHookEntries(sourceRoot);
+    let changed = false;
+    for (const [event, entries] of Object.entries(managed)) {
+      if (!Array.isArray(config.hooks[event])) continue;
+      const serialized = new Set(entries.map((entry) => JSON.stringify(entry)));
+      const kept = config.hooks[event].filter((entry) => !serialized.has(JSON.stringify(entry)));
+      if (kept.length !== config.hooks[event].length) {
+        changed = true;
+        if (kept.length > 0) config.hooks[event] = kept;
+        else delete config.hooks[event];
+      }
+    }
+    if (changed) {
+      writeHooks(hooksPath, config);
+      removed.push(`managed hook entries in ${hooksPath}`);
+    }
+  }
+
+  return { codexHome: resolvedHome, removed };
+}
+
+export function doctorSuite({ codexHome, sourceRoot = packageRoot } = {}) {
+  const resolvedHome = resolveCodexHome(codexHome);
+  const installRoot = join(resolvedHome, "orchestration-skills");
+  const hooksPath = join(resolvedHome, "hooks.json");
+  const checks = [];
+  const check = (name, ok, detail) => checks.push({ name, ok, detail: ok ? "ok" : detail });
+
+  try {
+    shellPythonAvailable();
+    check("python3", true);
+  } catch (error) {
+    check("python3", false, error.message);
+  }
+
+  const markerPath = join(installRoot, ".codex-orchestration-install.json");
+  if (!pathExists(installRoot)) {
+    check("install directory", false, `missing: ${installRoot}`);
+  } else if (!pathExists(markerPath)) {
+    check("install directory", false, `missing marker: ${markerPath}`);
+  } else {
+    let marker;
+    try {
+      marker = readJson(markerPath);
+    } catch {
+      marker = null;
+    }
+    check(
+      "install directory",
+      marker?.package === PACKAGE_NAME,
+      `marker does not match ${PACKAGE_NAME}: ${markerPath}`,
+    );
+  }
+
+  for (const skill of SKILLS) {
+    const linkPath = join(resolvedHome, "skills", skill);
+    check(
+      `skill link ${skill}`,
+      managedLink(linkPath, join(installRoot, skill)),
+      `missing or unmanaged symlink: ${linkPath}`,
+    );
+  }
+
+  if (!pathExists(hooksPath)) {
+    check("hook configuration", false, `missing: ${hooksPath}`);
+  } else if (lstatSync(hooksPath).isSymbolicLink()) {
+    check("hook configuration", false, `symlinked: ${hooksPath}`);
+  } else {
+    let config = null;
+    try {
+      config = readJson(hooksPath);
+    } catch {
+      check("hook configuration", false, `unparseable JSON: ${hooksPath}`);
+    }
+    if (config) {
+      check("hook configuration", true);
+      const managed = managedHookEntries(sourceRoot);
+      for (const [event, entries] of Object.entries(managed)) {
+        const current = Array.isArray(config.hooks?.[event]) ? config.hooks[event] : [];
+        const serialized = new Set(current.map((entry) => JSON.stringify(entry)));
+        check(
+          `hook entries ${event}`,
+          entries.every((entry) => serialized.has(JSON.stringify(entry))),
+          `managed entry missing for ${event}: ${hooksPath}`,
+        );
+      }
+    }
+  }
+
+  const problems = checks.filter((entry) => !entry.ok).map((entry) => `${entry.name}: ${entry.detail}`);
+  return { ok: problems.length === 0, problems, checks };
+}
+
 function parseArguments(arguments_) {
-  const options = {};
+  const options = { command: "install" };
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--codex-home") {
@@ -186,6 +313,8 @@ function parseArguments(arguments_) {
       index += 1;
     } else if (argument === "--help" || argument === "-h") {
       options.help = true;
+    } else if (argument === "uninstall" || argument === "doctor") {
+      options.command = argument;
     } else {
       throw new Error(`Unknown argument: ${argument}`);
     }
@@ -194,7 +323,7 @@ function parseArguments(arguments_) {
 }
 
 function printHelp() {
-  console.log(`Install Codex orchestration skills\n\nUsage:\n  npx @dylanmccavitt/skills@latest [--codex-home PATH]\n`);
+  console.log(`Install Codex orchestration skills\n\nUsage:\n  npx @dylanmccavitt/skills@latest [uninstall|doctor] [--codex-home PATH]\n`);
 }
 
 async function main() {
@@ -202,6 +331,23 @@ async function main() {
     const options = parseArguments(process.argv.slice(2));
     if (options.help) {
       printHelp();
+      return;
+    }
+    if (options.command === "uninstall") {
+      const result = uninstallSuite(options);
+      console.log(
+        result.removed.length > 0
+          ? `Removed:\n${result.removed.map((entry) => `  ${entry}`).join("\n")}`
+          : `Nothing to remove in ${result.codexHome}.`,
+      );
+      return;
+    }
+    if (options.command === "doctor") {
+      const result = doctorSuite(options);
+      for (const entry of result.checks) {
+        console.log(`${entry.ok ? "ok" : "problem"} - ${entry.name}${entry.ok ? "" : `: ${entry.detail}`}`);
+      }
+      if (!result.ok) process.exitCode = 1;
       return;
     }
     const result = installSuite(options);

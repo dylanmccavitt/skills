@@ -5,7 +5,7 @@ Require the project name, live leaf issue or PR URL, approved research artifact,
 Register the task immediately after creation:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_state.py" register --session-id <pinocchio-task-id> --role implementation --coordinator-thread-id <gepetto-task-id>
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" register --session-id <pinocchio-task-id> --role implementation --coordinator-thread-id <gepetto-task-id>
 ```
 
 ## Persisted proof
@@ -31,4 +31,4 @@ IMPLEMENTATION_PACKET:
     path: <absolute path, present for a temporary Markdown artifact>
 ```
 
-Gepetto may dispatch review only after rereading a persisted GitHub artifact and independently confirming that its PR head equals `pr_head_sha`. Finish with only this receipt; never paste proof contents into chat.
+Persisting the proof remains mandatory. Gepetto dispatches review after confirming that the live PR head equals `pr_head_sha`; it rereads the artifact only at `JIMINY_READY` assembly or on drift. Finish with only this receipt; never paste proof contents into chat.
