@@ -6,7 +6,9 @@ Four Codex skills for agent orchestration. Coordinated Codex threads in the desk
 - `$pinocchio` — implementer - delivers one approved leaf as a verified pull request
 - `$jiminy` — merge-time gatekeeper - created at JIMINY_READY, re-validates exact-head merge gates on live heads, merges in dependency order, verifies integration
 - `$checkpoint` — compaction - continues long-running work in a fresh Codex thread with the context the successor needs
-- Supervision — mechanical liveness detection: hooks stamp heartbeats on every registered thread, a watchdog CLI classifies lanes, and Gepetto owns every restart
+- Context refs — stable instructions and artifacts are exact-byte SHA-256 references, so unchanged content is not repeatedly loaded into task context
+- State safety — process-locked CAS updates, crash-recoverable continuation journals, and atomic graph/ledger transitions prevent competing authoritative state
+- Supervision — mechanical liveness and pressure detection: hooks stamp heartbeats, measurable context/state pressure drives proactive checkpoints, and Gepetto owns every restart
 
 <h2 align="center">Thread-driven agent graph</h2>
 
@@ -96,6 +98,9 @@ directory, or a symlinked hook configuration. Resolve the reported conflict and
 rerun. Restart Codex or begin a new task after installation. To update, rerun
 the same command.
 
+The registry coordinates tasks under one user account; it is not a security
+boundary against other processes running as that user.
+
 ### Uninstall
 
 ```sh
@@ -182,7 +187,9 @@ python3 hooks/orchestration_graph.py
 
 The watchdog classifies registered lanes against the graph's supervision
 policies (healthy, stale, recycle, over-budget) and only reports; restarts stay
-with the coordinator. Check it with:
+with the coordinator. Measured context/state pressure drives recycling, while
+the event count remains a compatibility fallback when telemetry is absent.
+Check it with:
 
 ```sh
 python3 hooks/orchestration_watchdog.py check

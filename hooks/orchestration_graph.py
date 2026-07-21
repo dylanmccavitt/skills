@@ -66,7 +66,9 @@ def _lookup(context: dict[str, Any], path: str) -> Any:
     return value
 
 
-def _condition_passes(condition: dict[str, Any], context: dict[str, Any]) -> bool:
+def _condition_passes(
+    condition: dict[str, Any], context: dict[str, Any], policies: dict[str, Any]
+) -> bool:
     value = _lookup(context, condition["path"])
     if "equals" in condition:
         return value == condition["equals"]
@@ -74,6 +76,21 @@ def _condition_passes(condition: dict[str, Any], context: dict[str, Any]) -> boo
         return value == _lookup(context, condition["equals_path"])
     if condition.get("non_empty") is True:
         return bool(value)
+    if "less_than_policy" in condition:
+        limit = policies.get(condition["less_than_policy"])
+        return isinstance(value, (int, float)) and isinstance(limit, (int, float)) and value < limit
+    if "map_keys_equal_path" in condition:
+        expected = _lookup(context, condition["map_keys_equal_path"])
+        return (
+            isinstance(value, dict) and isinstance(expected, list)
+            and len(value) == len(expected) and set(value) == set(expected)
+        )
+    if condition.get("values_full_sha") is True:
+        return isinstance(value, dict) and all(
+            isinstance(item, str) and len(item) == 40
+            and all(character in "0123456789abcdefABCDEF" for character in item)
+            for item in value.values()
+        )
     raise ValueError(f"unsupported workflow condition: {condition}")
 
 
@@ -90,7 +107,10 @@ def eligible_transitions(
         for transition in workflow["transitions"]
         if current_node in transition["from"]
         and transition["event"] == event
-        and all(_condition_passes(condition, context) for condition in transition.get("all", []))
+        and all(
+            _condition_passes(condition, context, workflow.get("policies", {}))
+            for condition in transition.get("all", [])
+        )
     ]
 
 

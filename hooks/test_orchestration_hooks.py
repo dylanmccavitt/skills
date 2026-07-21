@@ -6,8 +6,12 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from hooks import orchestration_state
 
 
 HOOK = Path(__file__).with_name("orchestration_hook.py")
@@ -33,13 +37,21 @@ class OrchestrationHookTest(unittest.TestCase):
             for entries in config["hooks"].values()
             for entry in entries
             for hook in entry["hooks"]
+            if "orchestration_hook.py" in hook["command"]
         ]
         self.assertTrue(commands)
         self.assertTrue(all(command == HOOK_COMMAND for command in commands))
 
-    def register(self, role: str, *extra: str) -> None:
+    def register(self, role: str, *extra: str, session_id: str = "session-1") -> None:
+        if role != "gepetto" and "--coordinator-thread-id" not in extra:
+            coordinator = f"{session_id}-coordinator"
+            subprocess.run(
+                [PYTHON, str(STATE), "register", "--session-id", coordinator, "--role", "gepetto"],
+                env=self.env, text=True, capture_output=True, check=True,
+            )
+            extra = (*extra, "--coordinator-thread-id", coordinator)
         subprocess.run(
-            [PYTHON, str(STATE), "register", "--session-id", "session-1", "--role", role, *extra],
+            [PYTHON, str(STATE), "register", "--session-id", session_id, "--role", role, *extra],
             env=self.env,
             text=True,
             capture_output=True,
@@ -87,7 +99,7 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         self.assertIsNone(self.hook("SessionStart", source="compact"))
 
-    def test_research_subagent_must_return_receipt_once(self) -> None:
+    def test_research_subagent_does_not_duplicate_lane_receipt_enforcement(self) -> None:
         self.register("research")
         start = self.hook("SubagentStart", agent_id="agent-1", agent_type="default")
         context = start["hookSpecificOutput"]["additionalContext"]
@@ -95,9 +107,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertIn("issue create/update remains allowed", context)
         self.assertIn("split, consolidate", context)
         stop = self.hook("SubagentStop", agent_id="agent-1", agent_type="default", last_assistant_message="done", stop_hook_active=False)
-        self.assertEqual(stop["decision"], "block")
-        retry = self.hook("SubagentStop", agent_id="agent-1", agent_type="default", last_assistant_message="done", stop_hook_active=True)
-        self.assertEqual(retry, {})
+        self.assertEqual(stop, {})
 
     def test_review_nested_agent_is_a_fixer(self) -> None:
         self.register("review")
@@ -113,6 +123,58 @@ class OrchestrationHookTest(unittest.TestCase):
         allowed = self.hook("Stop", last_assistant_message="IMPLEMENTATION_PACKET:\n  pr_url: x", stop_hook_active=False)
         self.assertEqual(allowed, {})
         self.assertIsNone(self.hook("SessionStart", source="compact"))
+
+    def test_lane_stop_rejects_duplicate_packet_headers(self) -> None:
+        self.register("implementation")
+        duplicate = self.hook(
+            "Stop",
+            last_assistant_message=(
+                "IMPLEMENTATION_PACKET:\n  pr_url: first\n"
+                "IMPLEMENTATION_PACKET:\n  pr_url: repeated"
+            ),
+            stop_hook_active=False,
+        )
+        self.assertEqual(duplicate["decision"], "block")
+        recursive = self.hook(
+            "Stop",
+            last_assistant_message="IMPLEMENTATION_PACKET:\nIMPLEMENTATION_PACKET:",
+            stop_hook_active=True,
+        )
+        self.assertEqual(recursive, {})
+        self.assertTrue(self.session_state()["active"])
+
+    def test_jiminy_stop_requires_exactly_one_terminal_packet(self) -> None:
+        self.register("jiminy")
+        blocked = self.hook("Stop", last_assistant_message="done", stop_hook_active=False)
+        self.assertEqual(blocked["decision"], "block")
+        malformed = self.hook(
+            "Stop", last_assistant_message="JIMINY_COMPLETE:\n  blockers: []", stop_hook_active=False,
+        )
+        self.assertEqual(malformed["decision"], "block")
+        self.assertTrue(self.session_state()["active"])
+        allowed = self.hook(
+            "Stop", last_assistant_message=(
+                "JIMINY_COMPLETE:\n"
+                "  coordinator_thread_id: coordinator\n"
+                "  repository: owner/repo\n"
+                "  default_branch: main\n"
+                f"  verified_default_head_sha: {SHA}\n"
+                "  pull_requests: []\n"
+                "  integration:\n"
+                "    expected_merges_present: true\n"
+                "    required_checks_green: true\n"
+                "    linked_issues_verified: true\n"
+                "    runtime_ready_for_completion: true\n"
+                "  blockers: []\n"
+                "  private_log_path: /tmp/jiminy.log"
+            ), stop_hook_active=False,
+        )
+        self.assertEqual(allowed, {})
+        self.assertFalse(self.session_state()["active"])
+
+    def test_jiminy_subagent_start_does_not_inject_lane_contract(self) -> None:
+        self.register("jiminy")
+        self.assertIsNone(self.hook("SubagentStart", agent_id="helper", agent_type="default"))
 
     def test_force_push_is_denied(self) -> None:
         self.register("implementation")
@@ -130,6 +192,64 @@ class OrchestrationHookTest(unittest.TestCase):
         update = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "gh issue edit 42 --body-file contract.md"})
         self.assertIsNone(create)
         self.assertIsNone(update)
+
+    def test_child_cannot_mutate_coordinator_authority_through_state_cli(self) -> None:
+        self.register("implementation")
+        denied_commands = (
+            "python3 hooks/orchestration_state.py register --session-id fake --role gepetto",
+            "python3 hooks/orchestration_state.py register --session-id fake --role jiminy --merge-authorized",
+            "python3 hooks/orchestration_state.py complete --session-id session-1-coordinator",
+            "python3 hooks/orchestration_state.py continue --source-id session-1-coordinator --successor-id fake",
+            "python3 hooks/orchestration_state.py ledger set --session-id session-1-coordinator --lane x --json {}",
+            "python3 hooks/orchestration_state.py graph apply --session-id session-1-coordinator --lane x --current-node review --event ACTIONABLE_FINDINGS",
+        )
+        for command in denied_commands:
+            result = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": command})
+            self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny", command)
+        own_continue = self.hook(
+            "PreToolUse", tool_name="Bash",
+            tool_input={"command": "python3 hooks/orchestration_state.py continue --source-id session-1 --successor-id next"},
+        )
+        self.assertIsNone(own_continue)
+
+    def test_child_authority_guard_covers_python_module_invocations(self) -> None:
+        self.register("implementation")
+        denied = (
+            "python3 -m hooks.orchestration_state register --session-id fake --role gepetto",
+            "/usr/bin/python3 -m hooks.orchestration_state ledger show --session-id session-1-coordinator",
+            "python3.14 -m orchestration_state graph apply --session-id session-1-coordinator --lane x --current-node review --event ACTIONABLE_FINDINGS",
+        )
+        for command in denied:
+            result = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": command})
+            self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny", command)
+        own = self.hook(
+            "PreToolUse", tool_name="Bash",
+            tool_input={
+                "command": "python3 -m hooks.orchestration_state continue --source-id session-1 --successor-id next"
+            },
+        )
+        self.assertIsNone(own)
+
+    def test_child_authority_guard_tokenizes_quoted_and_chained_invocations(self) -> None:
+        self.register("implementation")
+        denied = (
+            "python3 -m 'hooks.orchestration_state' register --session-id fake --role gepetto",
+            "python3 'hooks/orchestration_state.py' register --session-id fake --role gepetto",
+            "echo safe&&/usr/bin/python3.14 -m 'hooks.orchestration_state' ledger show --session-id session-1-coordinator",
+            "python3 -m 'hooks.orchestration_state register --session-id fake --role gepetto",
+        )
+        for command in denied:
+            result = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": command})
+            self.assertEqual(
+                result["hookSpecificOutput"]["permissionDecision"], "deny", command
+            )
+        own = self.hook(
+            "PreToolUse", tool_name="Bash",
+            tool_input={
+                "command": "echo safe && python3 -m 'hooks.orchestration_state' continue --source-id session-1 --successor-id next"
+            },
+        )
+        self.assertIsNone(own)
 
     def test_checkpoint_moves_active_role_state(self) -> None:
         self.register("review")
@@ -161,10 +281,11 @@ class OrchestrationHookTest(unittest.TestCase):
         )
 
     def test_read_only_roles_cannot_edit_or_write(self) -> None:
-        for role in ("gepetto", "jiminy", "research"):
-            self.register(role)
+        for index, role in enumerate(("gepetto", "jiminy", "research"), start=1):
+            session_id = f"read-only-{index}"
+            self.register(role, session_id=session_id)
             for tool in ("Edit", "Write"):
-                result = self.hook("PreToolUse", tool_name=tool, tool_input={"file_path": "/tmp/x", "content": "y"})
+                result = self.hook("PreToolUse", session_id=session_id, tool_name=tool, tool_input={"file_path": "/tmp/x", "content": "y"})
                 self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny", (role, tool))
 
     def test_implementation_can_edit_and_write(self) -> None:
@@ -210,6 +331,212 @@ class OrchestrationHookTest(unittest.TestCase):
         shown = json.loads(self.state_command("ledger", "show", "--session-id", "session-2").stdout)
         self.assertEqual(shown, {"lane-1": {"node": "review"}})
 
+    def test_parallel_ledger_updates_do_not_lose_state(self) -> None:
+        self.register("gepetto")
+        processes = [
+            subprocess.Popen(
+                [
+                    PYTHON, str(STATE), "ledger", "set", "--session-id", "session-1",
+                    "--lane", "lane-1", "--json", json.dumps({"proof": {f"item-{index}": index}}),
+                ],
+                env=self.env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for index in range(20)
+        ]
+        results = [process.communicate(timeout=10) + (process.returncode,) for process in processes]
+        self.assertTrue(all(returncode == 0 for _, _, returncode in results), results)
+        shown = json.loads(self.state_command("ledger", "show", "--session-id", "session-1").stdout)
+        self.assertEqual(shown["lane-1"]["proof"], {f"item-{index}": index for index in range(20)})
+
+    def test_ledger_move_transfers_lane_and_leaves_tombstone(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-old",
+            "--json", '{"role":"review","node":"review","cycles":2}',
+        )
+        self.state_command(
+            "ledger", "move", "--session-id", "session-1",
+            "--from-lane", "lane-old", "--to-lane", "lane-new",
+        )
+        shown = json.loads(self.state_command("ledger", "show", "--session-id", "session-1").stdout)
+        self.assertEqual(shown["lane-old"], {"tombstone": True, "successor_lane": "lane-new"})
+        self.assertEqual(shown["lane-new"]["continued_from"], "lane-old")
+        self.assertEqual(shown["lane-new"]["cycles"], 2)
+
+    def test_graph_apply_atomically_enforces_and_increments_review_cycle(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", '{"node":"review","review_fix_cycles":2}',
+        )
+        applied = json.loads(self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "review", "--event", "ACTIONABLE_FINDINGS",
+        ).stdout)
+        self.assertEqual(applied["transition_id"], "review-found-issues")
+        self.assertEqual(applied["state"]["node"], "fixer")
+        self.assertEqual(applied["state"]["review_fix_cycles"], 3)
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", '{"node":"review"}',
+        )
+        blocked = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "review", "--event", "ACTIONABLE_FINDINGS", check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("found 0", blocked.stderr)
+
+    def test_blocking_workflow_load_does_not_hold_registry_lock(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", '{"node":"review","review_fix_cycles":0}',
+        )
+        fifo = Path(self.temporary.name) / "workflow.fifo"
+        os.mkfifo(fifo)
+        applying = subprocess.Popen(
+            [
+                PYTHON, str(STATE), "graph", "apply", "--session-id", "session-1",
+                "--lane", "review-lane", "--current-node", "review",
+                "--event", "ACTIONABLE_FINDINGS", "--workflow", str(fifo),
+            ],
+            env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        time.sleep(0.1)
+        status = subprocess.run(
+            [PYTHON, str(STATE), "status"], env=self.env, text=True,
+            capture_output=True, timeout=1, check=True,
+        )
+        self.assertIn("session-1", status.stdout)
+        workflow = STATE.parents[1] / "gepetto" / "references" / "workflow.json"
+        with fifo.open("wb", buffering=0) as handle:
+            handle.write(workflow.read_bytes())
+        stdout, stderr = applying.communicate(timeout=2)
+        self.assertEqual(applying.returncode, 0, (stdout, stderr))
+
+    def test_context_binding_requires_reload_only_when_digest_changes(self) -> None:
+        self.register("implementation")
+        instructions = Path(self.temporary.name) / "AGENTS.md"
+        instructions.write_text("first rules\n", encoding="utf-8")
+
+        first = json.loads(self.state_command(
+            "context", "bind",
+            "--session-id", "session-1",
+            "--key", "repository-instructions",
+            "--file", str(instructions),
+        ).stdout)
+        unchanged = json.loads(self.state_command(
+            "context", "bind",
+            "--session-id", "session-1",
+            "--key", "repository-instructions",
+            "--file", str(instructions),
+        ).stdout)
+        instructions.write_text("second rules\n", encoding="utf-8")
+        changed = json.loads(self.state_command(
+            "context", "bind",
+            "--session-id", "session-1",
+            "--key", "repository-instructions",
+            "--file", str(instructions),
+        ).stdout)
+
+        self.assertTrue(first["reload_required"])
+        self.assertFalse(unchanged["reload_required"])
+        self.assertTrue(changed["reload_required"])
+        self.assertNotEqual(first["ref"], changed["ref"])
+
+    def test_context_digest_is_stable_until_file_content_changes(self) -> None:
+        artifact = Path(self.temporary.name) / "research.md"
+        artifact.write_text("approved scope\n", encoding="utf-8")
+        first = json.loads(self.state_command("context", "digest", "--file", str(artifact)).stdout)
+        same = json.loads(self.state_command("context", "digest", "--file", str(artifact)).stdout)
+        artifact.write_text("changed scope\n", encoding="utf-8")
+        changed = json.loads(self.state_command("context", "digest", "--file", str(artifact)).stdout)
+
+        self.assertEqual(first["digest"], same["digest"])
+        self.assertNotEqual(first["digest"], changed["digest"])
+        self.assertEqual(first["ref"], f"sha256:{first['digest']}")
+
+    def test_context_digest_is_versioned_domain_separated_and_carries_arity(self) -> None:
+        whole = Path(self.temporary.name) / "whole"
+        left = Path(self.temporary.name) / "left"
+        right = Path(self.temporary.name) / "right"
+        whole.write_bytes(b"ab")
+        left.write_bytes(b"a")
+        right.write_bytes(b"b")
+        single = json.loads(self.state_command("context", "digest", "--file", str(whole)).stdout)
+        multiple = json.loads(self.state_command(
+            "context", "digest", "--file", str(left), "--file", str(right),
+        ).stdout)
+
+        self.assertEqual(single["digest_version"], 1)
+        self.assertEqual(single["arity"], 1)
+        self.assertEqual(multiple["arity"], 2)
+        self.assertNotEqual(single["digest"], multiple["digest"])
+
+    def test_missing_context_file_fails_without_mutating_state(self) -> None:
+        self.register("implementation")
+        before = self.session_state()
+        result = self.state_command(
+            "context", "bind", "--session-id", "session-1",
+            "--key", "research-artifact",
+            "--file", str(Path(self.temporary.name) / "missing.md"),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("No such file", result.stderr)
+        self.assertEqual(self.session_state(), before)
+
+    def test_blocking_context_read_does_not_hold_registry_lock(self) -> None:
+        self.register("gepetto")
+        fifo = Path(self.temporary.name) / "context.fifo"
+        os.mkfifo(fifo)
+        binding = subprocess.Popen(
+            [
+                PYTHON, str(STATE), "context", "bind", "--session-id", "session-1",
+                "--key", "fifo", "--file", str(fifo),
+            ],
+            env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        time.sleep(0.1)
+        status = subprocess.run(
+            [PYTHON, str(STATE), "status"], env=self.env, text=True,
+            capture_output=True, timeout=1, check=True,
+        )
+        self.assertIn("session-1", status.stdout)
+        with fifo.open("wb", buffering=0) as handle:
+            handle.write(b"stable context")
+        stdout, stderr = binding.communicate(timeout=2)
+        self.assertEqual(binding.returncode, 0, (stdout, stderr))
+
+    def test_malformed_state_containers_fail_cleanly_without_mutation(self) -> None:
+        self.register("gepetto")
+        path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        malformed = self.session_state()
+        malformed["context_refs"] = []
+        malformed["ledger"] = []
+        path.write_text(json.dumps(malformed), encoding="utf-8")
+        before = path.read_bytes()
+        artifact = Path(self.temporary.name) / "artifact.md"
+        artifact.write_text("content", encoding="utf-8")
+
+        context = self.state_command(
+            "context", "bind", "--session-id", "session-1", "--key", "artifact",
+            "--file", str(artifact), check=False,
+        )
+        ledger = self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", "{}", check=False,
+        )
+        self.assertEqual(context.returncode, 1)
+        self.assertEqual(ledger.returncode, 1)
+        self.assertNotIn("Traceback", context.stderr + ledger.stderr)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_status_lists_sessions(self) -> None:
         self.register("gepetto")
         self.state_command("register", "--session-id", "session-2", "--role", "review", "--coordinator-thread-id", "session-1")
@@ -218,15 +545,148 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertIn("session-1 role=gepetto active=true coordinator=-", lines)
         self.assertIn("session-2 role=review active=false coordinator=session-1", lines)
 
-    def test_merge_requires_authorized_jiminy_and_bound_head(self) -> None:
+    def test_child_verifies_authoritative_coordinator_registration_without_mutation(self) -> None:
         self.register("gepetto")
+        self.state_command(
+            "register", "--session-id", "session-2", "--role", "implementation",
+            "--coordinator-thread-id", "session-1",
+        )
+        before = self.session_state("session-2")
+        verified = json.loads(self.state_command(
+            "verify", "--session-id", "session-2", "--role", "implementation",
+            "--coordinator-thread-id", "session-1",
+        ).stdout)
+        after = self.session_state("session-2")
+
+        self.assertEqual(verified, {
+            "active": True,
+            "coordinator_thread_id": "session-1",
+            "role": "implementation",
+            "session_id": "session-2",
+            "verified": True,
+        })
+        self.assertEqual(after, before)
+
+        mismatch = self.state_command(
+            "verify", "--session-id", "session-2", "--role", "review",
+            "--coordinator-thread-id", "session-1", check=False,
+        )
+        self.assertEqual(mismatch.returncode, 1)
+        self.assertIn("role mismatch", mismatch.stderr)
+
+    def test_child_registration_requires_active_gepetto_coordinator(self) -> None:
+        missing = self.state_command(
+            "register", "--session-id", "session-2", "--role", "implementation",
+            "--coordinator-thread-id", "session-1", check=False,
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("active Gepetto coordinator", missing.stderr)
+
+        self.register("review")
+        wrong_role = self.state_command(
+            "register", "--session-id", "session-2", "--role", "implementation",
+            "--coordinator-thread-id", "session-1", check=False,
+        )
+        self.assertEqual(wrong_role.returncode, 1)
+        self.assertIn("active Gepetto coordinator", wrong_role.stderr)
+
+    def test_all_child_roles_require_coordinator_and_gepetto_rejects_one(self) -> None:
+        for role in ("research", "implementation", "review", "jiminy"):
+            result = self.state_command(
+                "register", "--session-id", f"standalone-{role}", "--role", role, check=False,
+            )
+            self.assertEqual(result.returncode, 1, role)
+        self.register("gepetto")
+        nested = self.state_command(
+            "register", "--session-id", "nested-gepetto", "--role", "gepetto",
+            "--coordinator-thread-id", "session-1", check=False,
+        )
+        self.assertEqual(nested.returncode, 1)
+
+    def test_conflicting_child_reregistration_is_rejected(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "register", "--session-id", "session-2", "--role", "implementation",
+            "--coordinator-thread-id", "session-1",
+        )
+        before = self.session_state("session-2")
+        conflict = self.state_command(
+            "register", "--session-id", "session-2", "--role", "review",
+            "--coordinator-thread-id", "session-1", check=False,
+        )
+
+        self.assertEqual(conflict.returncode, 1)
+        self.assertIn("already authoritative", conflict.stderr)
+        self.assertEqual(self.session_state("session-2"), before)
+
+    def test_identical_reregistration_is_read_only_and_cannot_revive_lane(self) -> None:
+        self.register("jiminy", "--merge-authorized", "--no-checkpoint")
+        before = self.session_state()
+        repeated = self.state_command(
+            "register", "--session-id", "session-1", "--role", "jiminy",
+            "--coordinator-thread-id", "session-1-coordinator",
+        )
+        self.assertEqual(repeated.returncode, 0)
+        self.assertEqual(self.session_state(), before)
+
+        self.state_command("complete", "--session-id", "session-1")
+        completed = self.session_state()
+        revive = self.state_command(
+            "register", "--session-id", "session-1", "--role", "jiminy",
+            "--coordinator-thread-id", "session-1-coordinator",
+            check=False,
+        )
+        self.assertEqual(revive.returncode, 1)
+        self.assertEqual(self.session_state(), completed)
+
+    def test_child_verification_fails_after_coordinator_completes(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "register", "--session-id", "session-2", "--role", "implementation",
+            "--coordinator-thread-id", "session-1",
+        )
+        self.state_command("complete", "--session-id", "session-1")
+
+        result = self.state_command(
+            "verify", "--session-id", "session-2", "--role", "implementation",
+            "--coordinator-thread-id", "session-1", check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("active Gepetto coordinator", result.stderr)
+
+        implicit = self.state_command(
+            "verify", "--session-id", "session-2", "--role", "implementation",
+            check=False,
+        )
+        self.assertEqual(implicit.returncode, 1)
+        self.assertIn("active Gepetto coordinator", implicit.stderr)
+
+    def test_child_verification_follows_coordinator_checkpoint_lineage(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "register", "--session-id", "session-2", "--role", "implementation",
+            "--coordinator-thread-id", "session-1",
+        )
+        self.state_command(
+            "continue", "--source-id", "session-1", "--successor-id", "session-3",
+        )
+
+        verified = json.loads(self.state_command(
+            "verify", "--session-id", "session-2", "--role", "implementation",
+            "--coordinator-thread-id", "session-3",
+        ).stdout)
+        self.assertEqual(verified["coordinator_thread_id"], "session-3")
+        self.assertTrue(verified["verified"])
+
+    def test_merge_requires_authorized_jiminy_and_bound_head(self) -> None:
+        self.register("jiminy")
         denied = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": f"gh pr merge 1 --squash --match-head-commit {SHA}"})
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
 
-        self.register("jiminy", "--merge-authorized")
-        unbound = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "gh pr merge 1 --squash"})
+        self.register("jiminy", "--merge-authorized", session_id="authorized-jiminy")
+        unbound = self.hook("PreToolUse", session_id="authorized-jiminy", tool_name="Bash", tool_input={"command": "gh pr merge 1 --squash"})
         self.assertEqual(unbound["hookSpecificOutput"]["permissionDecision"], "deny")
-        allowed = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": f"gh pr merge 1 --squash --match-head-commit {SHA}"})
+        allowed = self.hook("PreToolUse", session_id="authorized-jiminy", tool_name="Bash", tool_input={"command": f"gh pr merge 1 --squash --match-head-commit {SHA}"})
         self.assertIsNone(allowed)
 
     def session_state(self, session_id: str = "session-1") -> dict[str, object]:
@@ -252,6 +712,108 @@ class OrchestrationHookTest(unittest.TestCase):
         successor = self.session_state("session-2")
         self.assertEqual(successor["events"], 0)
         self.assertIsInstance(successor["last_heartbeat"], int)
+
+    def test_continue_preserves_context_refs_but_resets_ephemeral_pressure(self) -> None:
+        self.register("implementation")
+        artifact = Path(self.temporary.name) / "research.md"
+        artifact.write_text("stable contract\n", encoding="utf-8")
+        self.state_command(
+            "context", "bind", "--session-id", "session-1",
+            "--key", "research-artifact", "--source", str(artifact),
+            "--file", str(artifact),
+        )
+        self.state_command(
+            "pressure", "record", "--session-id", "session-1",
+            "--context-used-tokens", "800", "--context-limit-tokens", "1000",
+        )
+        self.state_command("continue", "--source-id", "session-1", "--successor-id", "session-2")
+
+        successor = self.session_state("session-2")
+        self.assertTrue(successor["context_refs"]["research-artifact"]["ref"].startswith("sha256:"))
+        self.assertNotIn("pressure", successor)
+
+    def test_continue_rejects_same_or_existing_successor_without_mutation(self) -> None:
+        self.register("implementation")
+        before = self.session_state()
+        same = self.state_command(
+            "continue", "--source-id", "session-1", "--successor-id", "session-1",
+            check=False,
+        )
+        self.assertEqual(same.returncode, 1)
+        self.assertEqual(self.session_state(), before)
+
+        self.register("review", session_id="session-2")
+        successor_before = self.session_state("session-2")
+        existing = self.state_command(
+            "continue", "--source-id", "session-1", "--successor-id", "session-2",
+            check=False,
+        )
+        self.assertEqual(existing.returncode, 1)
+        self.assertEqual(self.session_state(), before)
+        self.assertEqual(self.session_state("session-2"), successor_before)
+
+    def test_continue_rolls_back_if_second_staged_commit_fails(self) -> None:
+        self.register("implementation")
+        source_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = source_path.read_bytes()
+        original_replace = Path.replace
+        calls = 0
+
+        def fail_second_replace(path: Path, target: Path) -> Path:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected source commit failure")
+            return original_replace(path, target)
+
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}), patch.object(
+            Path, "replace", fail_second_replace
+        ):
+            with self.assertRaisesRegex(OSError, "injected source commit failure"):
+                orchestration_state.continue_session("session-1", "session-2")
+
+        self.assertEqual(source_path.read_bytes(), before)
+        self.assertFalse((Path(self.temporary.name) / "sessions" / "session-2.json").exists())
+
+    def test_continue_stage_failure_removes_journal_and_stages_without_mutation(self) -> None:
+        self.register("implementation")
+        source_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = source_path.read_bytes()
+        original_stage = orchestration_state._stage_state
+        calls = 0
+
+        def fail_second_stage(*args: object, **kwargs: object) -> tuple[Path, Path]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected successor staging failure")
+            return original_stage(*args, **kwargs)
+
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}), patch.object(
+            orchestration_state, "_stage_state", side_effect=fail_second_stage
+        ):
+            with self.assertRaisesRegex(OSError, "injected successor staging failure"):
+                orchestration_state.continue_session("session-1", "session-2")
+
+        self.assertEqual(source_path.read_bytes(), before)
+        self.assertFalse((Path(self.temporary.name) / "transactions" / "continuation.json").exists())
+        self.assertEqual(list((Path(self.temporary.name) / "sessions").glob(".*.tmp")), [])
+
+    def test_hard_exit_continuation_recovers_one_active_owner_on_next_operation(self) -> None:
+        self.register("implementation")
+        crash_env = dict(self.env, CODEX_ORCHESTRATION_TEST_CRASH_AFTER="successor")
+        crashed = subprocess.run(
+            [PYTHON, str(STATE), "continue", "--source-id", "session-1", "--successor-id", "session-2"],
+            env=crash_env, text=True, capture_output=True,
+        )
+        self.assertEqual(crashed.returncode, 91)
+        self.assertTrue(self.session_state()["active"])
+        self.assertTrue(self.session_state("session-2")["active"])
+
+        self.state_command("status")
+        self.assertFalse(self.session_state()["active"])
+        self.assertTrue(self.session_state("session-2")["active"])
+        self.assertFalse((Path(self.temporary.name) / "transactions" / "continuation.json").exists())
 
 
 if __name__ == "__main__":

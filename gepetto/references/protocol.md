@@ -25,7 +25,7 @@ Register the coordinator after resolving its exact task ID:
 python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" register --session-id <gepetto-task-id> --role gepetto
 ```
 
-Immediately after `create_thread` returns, register each child before waiting or dispatching the next phase:
+Immediately after `create_thread` returns, register each child before waiting or dispatching the next phase. Coordinator registration is authoritative:
 
 ```bash
 # Add --merge-authorized only when Jiminy has that authority.
@@ -34,18 +34,32 @@ python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_st
 
 Registration activates role-aware compaction, subagent contracts, receipt checks, and merge guards. A registration failure blocks that lane; report it separately from delivery proof.
 
-After a terminal Gepetto or Jiminy result, disable its hooks:
+Every child registration, including Jiminy, requires an active Gepetto coordinator; Gepetto rejects a coordinator. Jiminy merge authority must be granted on its initial coordinator-owned registration and cannot be escalated by re-registration.
+
+Hook guards prevent active child lanes from registering Gepetto, granting merge authority, or mutating another session's coordinator state, ledger, or graph. This is same-user coordination integrity, not protection from a compromised local account; keep state directories and files at `0700`/`0600`.
+
+Each child verifies that registration without rewriting it:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" complete --session-id <task-id>
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" verify --session-id <task-id> --role <research|implementation|review|jiminy> --coordinator-thread-id <gepetto-task-id>
 ```
+
+Verification and conflicting re-registration fail closed.
+
+After Gepetto has verified the terminal Jiminy result, disable the Gepetto coordinator hooks:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" complete --session-id <gepetto-task-id>
+```
+
+Jiminy does not run `complete` before its final response. Its valid exactly-once `JIMINY_COMPLETE` Stop deactivates its own registration; an invalid or duplicate terminal packet never deactivates it.
 
 ## Ledger
 
 Persist lane state mechanically after registering each lane and after each accepted packet or node change; the JSON deep-merges into the coordinator session file:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger set --session-id <gepetto-task-id> --lane <lane-task-id> --json '{"role": "<role>", "issue": "<url>", "pr": "<url>", "head_sha": "<sha>", "node": "<node>", "resume_node": "<node-or-null>", "cycles": <n>}'
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger set --session-id <gepetto-task-id> --lane <lane-task-id> --json '{"role": "<role>", "issue": "<url>", "pr": "<url>", "head_sha": "<sha>", "node": "<node>", "resume_node": "<node-or-null>", "review_fix_cycles": <n>}'
 ```
 
 Read it back on resume or checkpoint:
@@ -56,9 +70,34 @@ python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_st
 
 Checkpoint capsules point at this ledger instead of restating lane state.
 
+Move a continued lane atomically instead of copying it with `ledger set`:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger move --session-id <gepetto-task-id> --from-lane <source-task-id> --to-lane <successor-task-id>
+```
+
+The successor receives the lane state plus `continued_from`; the source becomes a tombstone with `successor_lane`.
+
+## Content references
+
+Hash stable repository instructions and artifacts through the public state CLI. `context bind` hashes exact file bytes with a versioned domain and input arity, stores a `sha256:` ref, and reports `reload_required`. Repeat `--file` for multiple files; ordering is normalized.
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" context bind --session-id <task-id> --key repository-instructions --file <AGENTS.md> [--file <nested-AGENTS.md> ...]
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" context bind --session-id <task-id> --key research-artifact --source <artifact-url-or-path> --file <exact-fetched-artifact-snapshot>
+```
+
+Load full content only when `reload_required` is true; otherwise use the returned ref. Failures leave state unchanged, refs survive continuation, and source updates require a fresh exact-byte snapshot.
+
 ## Supervision
 
-Hooks stamp `last_heartbeat` and an `events` counter on every registered active session. Classify lane liveness mechanically when refreshing task state:
+Hooks stamp `last_heartbeat` and a compatibility `events` counter on every registered active session. Record measurable pressure before classifying whenever token telemetry is available:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" pressure record --session-id <task-id> --context-used-tokens <used> --context-limit-tokens <limit>
+```
+
+The sample also records persisted state bytes. Classify lane liveness mechanically when refreshing task state:
 
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_watchdog.py" check [--json]
@@ -68,16 +107,16 @@ The watchdog only reports; Gepetto owns every restart. Apply its statuses explic
 
 - `stale` raises `LANE_UNRESPONSIVE` into `blocked`; replace the lane task through the checkpoint flow, registering the continuation with `continue --supervised` so the restart consumes budget.
 - `over-budget` raises `RESTART_BUDGET_EXCEEDED` into `needs_decision`; stop for a user decision.
-- `recycle` requests a proactive checkpoint (a planned handoff, no `--supervised`).
+- `recycle` requests a proactive checkpoint (a planned handoff, no `--supervised`). Measured context or state pressure takes precedence; the event threshold is used only when no pressure sample exists.
 
-TTLs, the restart budget, and the recycle threshold come from `policies.supervision` in `workflow.json`. The command exits non-zero when any lane is stale or over-budget.
+TTLs, restart budget, and pressure/event thresholds come from `policies.supervision` in `workflow.json`. Pressure resets on continuation. The command exits non-zero when any lane is stale or over-budget.
 
 ## Research task prompt
 
 Dispatch a research task only for multi-issue scope or a likely split/consolidate; otherwise Gepetto researches inline and persists the same artifact. Include the project path, issue URL, current default-branch SHA, repository instructions, and `coordinatorThreadId` when Gepetto resolved it. Use this request:
 
 ```text
-You are a Gepetto research lane for <issue-url>. Work code-read-only. Refresh the live issue and repository first. Inspect the issue contract, relevant code/history, tests, dependencies, linked work, and conventions, then decide keep, split, consolidate, clarify, or block. Issue-write authority is <persist|propose-only>. With persist authority, GitHub is the canonical output: preserve unrelated issue text and idempotently append or replace a `<!-- gepetto-research:start -->` … `<!-- gepetto-research:end -->` section containing the full readable research contract. For keep, clarify, or block, update the source issue. For split, search duplicates, create each non-overlapping leaf with its full contract, link it when supported, and update the parent with the decision and child URLs. For consolidate, identify a related open issue, confirm their combined scope remains one independently reviewable leaf, select the canonical issue from live history and dependencies, update it with the combined contract, and update the source with the decision and canonical URL. Do not close either issue without explicit issue-close authority. Re-read every written issue and record its live URL and updatedAt. With propose-only authority, or when an attempted issue write is blocked, put the full contract in a uniquely named temporary Markdown file under `${TMPDIR:-/tmp}` and record its absolute path; a blocked persist attempt still has status blocked. Do not edit code, create branches/PRs, or perform unrelated GitHub mutations. A chat-only contract is failure. Verify the referenced artifact. Send only the compact RESEARCH_PACKET pointer receipt below to <coordinator-thread-id> when present and finish with exactly that receipt. Never paste the research contract, evidence, acceptance criteria, managed issue section, or temporary Markdown contents into chat. Never search for the parent by title.
+You are a Gepetto research lane for <issue-url>. Work code-read-only. Verify the coordinator's authoritative `research` registration; do not register again. Refresh the live issue and repository first. Inspect the issue contract, relevant code/history, tests, dependencies, linked work, and conventions, then decide keep, split, consolidate, clarify, or block. Issue-write authority is <persist|propose-only>. With persist authority, GitHub is the canonical output: preserve unrelated issue text and idempotently append or replace a `<!-- gepetto-research:start -->` … `<!-- gepetto-research:end -->` section containing the full readable research contract. For keep, clarify, or block, update the source issue. For split, search duplicates, create each non-overlapping leaf with its full contract, link it when supported, and update the parent with the decision and child URLs. For consolidate, identify a related open issue, confirm their combined scope remains one independently reviewable leaf, select the canonical issue from live history and dependencies, update it with the combined contract, and update the source with the decision and canonical URL. Do not close either issue without explicit issue-close authority. Re-read every written issue and record its live URL and updatedAt. With propose-only authority, or when an attempted issue write is blocked, put the full contract in a uniquely named temporary Markdown file under `${TMPDIR:-/tmp}` and record its absolute path; a blocked persist attempt still has status blocked. Do not edit code, create branches/PRs, or perform unrelated GitHub mutations. A chat-only contract is failure. Verify and content-bind the referenced artifact. Finish with exactly one compact RESEARCH_PACKET as the task final result; do not send it separately. Never paste the research contract, evidence, acceptance criteria, managed issue section, or temporary Markdown contents into chat. Never search for the parent by title.
 ```
 
 ## RESEARCH_PACKET
@@ -95,6 +134,7 @@ RESEARCH_PACKET:
     kind: github_issue|tmp_markdown
     status: persisted|propose-only|blocked
     marker: <gepetto-research for GitHub, null for temporary Markdown>
+    content_ref: <sha256: digest of the exact verified artifact snapshot>
     locations:
       - issue_url: <raw live URL, present for a GitHub artifact>
         observed_updated_at: <timestamp after re-read>
@@ -108,22 +148,28 @@ The full artifact, not this receipt, contains the problem statement, evidence, s
 Read [../../pinocchio/references/protocol.md](../../pinocchio/references/protocol.md) before dispatching. Include the actual leaf issue URL, approved research artifact URL or absolute temporary Markdown path, its compact receipt, project path, default branch, base SHA, branch convention, authority to commit/push/open one PR and update the leaf issue, and `coordinatorThreadId`. Do not embed the full research contract. Use this request:
 
 ```text
-Use $pinocchio to deliver <leaf-issue-url> from the approved contract at <research-artifact-url-or-absolute-path>. Work in a dedicated worktree from <default-branch>@<base-sha>. You may commit, push without force, open one linked PR, and update the leaf issue; you may not merge or close it. Register this task as `implementation` under <coordinator-thread-id>, send the exact `IMPLEMENTATION_PACKET` there, and finish with the same receipt.
+Use $pinocchio to deliver <leaf-issue-url> from the approved contract at <research-artifact-url-or-absolute-path> with content ref <research-content-ref>. Work in a dedicated worktree from <default-branch>@<base-sha>. You may commit, push without force, open one linked PR, and update the leaf issue; you may not merge or close it. Verify the coordinator's authoritative `implementation` registration; do not register again. Finish with exactly one `IMPLEMENTATION_PACKET` as the task final result; do not send it separately.
 ```
 
 ## IMPLEMENTATION_PACKET
 
-Use Pinocchio's packet schema and gates exactly. Gepetto dispatches review after confirming the live PR head equals `pr_head_sha`; it rereads the persisted artifact only when assembling `JIMINY_READY` or on a drift event.
+Use Pinocchio's packet schema and gates exactly. Dispatch review only after confirming the live PR head equals `pr_head_sha`.
 
 ## Review task prompt
 
 Include the issue URL, PR URL, exact expected head SHA, repository instructions, acceptance criteria, and `coordinatorThreadId` when available. Use this request:
 
 ```text
-You are the independent review lane for <pr-url>. Refresh the PR and stop if its live head differs from <expected-head-sha>. Spawn one internal reviewer agent named reviewer_<pr>. It must inspect the issue contract, diff, surrounding code, tests, security/reliability implications, and repository rules, binding findings to the exact head SHA, and collect ALL actionable findings before any repair. The reviewer owns repairs: it runs one fixer pass covering every actionable finding, applying tested fixes serially on this PR branch, verifies each pushed fix, then re-reviews scoped to the changed delta plus the acceptance criteria and required CI. A full fresh review is required after MATERIAL_CONTRACT_CHANGED, MATERIAL_BASE_CHANGED, or any head change not produced by this fixer pass (PR_HEAD_CHANGED). Repeat until blocked or no actionable findings remain and required CI is green. Do not merge. Wait for the reviewer, verify its evidence, then produce REVIEW_PACKET. If <coordinator-thread-id> is present, send the packet there with codex_app__send_message_to_thread. Finish with exactly the same packet.
+You are the independent review lane for <pr-url>. Verify the coordinator's authoritative `review` registration; do not register again. Refresh the PR and stop if its live head differs from <expected-head-sha>. Spawn one internal reviewer agent named reviewer_<pr>. It must inspect the issue contract, diff, surrounding code, tests, security/reliability implications, and repository rules, binding findings to the exact head SHA, and collect ALL actionable findings before any repair. The reviewer owns repairs: it runs one fixer pass covering every actionable finding, applying tested fixes serially on this PR branch, verifies each pushed fix, then re-reviews scoped to the changed delta plus the acceptance criteria and required CI. A full fresh review is required after MATERIAL_CONTRACT_CHANGED, MATERIAL_BASE_CHANGED, or any head change not produced by this fixer pass (PR_HEAD_CHANGED). Repeat until blocked or no actionable findings remain and required CI is green. Do not merge. Wait for the reviewer, verify its evidence, then finish with exactly one REVIEW_PACKET as the task final result; do not send it separately.
 ```
 
-Limit the review → fixer-pass → delta re-review cycle to `policies.max_review_fix_cycles` from `workflow.json`. If the limit is reached with actionable findings remaining, set `ready_for_jiminy: false`, include `review_fix_limit_exceeded` in `blockers`, and return control to Gepetto for a user decision.
+The `ACTIONABLE_FINDINGS` graph transition mechanically requires `review_fix_cycles < policies.max_review_fix_cycles` and increments the counter on entry to `fixer`. Apply it atomically with:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph apply --session-id <gepetto-task-id> --lane <review-task-id> --current-node review --event ACTIONABLE_FINDINGS
+```
+
+If the command reports no eligible transition, emit `REVIEW_FIX_LIMIT_EXCEEDED`, set `ready_for_jiminy: false`, include `review_fix_limit_exceeded` in `blockers`, and return control to Gepetto for a user decision. `PR_HEAD_CHANGED` from a fixer invalidates that fixer pass and returns to review.
 
 ## REVIEW_PACKET
 
@@ -165,7 +211,7 @@ Current PRs: <pr-urls>.
 
 Merge authority: every Gepetto-managed PR in this delivery. The user's request to use Gepetto grants this authority; do not wait for a second user instruction. Using the accompanying JIMINY_READY packet as a locator, re-apply every merge gate to each live PR head, independently decide whether each PR is approved to merge, and merge every approved PR in dependency order. For any PR not approved, report the exact blocker to Gepetto. After the final merge, run the post-merge integration gate.
 
-Send every JIMINY_PR_RESULT, any JIMINY_INTEGRATION_FAILED, and the final JIMINY_COMPLETE to <coordinator-thread-id> with codex_app__send_message_to_thread. Finish with the same final packet.
+Send every intermediate JIMINY_PR_RESULT and any JIMINY_INTEGRATION_FAILED to <coordinator-thread-id> with codex_app__send_message_to_thread. Finish with exactly one JIMINY_COMPLETE as the task final result; do not send that terminal packet separately.
 
 On CHECKPOINT_CONTINUATION from Gepetto, replace the coordinator ID with the confirmed successor ID, leave both tasks unarchived, and acknowledge the successor.
 ```
@@ -179,12 +225,20 @@ JIMINY_READY:
   merge_authority: merge|monitoring-only
   merge_order:
     - <PR URL>
+  expected_pr_urls:
+    - <every exact PR URL expected to produce a verified merge result>
   pull_requests:
     - issue_url: <live issue URL>
       pr_url: <live PR URL>
       branch: <head branch>
       reviewed_head_sha: <full SHA>
       reviewer_task_id: <exact task ID>
+      research_artifact:
+        locator: <live issue URL or absolute temporary path>
+        content_ref: <sha256: exact verified research artifact digest>
+      implementation_artifact:
+        locator: <live issue URL or absolute temporary path>
+        content_ref: <sha256: exact verified implementation proof digest>
       dependencies:
         - <PR URL or none>
       gates:
@@ -197,6 +251,20 @@ JIMINY_READY:
 ```
 
 Every listed PR must have a verified persisted implementation artifact and a `REVIEW_PACKET` bound to `reviewed_head_sha`. Any false or unknown required gate keeps the PR out of merge-ready state and must be reported as a blocker.
+
+## JIMINY_PR_RESULT
+
+```yaml
+JIMINY_PR_RESULT:
+  pr_url: <live URL>
+  state: MERGED
+  reviewed_head_sha: <full pre-merge head SHA>
+  merge_commit_sha: <full verified merge commit SHA>
+  linked_issue_url: <live URL>
+  linked_issue_state: OPEN|CLOSED
+```
+
+Each result is intermediate and advances no phase by itself. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public `graph apply` command with `ready.expected_pr_urls` and `packet.merge_results` in `--context-json`. It is eligible only when the result-map keys exactly equal `JIMINY_READY.expected_pr_urls` and every value is a full SHA; missing, extra, or malformed PR/commit results block integration verification.
 
 ## JIMINY_INTEGRATION_FAILED
 
@@ -238,4 +306,4 @@ JIMINY_COMPLETE:
   private_log_path: <absolute path>
 ```
 
-Jiminy may send `JIMINY_COMPLETE` only when every integration field is true. `runtime_ready_for_completion` means every lane is terminal or safely handed off; Jiminy and Gepetto still complete only their own registrations after the packet. Worktree removal remains subject to separate cleanup authority and the repository hygiene rules, and is never forced.
+Jiminy may return `JIMINY_COMPLETE` only when every integration field is true. `runtime_ready_for_completion` means every lane is terminal or safely handed off. Jiminy's validated final Stop completes its registration; Gepetto completes its own registration only after accepting and independently verifying the packet. Worktree removal remains subject to separate cleanup authority and the repository hygiene rules, and is never forced.

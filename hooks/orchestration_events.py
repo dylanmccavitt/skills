@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shlex
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -16,21 +18,22 @@ LANE_RECEIPTS = {
     "research": "RESEARCH_PACKET:",
     "implementation": "IMPLEMENTATION_PACKET:",
     "review": "REVIEW_PACKET:",
+    "jiminy": "JIMINY_COMPLETE:",
 }
 
 AGENT_CONTRACTS = {
     "research": (
         "Work code-read-only; issue create/update remains allowed within declared authority. "
         "Decide keep, split, consolidate, clarify, or block; persist and reread the contract, "
-        "then return only RESEARCH_PACKET."
+        "then return compact verified evidence to the parent lane, not a terminal RESEARCH_PACKET."
     ),
     "implementation": (
-        "Use Pinocchio as the sole writer. Deliver one leaf, branch, and PR; persist proof and return only "
-        "IMPLEMENTATION_PACKET."
+        "Use Pinocchio as the sole writer. Deliver one leaf, branch, and PR; persist proof and return compact "
+        "verified evidence to the parent lane, not a terminal IMPLEMENTATION_PACKET."
     ),
     "reviewer": (
         "Collect all actionable findings, run one fixer pass, re-review the changed delta, and "
-        "return only REVIEW_PACKET."
+        "return compact review evidence to the parent lane, not a terminal REVIEW_PACKET."
     ),
     "fixer": (
         "Apply the assigned fixes serially, test each, push without force, and return compact "
@@ -44,6 +47,60 @@ PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b")
 API_MERGE = re.compile(r"\bgh\s+api\b")
 MERGE_ENDPOINT = re.compile(r"pulls/\d+/merge\b|\bmergePullRequest\b")
 BOUND_HEAD = re.compile(r"--match-head-commit(?:=|\s+)[0-9a-fA-F]{40}\b")
+PYTHON_EXECUTABLE = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
+STATE_MODULES = {"orchestration_state", "hooks.orchestration_state"}
+SHELL_CONTROLS = {";", "&&", "||", "&", "|"}
+
+
+def _argv_option(arguments: list[str], option: str) -> str | None:
+    for index, value in enumerate(arguments):
+        if value == option and index + 1 < len(arguments):
+            return arguments[index + 1]
+        if value.startswith(f"{option}="):
+            return value.split("=", 1)[1]
+    return None
+
+
+def _state_cli_invocations(command: str) -> tuple[list[list[str]], bool]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return [], "orchestration_state" in command
+
+    invocations: list[list[str]] = []
+    ambiguous = False
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token in SHELL_CONTROLS:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+
+    for segment in segments:
+        matched_positions: set[int] = set()
+        for index, token in enumerate(segment):
+            if os.path.basename(token) == "orchestration_state.py":
+                invocations.append(segment[index + 1:])
+                matched_positions.add(index)
+                continue
+            executable = os.path.basename(token)
+            if (
+                PYTHON_EXECUTABLE.fullmatch(executable)
+                and index + 2 < len(segment)
+                and segment[index + 1] == "-m"
+                and segment[index + 2] in STATE_MODULES
+            ):
+                invocations.append(segment[index + 3:])
+                matched_positions.add(index + 2)
+        if any(
+            "orchestration_state" in token and index not in matched_positions
+            for index, token in enumerate(segment)
+        ):
+            ambiguous = True
+    return invocations, ambiguous
 
 
 @dataclass
@@ -65,7 +122,11 @@ class HookContext:
 
     def save(self) -> None:
         if self.state:
-            write_state(self.state["session_id"], self.state)
+            write_state(
+                self.state["session_id"],
+                self.state,
+                expected_revision=int(self.state.get("state_revision", 0)),
+            )
 
 
 def additional_context(event: str, message: str) -> JsonObject:
@@ -91,8 +152,33 @@ def continue_turn(reason: str) -> JsonObject:
     return {"decision": "block", "reason": reason}
 
 
-def starts_with_receipt(message: Any, receipt: str) -> bool:
-    return isinstance(message, str) and message.lstrip().startswith(receipt)
+def has_exactly_one_receipt(message: Any, receipt: str) -> bool:
+    if not isinstance(message, str):
+        return False
+    lines = [line.strip() for line in message.splitlines()]
+    first = next((line for line in lines if line), "")
+    return first == receipt and lines.count(receipt) == 1
+
+
+def valid_jiminy_complete(message: Any) -> bool:
+    if not isinstance(message, str):
+        return False
+    required_scalars = (
+        "coordinator_thread_id", "repository", "default_branch", "private_log_path"
+    )
+    if any(not re.search(rf"(?m)^\s*{field}:\s*\S+", message) for field in required_scalars):
+        return False
+    if not re.search(r"(?m)^\s*verified_default_head_sha:\s*[0-9a-fA-F]{40}\s*$", message):
+        return False
+    if not re.search(r"(?m)^\s*pull_requests:\s*(?:\[\])?\s*$", message):
+        return False
+    for field in (
+        "expected_merges_present", "required_checks_green",
+        "linked_issues_verified", "runtime_ready_for_completion",
+    ):
+        if not re.search(rf"(?m)^\s*{field}:\s*true\s*$", message):
+            return False
+    return bool(re.search(r"(?m)^\s*blockers:\s*\[\]\s*$", message))
 
 
 def session_start(context: HookContext) -> HookResult:
@@ -107,31 +193,37 @@ def session_start(context: HookContext) -> HookResult:
     )
 
 
-def next_agent_contract(state: JsonObject) -> tuple[str, str | None]:
+def next_agent_contract(state: JsonObject) -> str:
     if state["role"] != "review":
-        role = state["role"]
-        return role, LANE_RECEIPTS.get(role)
+        return state["role"]
 
+    agents = state.get("agents", {})
+    if not isinstance(agents, dict):
+        raise ValueError("invalid agents container in orchestration state")
     active_roles = {
         agent.get("role")
-        for agent in state.get("agents", {}).values()
+        for agent in agents.values()
+        if isinstance(agent, dict)
         if agent.get("active")
     }
-    return ("fixer", None) if "reviewer" in active_roles else ("reviewer", "REVIEW_PACKET:")
+    return "fixer" if "reviewer" in active_roles else "reviewer"
 
 
 def subagent_start(context: HookContext) -> HookResult:
-    if not context.active or context.role not in LANE_RECEIPTS:
+    if not context.active or context.role not in {"research", "implementation", "review"}:
         return None
 
     agent_id = str(context.payload.get("agent_id", ""))
     if not agent_id:
         return None
 
-    agent_role, receipt = next_agent_contract(context.state)
-    context.state.setdefault("agents", {})[agent_id] = {
+    agent_role = next_agent_contract(context.state)
+    agents = context.state.get("agents")
+    if not isinstance(agents, dict):
+        raise ValueError("invalid agents container in orchestration state")
+    agents[agent_id] = {
         "role": agent_role,
-        "receipt": receipt,
+        "receipt": None,
         "active": True,
     }
     context.save()
@@ -143,18 +235,12 @@ def subagent_stop(context: HookContext) -> JsonObject:
         return {}
 
     agent_id = str(context.payload.get("agent_id", ""))
-    agent = context.state.get("agents", {}).get(agent_id)
+    agents = context.state.get("agents", {})
+    if not isinstance(agents, dict):
+        raise ValueError("invalid agents container in orchestration state")
+    agent = agents.get(agent_id)
     if not agent:
         return {}
-
-    receipt = agent.get("receipt")
-    valid = receipt is None or starts_with_receipt(
-        context.payload.get("last_assistant_message"), receipt
-    )
-    if not valid and not context.payload.get("stop_hook_active"):
-        return continue_turn(
-            f"Finish with exactly one {receipt[:-1]} receipt after verifying its artifact."
-        )
 
     agent["active"] = False
     context.save()
@@ -166,10 +252,14 @@ def stop(context: HookContext) -> JsonObject:
         return {}
 
     receipt = LANE_RECEIPTS.get(context.role)
-    valid = receipt is None or starts_with_receipt(
+    valid = receipt is None or has_exactly_one_receipt(
         context.payload.get("last_assistant_message"), receipt
     )
-    if not valid and not context.payload.get("stop_hook_active"):
+    if valid and context.role == "jiminy":
+        valid = valid_jiminy_complete(context.payload.get("last_assistant_message"))
+    if not valid:
+        if context.payload.get("stop_hook_active"):
+            return {}
         return continue_turn(
             f"Verify the lane result and finish with exactly one {receipt[:-1]} receipt."
         )
@@ -194,6 +284,25 @@ def pre_tool_use(context: HookContext) -> HookResult:
 
     if tool_name == "Bash" and FORCE_PUSH.search(command):
         return deny_tool("Force-pushing is forbidden in Gepetto-managed work.")
+
+    if tool_name == "Bash" and context.role != "gepetto":
+        invocations, ambiguous = _state_cli_invocations(command)
+        if ambiguous:
+            return deny_tool("Ambiguous orchestration state CLI invocation is denied for child lanes.")
+        for arguments in invocations:
+            state_command = arguments[0] if arguments else ""
+            if "--merge-authorized" in arguments or state_command == "register":
+                return deny_tool("Only the active Gepetto coordinator may create or authorize registrations.")
+            if state_command in {"ledger", "graph"}:
+                return deny_tool("Only the active Gepetto coordinator may mutate the delivery ledger or graph.")
+            if state_command == "complete":
+                target = _argv_option(arguments, "--session-id")
+                if target != context.state.get("session_id"):
+                    return deny_tool("A child lane cannot complete another orchestration session.")
+            if state_command == "continue":
+                source = _argv_option(arguments, "--source-id")
+                if source != context.state.get("session_id"):
+                    return deny_tool("A child lane cannot continue another orchestration session.")
 
     if tool_name == "Bash" and API_MERGE.search(command) and MERGE_ENDPOINT.search(command):
         return deny_tool(

@@ -8,10 +8,33 @@
     "proof_bound_to_live_head": true,
     "inline_research": "single_leaf_keep",
     "packet_authoritative_when_head_matches": true,
+    "context_addressing": {
+      "algorithm": "sha256",
+      "input": "exact_file_bytes",
+      "digest_version": 1,
+      "includes_arity": true,
+      "reload": "digest_change_only",
+      "survives_continuation": true
+    },
+    "registration": {
+      "authority": "coordinator",
+      "child_action": "verify",
+      "conflicts": "reject"
+    },
+    "terminal_receipts": {
+      "delivery": "task_final_result",
+      "exactly_once": true,
+      "separate_send": false,
+      "jiminy_intermediate_notifications": true
+    },
     "supervision": {
       "heartbeat_ttl_seconds": {"gepetto": 1800, "research": 900, "implementation": 2700, "review": 2700, "jiminy": 900},
       "max_lane_restarts": 2,
-      "recycle_after_events": 400
+      "recycle_context_ratio": 0.8,
+      "recycle_state_bytes": 131072,
+      "recycle_after_events": 400,
+      "pressure_ttl_seconds": 300,
+      "event_count_role": "compatibility_fallback"
     }
   },
   "nodes": {
@@ -51,7 +74,11 @@
       "id": "review-found-issues",
       "from": ["review"],
       "event": "ACTIONABLE_FINDINGS",
-      "to": "fixer"
+      "to": "fixer",
+      "all": [
+        {"path": "review_fix_cycles", "less_than_policy": "max_review_fix_cycles"}
+      ],
+      "increment": {"path": "review_fix_cycles", "by": 1}
     },
     {
       "id": "fix-pushed",
@@ -70,10 +97,24 @@
       ]
     },
     {
+      "id": "merge-result-recorded",
+      "from": ["merge"],
+      "event": "JIMINY_PR_RESULT",
+      "to": "merge",
+      "all": [
+        {"path": "packet.state", "equals": "MERGED"},
+        {"path": "packet.merge_commit_sha", "non_empty": true}
+      ]
+    },
+    {
       "id": "merge-set-verified",
       "from": ["merge"],
       "event": "MERGES_VERIFIED",
-      "to": "integration_verification"
+      "to": "integration_verification",
+      "all": [
+        {"path": "packet.merge_results", "map_keys_equal_path": "ready.expected_pr_urls"},
+        {"path": "packet.merge_results", "values_full_sha": true}
+      ]
     },
     {
       "id": "integration-passed",
@@ -81,10 +122,10 @@
       "event": "JIMINY_COMPLETE",
       "to": "complete",
       "all": [
-        {"path": "verification.expected_merges_present", "equals": true},
-        {"path": "verification.required_checks_green", "equals": true},
-        {"path": "verification.linked_issues_verified", "equals": true},
-        {"path": "verification.runtime_ready_for_completion", "equals": true}
+        {"path": "packet.integration.expected_merges_present", "equals": true},
+        {"path": "packet.integration.required_checks_green", "equals": true},
+        {"path": "packet.integration.linked_issues_verified", "equals": true},
+        {"path": "packet.integration.runtime_ready_for_completion", "equals": true}
       ]
     },
     {
@@ -108,9 +149,10 @@
     },
     {
       "id": "head-invalidated",
-      "from": ["review", "merge"],
+      "from": ["review", "fixer", "merge"],
       "event": "PR_HEAD_CHANGED",
-      "to": "review"
+      "to": "review",
+      "set": {"fixer_pass_invalidated": true}
     },
     {
       "id": "repair-limit-reached",

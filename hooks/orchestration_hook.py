@@ -8,20 +8,22 @@ import sys
 import time
 
 from orchestration_events import HANDLERS, HookContext
-from orchestration_state import load_state
+from orchestration_state import load_state, recover_transactions, registry_lock
 
 
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
-        session_id = str(payload.get("session_id", ""))
-        context = HookContext(payload, load_state(session_id) if session_id else None)
-        if context.active:
-            context.state["last_heartbeat"] = int(time.time())
-            context.state["events"] = context.state.get("events", 0) + 1
-            context.save()
-        handler = HANDLERS.get(context.event)
-        result = handler(context) if handler else None
+        with registry_lock():
+            recover_transactions()
+            session_id = str(payload.get("session_id", ""))
+            context = HookContext(payload, load_state(session_id) if session_id else None)
+            if context.active:
+                context.state["last_heartbeat"] = int(time.time())
+                context.state["events"] = context.state.get("events", 0) + 1
+                context.save()
+            handler = HANDLERS.get(context.event)
+            result = handler(context) if handler else None
         if result is not None:
             print(json.dumps(result, separators=(",", ":")))
         return 0

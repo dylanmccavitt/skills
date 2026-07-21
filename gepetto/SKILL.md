@@ -11,12 +11,12 @@ Read [references/protocol.md](references/protocol.md) and validate its machine-r
 
 ## Invariants
 
-- Refresh Git, GitHub, repository instructions, task state, and the current head before decisions.
+- Refresh Git, GitHub, task state, and the current head before decisions. Content-bind repository instructions; reload them only when their exact-byte digest changes.
 - Run the watchdog check when refreshing task state; route a stale lane through `LANE_UNRESPONSIVE` (checkpoint-replace the lane task with `continue --supervised`), a lane over its restart budget through `RESTART_BUDGET_EXCEEDED` into `needs_decision`, and proactively checkpoint a lane flagged `recycle`.
 - Run research → approved leaf map → Pinocchio → review → Jiminy.
 - Use one app task per lane and reuse matching live tasks.
 - Keep one writer per branch and worktree.
-- Treat a packet as actionable when its stated head SHA matches the live head. Reread persisted artifacts only when assembling `JIMINY_READY` or on a drift event.
+- Treat a packet as actionable when its stated head SHA matches the live head. Refresh persisted artifact digests when assembling `JIMINY_READY` or on a drift event; reload full content only when a digest changed.
 - Bind implementation, review, CI, and merge readiness to the live PR head SHA.
 - Treat `CHECKPOINT_CONTINUATION` as task-ID replacement, never a new lane.
 - Keep blocked lanes separate from validated work.
@@ -34,7 +34,7 @@ Delivery authority includes issue persistence and Jiminy merge authority unless 
 
 ## Dispatch
 
-1. Fast path: when scope is plausibly one leaf with a keep decision, research inline in this task (hooks keep Gepetto code-read-only) and persist the same gepetto-research artifact. Create dedicated research tasks only for multi-issue scope or a likely split/consolidate; register every returned task ID before waiting.
+1. Fast path: when scope is plausibly one leaf with a keep decision, research inline in this task (hooks keep Gepetto code-read-only) and persist the same gepetto-research artifact. Create dedicated research tasks only for multi-issue scope or a likely split/consolidate; register every returned task ID before waiting. Children verify rather than re-register.
 2. Accept a `RESEARCH_PACKET` when its artifact status is `persisted` (analysis-only runs: a verified temporary Markdown artifact). Approve the leaf map only when all required research gates pass.
 3. Create one Pinocchio worktree task per approved leaf; register it as `implementation` and accept its `IMPLEMENTATION_PACKET` when the live PR head equals its `pr_head_sha`.
 4. Create one reviewer worktree task per verified PR; register it and accept its final `REVIEW_PACKET` when `ready_for_jiminy` is true and `reviewed_head_sha` matches the live head.
@@ -43,6 +43,6 @@ Delivery authority includes issue persistence and Jiminy merge authority unless 
 
 ## Complete
 
-Reread each persisted artifact while assembling `JIMINY_READY`. Only now create or reuse one Jiminy task, register it (merge-authorized when granted), and send it one `JIMINY_READY` packet using the protocol schema. Stay available for remediation. A merge is not completion: wait for Jiminy to verify the expected merges and required checks on the refreshed default branch. On `JIMINY_INTEGRATION_FAILED`, create an approved remediation leaf and send it through the same research → Pinocchio → review → Jiminy flow. On `JIMINY_COMPLETE`, verify live PR and linked-issue state, mark this task complete with the protocol command, and finish with clickable PR links, states, merge commits, or exact blockers.
+Refresh each persisted artifact digest while assembling `JIMINY_READY`; reload full content only when the bound digest changed. Only now create or reuse one Jiminy task, authoritatively register it (merge-authorized when granted), and send it one `JIMINY_READY` packet using the protocol schema. Stay available for remediation. A merge is not completion: wait for Jiminy to verify the expected merges and required checks on the refreshed default branch. On `JIMINY_INTEGRATION_FAILED`, create an approved remediation leaf and send it through the same research → Pinocchio → review → Jiminy flow. On `JIMINY_COMPLETE`, verify live PR and linked-issue state, mark this task complete with the protocol command, and finish with clickable PR links, states, merge commits, or exact blockers.
 
-On checkpoint, persist the ledger with `ledger set`, notify Jiminy only if a Jiminy task is live, and resume after any live Jiminy acknowledges the successor.
+On a lane checkpoint, transfer the ledger entry with `ledger move`; use `ledger set` only for ordinary state changes. Notify Jiminy only if a Jiminy task is live, and resume after any live Jiminy acknowledges the successor.
