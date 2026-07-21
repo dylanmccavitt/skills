@@ -29,18 +29,20 @@ AGENT_CONTRACTS = {
         "IMPLEMENTATION_PACKET."
     ),
     "reviewer": (
-        "Review the exact live head. Run fixers serially, rereview every new head, and return only "
-        "REVIEW_PACKET."
+        "Collect all actionable findings, run one fixer pass, re-review the changed delta, and "
+        "return only REVIEW_PACKET."
     ),
     "fixer": (
-        "Fix only the assigned finding, test it, push without force, and return compact proof to "
-        "the reviewer."
+        "Apply the assigned fixes serially, test each, push without force, and return compact "
+        "proof to the reviewer."
     ),
 }
 
 READ_ONLY_ROLES = {"gepetto", "jiminy", "research"}
 FORCE_PUSH = re.compile(r"\bgit\s+push\b[^\n]*(?:--force(?:-with-lease)?|-f\b)")
 PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b")
+API_MERGE = re.compile(r"\bgh\s+api\b")
+MERGE_ENDPOINT = re.compile(r"pulls/\d+/merge\b|\bmergePullRequest\b")
 BOUND_HEAD = re.compile(r"--match-head-commit(?:=|\s+)[0-9a-fA-F]{40}\b")
 
 
@@ -187,11 +189,17 @@ def pre_tool_use(context: HookContext) -> HookResult:
     tool_input = context.payload.get("tool_input") or {}
     command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else ""
 
-    if tool_name == "apply_patch" and context.role in READ_ONLY_ROLES:
+    if tool_name in {"apply_patch", "Edit", "Write"} and context.role in READ_ONLY_ROLES:
         return deny_tool(f"The registered {context.role} role is code-read-only.")
 
     if tool_name == "Bash" and FORCE_PUSH.search(command):
         return deny_tool("Force-pushing is forbidden in Gepetto-managed work.")
+
+    if tool_name == "Bash" and API_MERGE.search(command) and MERGE_ENDPOINT.search(command):
+        return deny_tool(
+            "Merging via gh api is forbidden; use gh pr merge --match-head-commit <sha> "
+            "from a merge-authorized Jiminy task."
+        )
 
     if tool_name == "Bash" and PR_MERGE.search(command):
         if context.role != "jiminy" or not context.state.get("merge_authorized"):

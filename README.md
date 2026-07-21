@@ -1,11 +1,11 @@
 # Codex driven skills
 
-Four skills in codex I have created for agent orchestration work. The orchestration is driven by creating and coordinating codex threads in the desktop app and allows for an easier managed view when working across multiple projects, tasks, or threads. Used mainly for taking a tracked repo from research through to a verified pr and merge:
+Four Codex skills for agent orchestration. Coordinated Codex threads in the desktop app take a tracked repo from research through to a verified PR and merge:
 
-- `$gepetto` — the orchestrator - delegates agents for research, implementation (`$pinocchio`), review, and completion
+- `$gepetto` — orchestrator - researches inline for single-leaf scope, delegates research, implementation (`$pinocchio`), and review threads otherwise
 - `$pinocchio` — implementer - delivers one approved leaf as a verified pull request
-- `$jiminy` — supervisor, and pr manager - monitors the work and validates exact-head merge gates
-- `$checkpoint` — compaction - continues long-running work in a fresh Codex task. When a thread starts to exceed the context window, a checkpoint/handoff forms so work continues in a fresh thread, with the appropriate context needed for the next agent to kick off.
+- `$jiminy` — merge-time gatekeeper - created at JIMINY_READY, re-validates exact-head merge gates on live heads, merges in dependency order, verifies integration
+- `$checkpoint` — compaction - continues long-running work in a fresh Codex thread with the context the successor needs
 
 <h2 align="center">Thread-driven agent graph</h2>
 
@@ -43,7 +43,7 @@ Four skills in codex I have created for agent orchestration work. The orchestrat
     <td align="center">←</td>
     <td align="center">
       <strong>Jiminy</strong><br>
-      <sub>Enforces merge gates</sub>
+      <sub>Merges at JIMINY_READY</sub>
     </td>
     <td align="center">←</td>
     <td align="center">
@@ -55,7 +55,7 @@ Four skills in codex I have created for agent orchestration work. The orchestrat
 
 <p align="center">
   <sub>
-    Review findings return to the Pinocchio thread for repair, followed by a fresh review.
+    The reviewer collects all findings, runs one fixer pass, then re-reviews the changed delta.
   </sub>
 </p>
 
@@ -71,43 +71,45 @@ Four skills in codex I have created for agent orchestration work. The orchestrat
 </table>
 
 <p>
-  Gepetto launches the research, implementation, review, and supervision threads,
-  supplies each thread with a focused contract, and routes structured results through
-  the graph. The orchestration happens through active Codex thread creation—not a
-  background automation or CI pipeline.
+  Gepetto researches single-leaf scope inline and launches dedicated research,
+  implementation, and review threads otherwise, supplying each a focused contract
+  and routing structured results through the graph. Jiminy is created only at
+  JIMINY_READY to execute the merge set. The orchestration happens through active
+  Codex thread creation—not a background automation or CI pipeline.
 </p>
 
 ## Install
-
-Run one of these commands:
 
 ```sh
 npx @dylanmccavitt/skills@latest
 ```
 
-```sh
-bunx @dylanmccavitt/skills@latest
-```
-
-```sh
-pnpm dlx @dylanmccavitt/skills@latest
-```
-
-```sh
-yarn dlx @dylanmccavitt/skills@latest
-```
-
-The installer supports macOS and Linux and requires Node.js 18 or newer and
-Python 3. It installs the suite under `${CODEX_HOME:-$HOME/.codex}`, links all
-four skills into the Codex skills directory, and adds the orchestration hooks
-without removing existing hook entries. If `hooks.json` already exists, the
-installer saves a timestamped backup before updating it.
+`bunx`, `pnpm dlx`, and `yarn dlx` work equally. Supports macOS and Linux;
+requires Node.js 18+ and Python 3. Installs the suite under
+`${CODEX_HOME:-$HOME/.codex}`, links all four skills into the Codex skills
+directory, and adds the orchestration hooks without removing existing hook
+entries. If `hooks.json` already exists, a timestamped backup is saved first.
 
 The installer refuses to replace unrelated skills, an unmanaged installation
 directory, or a symlinked hook configuration. Resolve the reported conflict and
-run the command again. Restart Codex or begin a new task after installation.
+rerun. Restart Codex or begin a new task after installation. To update, rerun
+the same command.
 
-To update the suite, rerun the same command.
+### Uninstall
+
+```sh
+npx @dylanmccavitt/skills@latest uninstall
+```
+
+Removes managed symlinks, the managed install directory, and managed hook entries.
+
+### Doctor
+
+```sh
+npx @dylanmccavitt/skills@latest doctor
+```
+
+Verifies the install; exits non-zero on problems.
 
 ## Development
 

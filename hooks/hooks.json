@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_hook.py\"",
+            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
             "timeout": 10,
             "statusMessage": "Checking checkpoint policy"
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_hook.py\"",
+            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
             "timeout": 10,
             "statusMessage": "Loading lane contract"
           }
@@ -32,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_hook.py\"",
+            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
             "timeout": 10,
             "statusMessage": "Checking lane receipt"
           }
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_hook.py\"",
+            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
             "timeout": 10,
             "statusMessage": "Checking orchestration result"
           }
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/skills/gepetto/../hooks/orchestration_hook.py\"",
+            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
             "timeout": 10,
             "statusMessage": "Checking orchestration guard"
           }

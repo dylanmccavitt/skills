@@ -8,6 +8,7 @@ import json
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +109,24 @@ def continue_session(source_id: str, successor_id: str) -> Path | None:
     return write_state(successor_id, successor)
 
 
+def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = value
+    return target
+
+
+def ledger_set(session_id: str, lane: str, updates: dict[str, Any]) -> Path:
+    state = load_state(session_id)
+    if state is None:
+        raise ValueError(f"no registered session: {session_id}")
+    lane_state = state.setdefault("ledger", {}).setdefault(_safe_id(lane), {})
+    _deep_merge(lane_state, updates)
+    return write_state(session_id, state)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -125,11 +144,49 @@ def _parser() -> argparse.ArgumentParser:
 
     complete_parser = subparsers.add_parser("complete")
     complete_parser.add_argument("--session-id", required=True)
+
+    ledger_parser = subparsers.add_parser("ledger")
+    ledger_actions = ledger_parser.add_subparsers(dest="ledger_command", required=True)
+    ledger_set_parser = ledger_actions.add_parser("set")
+    ledger_set_parser.add_argument("--session-id", required=True)
+    ledger_set_parser.add_argument("--lane", required=True)
+    ledger_set_parser.add_argument("--json", required=True)
+    ledger_show_parser = ledger_actions.add_parser("show")
+    ledger_show_parser.add_argument("--session-id", required=True)
+
+    subparsers.add_parser("status")
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
+    if args.command == "ledger":
+        if args.ledger_command == "set":
+            try:
+                updates = json.loads(args.json)
+            except json.JSONDecodeError as error:
+                print(f"orchestration_state: invalid --json: {error}", file=sys.stderr)
+                return 1
+            if not isinstance(updates, dict):
+                print("orchestration_state: --json must be a JSON object", file=sys.stderr)
+                return 1
+            try:
+                print(ledger_set(args.session_id, args.lane, updates))
+            except ValueError as error:
+                print(f"orchestration_state: {error}", file=sys.stderr)
+                return 1
+        else:
+            state = load_state(args.session_id) or {}
+            print(json.dumps(state.get("ledger", {}), sort_keys=True))
+        return 0
+    if args.command == "status":
+        sessions = state_root() / "sessions"
+        for path in sorted(sessions.glob("*.json")) if sessions.is_dir() else []:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            coordinator = state.get("coordinator_thread_id") or "-"
+            active = "true" if state.get("active") else "false"
+            print(f"{state.get('session_id', path.stem)} role={state.get('role', '-')} active={active} coordinator={coordinator}")
+        return 0
     if args.command == "register":
         path = register(
             args.session_id,
