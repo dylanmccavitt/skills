@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -92,7 +93,7 @@ def register(
     return write_state(session_id, existing)
 
 
-def continue_session(source_id: str, successor_id: str) -> Path | None:
+def continue_session(source_id: str, successor_id: str, *, supervised: bool = False) -> Path | None:
     source = load_state(source_id)
     if source is None:
         return None
@@ -106,6 +107,9 @@ def continue_session(source_id: str, successor_id: str) -> Path | None:
     successor["agents"] = {}
     successor["active"] = True
     successor["checkpoint_on_compact"] = True
+    successor["events"] = 0
+    successor["last_heartbeat"] = int(time.time())
+    successor["restarts"] = source.get("restarts", 0) + (1 if supervised else 0)
     return write_state(successor_id, successor)
 
 
@@ -141,6 +145,7 @@ def _parser() -> argparse.ArgumentParser:
     continue_parser = subparsers.add_parser("continue")
     continue_parser.add_argument("--source-id", required=True)
     continue_parser.add_argument("--successor-id", required=True)
+    continue_parser.add_argument("--supervised", action="store_true")
 
     complete_parser = subparsers.add_parser("complete")
     complete_parser.add_argument("--session-id", required=True)
@@ -196,7 +201,7 @@ def main() -> int:
             coordinator_thread_id=args.coordinator_thread_id,
         )
     elif args.command == "continue":
-        path = continue_session(args.source_id, args.successor_id)
+        path = continue_session(args.source_id, args.successor_id, supervised=args.supervised)
     else:
         state = load_state(args.session_id)
         if state is None:

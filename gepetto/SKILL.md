@@ -12,6 +12,7 @@ Read [references/protocol.md](references/protocol.md) and validate its machine-r
 ## Invariants
 
 - Refresh Git, GitHub, repository instructions, task state, and the current head before decisions.
+- Run the watchdog check when refreshing task state; route a stale lane through `LANE_UNRESPONSIVE` (checkpoint-replace the lane task with `continue --supervised`), a lane over its restart budget through `RESTART_BUDGET_EXCEEDED` into `needs_decision`, and proactively checkpoint a lane flagged `recycle`.
 - Run research → approved leaf map → Pinocchio → review → Jiminy.
 - Use one app task per lane and reuse matching live tasks.
 - Keep one writer per branch and worktree.
