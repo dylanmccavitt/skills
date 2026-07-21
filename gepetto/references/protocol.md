@@ -201,6 +201,14 @@ REVIEW_PACKET:
 
 `ready_for_jiminy` is false whenever the PR head changed after review, CI is pending or failing, an actionable finding remains, or a required repository gate is unknown.
 
+After every required review packet is ready, create or reuse and authoritatively register the single Jiminy task. Only then move each ready review lane into the Jiminy-owned graph with the live runner bound mechanically:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph apply --session-id <gepetto-task-id> --lane <review-task-id> --current-node review --event REVIEW_PACKET --runner-session-id <jiminy-task-id> --context-json '<packet-and-live-head-context>'
+```
+
+The state CLI verifies that the runner is an active `jiminy` registration resolving to this Gepetto coordinator and records its task ID on the lane. Pass the same current runner ID to every later graph transition whose source or target node is Jiminy-owned. After a Jiminy checkpoint, use the verified successor ID.
+
 ## Jiminy task prompt
 
 Create or reuse one project-local Codex app task only when sending `JIMINY_READY`; dispatch this prompt with that packet. Include the exact Gepetto task ID, repository, current PR list, and merge authority. By default, use the request below unchanged: invoking Gepetto for delivery authorizes Jiminy to approve and merge every Gepetto-managed PR without a second user instruction. If the user explicitly requested analysis-only, review-only, review-ready PRs, or no merge, replace the entire merge-authority paragraph with the exact restriction and omit the merge instructions.
@@ -264,7 +272,7 @@ JIMINY_PR_RESULT:
   linked_issue_state: OPEN|CLOSED
 ```
 
-Each result is intermediate and advances no phase by itself. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public `graph apply` command with `ready.expected_pr_urls` and `packet.merge_results` in `--context-json`. It is eligible only when the result-map keys exactly equal `JIMINY_READY.expected_pr_urls` and every value is a full SHA; missing, extra, or malformed PR/commit results block integration verification.
+Each result is intermediate and advances no phase by itself. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public `graph apply` command with `ready.expected_pr_urls` and `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. It is eligible only when the result-map keys exactly equal `JIMINY_READY.expected_pr_urls` and every value is a full SHA; missing, extra, or malformed PR/commit results block integration verification.
 
 ## JIMINY_INTEGRATION_FAILED
 

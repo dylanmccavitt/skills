@@ -7,7 +7,7 @@ Four Codex skills for agent orchestration. Coordinated Codex threads in the desk
 - `$jiminy` — merge-time gatekeeper - created at JIMINY_READY, re-validates exact-head merge gates on live heads, merges in dependency order, verifies integration
 - `$checkpoint` — compaction - continues long-running work in a fresh Codex thread with the context the successor needs
 - Context refs — stable instructions and artifacts are exact-byte SHA-256 references, so unchanged content is not repeatedly loaded into task context
-- State safety — process-locked CAS updates, crash-recoverable continuation journals, and atomic graph/ledger transitions prevent competing authoritative state
+- State safety — process-locked CAS updates, crash-recoverable continuation journals, atomic graph/ledger transitions, and coordinator-bound Jiminy runners prevent competing authoritative state
 - Supervision — mechanical liveness and pressure detection: hooks stamp heartbeats, measurable context/state pressure drives proactive checkpoints, and Gepetto owns every restart
 
 <h2 align="center">Thread-driven agent graph</h2>

@@ -329,6 +329,7 @@ def apply_graph_transition(
     event: str,
     context: dict[str, Any],
     workflow: dict[str, Any],
+    runner_session_id: str | None = None,
 ) -> dict[str, Any]:
     from orchestration_graph import eligible_transitions, resolve_target
 
@@ -350,6 +351,18 @@ def apply_graph_transition(
     if len(matches) != 1:
         raise ValueError(f"expected one eligible transition, found {len(matches)}")
     transition = matches[0]
+    target_node = resolve_target(transition, evaluation_context, workflow["nodes"])
+    source_owner = workflow["nodes"][current_node].get("owner")
+    target_owner = workflow["nodes"][target_node].get("owner")
+    if "jiminy" in {source_owner, target_owner}:
+        if not runner_session_id:
+            raise ValueError("Jiminy runner session ID is required for this transition")
+        verify_registration(
+            runner_session_id,
+            "jiminy",
+            coordinator_thread_id=session_id,
+        )
+        lane_state["jiminy_runner_session_id"] = runner_session_id
     for key, value in transition.get("set", {}).items():
         lane_state[key] = value
     increment = transition.get("increment")
@@ -362,7 +375,7 @@ def apply_graph_transition(
         if type(current) is not int:
             raise ValueError(f"transition counter is not an integer: {path}")
         lane_state[path] = current + amount
-    lane_state["node"] = resolve_target(transition, evaluation_context, workflow["nodes"])
+    lane_state["node"] = target_node
     write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
     return {"transition_id": transition["id"], "lane": lane, "state": lane_state}
 
@@ -570,6 +583,7 @@ def _parser() -> argparse.ArgumentParser:
     graph_apply_parser.add_argument("--current-node", required=True)
     graph_apply_parser.add_argument("--event", required=True)
     graph_apply_parser.add_argument("--context-json", default="{}")
+    graph_apply_parser.add_argument("--runner-session-id")
     graph_apply_parser.add_argument(
         "--workflow", type=Path,
         default=Path(__file__).parents[1] / "gepetto" / "references" / "workflow.json",
@@ -709,7 +723,7 @@ def main() -> int:
             try:
                 result = apply_graph_transition(
                     args.session_id, args.lane, args.current_node, args.event,
-                    context, workflow,
+                    context, workflow, runner_session_id=args.runner_session_id,
                 )
             except (OSError, ValueError) as error:
                 print(f"orchestration_state: {error}", file=sys.stderr)
