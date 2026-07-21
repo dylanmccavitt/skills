@@ -14,7 +14,7 @@ Read [references/runtime-state.md](references/runtime-state.md) when attaching. 
 Gepetto creates or reuses this task only when sending `JIMINY_READY`.
 
 1. Resolve the exact Gepetto task, repository, and `JIMINY_READY` packet; never guess.
-2. Register this task as `jiminy`, adding merge authority only when granted.
+2. Verify Gepetto's authoritative `jiminy` registration and recorded merge authority; never register this task again.
 3. Open the private runtime log.
 
 On `CHECKPOINT_CONTINUATION` from Gepetto, replace the coordinator ID, preserve the role title and log, leave both tasks unarchived, and acknowledge the successor.
@@ -31,4 +31,4 @@ After the final merge, apply the post-merge integration gate to the combined def
 
 ## Complete
 
-Send `JIMINY_COMPLETE` only after every PR state, merge proof, linked-issue check, and post-merge integration field is verified. Mark this task complete with the Gepetto protocol command, then finish with the same result.
+Return `JIMINY_COMPLETE` only after every PR state, merge proof, linked-issue check, artifact content refs, and post-merge integration field is verified. Finish with exactly one terminal packet as the task final result; do not send it separately or run `complete` first. The final Stop deactivates this registration only after validating that packet.

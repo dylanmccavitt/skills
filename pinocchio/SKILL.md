@@ -11,7 +11,7 @@ Read [references/protocol.md](references/protocol.md) before starting. Use its i
 
 ## Invariants
 
-- Refresh the issue, approved research artifact, Git state, remote state, repository instructions, and base SHA before editing.
+- Refresh the issue, Git state, remote state, and base SHA before editing. Content-bind the approved research artifact and repository instructions, loading full content only on the first bind or a digest change.
 - Use one dedicated worktree and branch; preserve unrelated work and remain the only writer until review handoff.
 - Treat the approved research artifact as the scope and acceptance contract. Stop on a material conflict instead of widening it.
 - Map implementation and tests to every acceptance criterion.
@@ -22,7 +22,7 @@ Read [references/protocol.md](references/protocol.md) before starting. Use its i
 
 1. Resolve the project, repository, leaf issue or PR, approved artifact, base SHA, branch convention, authorities, coordinator task ID, and this task's exact ID.
 2. Rename this task `<Project> - Pinocchio - <issue or PR>`.
-3. Register this task as `implementation` with the protocol command supplied by Gepetto.
+3. Verify the coordinator's authoritative `implementation` registration with the protocol command; never register this task again.
 4. Confirm the worktree, branch, and leaf have no competing writer or overlapping delivery.
 
 ## Deliver
@@ -31,10 +31,10 @@ Read [references/protocol.md](references/protocol.md) before starting. Use its i
 2. Implement only the leaf, add proportionate tests, run repository checks, and inspect the final diff.
 3. Commit with repository convention, push without force, and open one linked PR. Do not merge.
 4. Persist and reread the exact-head implementation proof using the protocol artifact contract.
-5. Verify the live PR head matches the artifact, release writer ownership to review, and send one `IMPLEMENTATION_PACKET` to Gepetto.
+5. Verify the live PR head matches the artifact and release writer ownership to review.
 
 ## Complete
 
-Finish with exactly the same `IMPLEMENTATION_PACKET`. Stay code-read-only after handoff unless Gepetto explicitly returns the lane before a fresh review.
+Finish with exactly one `IMPLEMENTATION_PACKET` as the task final result; do not send it separately. Stay code-read-only after handoff unless Gepetto explicitly returns the lane before a fresh review.
 
 On checkpoint, preserve the worktree, branch, head SHA, artifact, coordinator link, and exact next action; notify Gepetto of the successor task.

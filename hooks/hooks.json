@@ -24,6 +24,15 @@
             "statusMessage": "Loading lane contract"
           }
         ]
+      },
+      {
+        "matcher": "tldraw-offline",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/dylanmccavitt/skills/tldraw-offline/inject-server-context.sh' SubagentStart"
+          }
+        ]
       }
     ],
     "SubagentStop": [

@@ -2,11 +2,13 @@
 
 Require the project name, live leaf issue or PR URL, approved research artifact, repository path, default branch and base SHA, branch convention, commit/push/PR and issue-update authority, coordinator task ID, and implementation task ID. Use the canonical title `<Project> - Pinocchio - <issue or PR>`. Never copy the full research contract into chat.
 
-Register the task immediately after creation:
+Gepetto registers the task immediately after creation. Verify that authoritative registration before work; do not register again:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" register --session-id <pinocchio-task-id> --role implementation --coordinator-thread-id <gepetto-task-id>
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" verify --session-id <pinocchio-task-id> --role implementation --coordinator-thread-id <gepetto-task-id>
 ```
+
+Content-bind the exact fetched research artifact and repository instruction files with the Gepetto protocol CLI. Load their full text only when `reload_required` is true; otherwise use the recorded `sha256:` refs.
 
 ## Persisted proof
 
@@ -26,9 +28,10 @@ IMPLEMENTATION_PACKET:
     kind: github_issue|tmp_markdown
     status: persisted|blocked
     marker: <gepetto-implementation for GitHub, null for temporary Markdown>
+    content_ref: <sha256: digest of the exact verified proof snapshot>
     issue_url: <raw live URL, present for a GitHub artifact>
     observed_updated_at: <timestamp after re-read, present for a GitHub artifact>
     path: <absolute path, present for a temporary Markdown artifact>
 ```
 
-Persisting the proof remains mandatory. Gepetto dispatches review after confirming that the live PR head equals `pr_head_sha`; it rereads the artifact only at `JIMINY_READY` assembly or on drift. Finish with only this receipt; never paste proof contents into chat.
+Persistence is mandatory. Gepetto dispatches review only after confirming the live PR head equals `pr_head_sha`. Finish with exactly one receipt as the task final result; do not send it separately or paste proof contents into chat.

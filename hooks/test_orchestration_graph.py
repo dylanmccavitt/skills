@@ -69,6 +69,48 @@ class OrchestrationGraphTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown target"):
             validate_workflow(invalid)
 
+    def test_jiminy_completion_and_merge_set_use_packet_root_guards(self) -> None:
+        complete = eligible_transitions(
+            self.workflow,
+            "integration_verification",
+            "JIMINY_COMPLETE",
+            {"packet": {"integration": {
+                "expected_merges_present": True,
+                "required_checks_green": True,
+                "linked_issues_verified": True,
+                "runtime_ready_for_completion": True,
+            }}},
+        )
+        self.assertEqual([item["id"] for item in complete], ["integration-passed"])
+        merges = eligible_transitions(
+            self.workflow,
+            "merge",
+            "MERGES_VERIFIED",
+            {
+                "ready": {"expected_pr_urls": ["https://pr/1"]},
+                "packet": {"merge_results": {"https://pr/1": "a" * 40}},
+            },
+        )
+        self.assertEqual([item["id"] for item in merges], ["merge-set-verified"])
+        mismatch = {
+            "ready": {"expected_pr_urls": ["https://pr/1"]},
+            "packet": {"merge_results": {"https://pr/2": "b" * 40}},
+        }
+        self.assertEqual(eligible_transitions(self.workflow, "merge", "MERGES_VERIFIED", mismatch), [])
+
+    def test_fixer_head_change_invalidates_pass_and_review_cycles_are_bounded(self) -> None:
+        changed = eligible_transitions(self.workflow, "fixer", "PR_HEAD_CHANGED", {})
+        self.assertEqual(changed[0]["to"], "review")
+        self.assertTrue(changed[0]["set"]["fixer_pass_invalidated"])
+        allowed = eligible_transitions(
+            self.workflow, "review", "ACTIONABLE_FINDINGS", {"review_fix_cycles": 2}
+        )
+        blocked = eligible_transitions(
+            self.workflow, "review", "ACTIONABLE_FINDINGS", {"review_fix_cycles": 3}
+        )
+        self.assertEqual(allowed[0]["increment"], {"path": "review_fix_cycles", "by": 1})
+        self.assertEqual(blocked, [])
+
 
 if __name__ == "__main__":
     unittest.main()
