@@ -6,6 +6,7 @@ Four Codex skills for agent orchestration. Coordinated Codex threads in the desk
 - `$pinocchio` — implementer - delivers one approved leaf as a verified pull request
 - `$jiminy` — merge-time gatekeeper - created at JIMINY_READY, re-validates exact-head merge gates on live heads, merges in dependency order, verifies integration
 - `$checkpoint` — compaction - continues long-running work in a fresh Codex thread with the context the successor needs
+- Supervision — mechanical liveness detection: hooks stamp heartbeats on every registered thread, a watchdog CLI classifies lanes, and Gepetto owns every restart
 
 <h2 align="center">Thread-driven agent graph</h2>
 
@@ -177,6 +178,14 @@ routes, and terminal states. Validate it directly with:
 
 ```sh
 python3 hooks/orchestration_graph.py
+```
+
+The watchdog classifies registered lanes against the graph's supervision
+policies (healthy, stale, recycle, over-budget) and only reports; restarts stay
+with the coordinator. Check it with:
+
+```sh
+python3 hooks/orchestration_watchdog.py check
 ```
 
 ## License

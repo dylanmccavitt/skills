@@ -7,7 +7,12 @@
     "one_writer_per_leaf": true,
     "proof_bound_to_live_head": true,
     "inline_research": "single_leaf_keep",
-    "packet_authoritative_when_head_matches": true
+    "packet_authoritative_when_head_matches": true,
+    "supervision": {
+      "heartbeat_ttl_seconds": {"gepetto": 1800, "research": 900, "implementation": 2700, "review": 2700, "jiminy": 900},
+      "max_lane_restarts": 2,
+      "recycle_after_events": 400
+    }
   },
   "nodes": {
     "research": {"owner": "gepetto", "lane_role": "research"},
@@ -124,6 +129,18 @@
       "from": ["research", "implementation", "review", "fixer", "merge", "integration_verification"],
       "event": "FLOW_BLOCKED",
       "to": "blocked"
+    },
+    {
+      "id": "lane-unresponsive",
+      "from": ["research", "implementation", "review", "fixer", "merge", "integration_verification"],
+      "event": "LANE_UNRESPONSIVE",
+      "to": "blocked"
+    },
+    {
+      "id": "restart-budget-exceeded",
+      "from": ["research", "implementation", "review", "fixer", "merge", "integration_verification"],
+      "event": "RESTART_BUDGET_EXCEEDED",
+      "to": "needs_decision"
     },
     {
       "id": "resume",

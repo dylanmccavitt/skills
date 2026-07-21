@@ -56,6 +56,22 @@ python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_st
 
 Checkpoint capsules point at this ledger instead of restating lane state.
 
+## Supervision
+
+Hooks stamp `last_heartbeat` and an `events` counter on every registered active session. Classify lane liveness mechanically when refreshing task state:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_watchdog.py" check [--json]
+```
+
+The watchdog only reports; Gepetto owns every restart. Apply its statuses explicitly:
+
+- `stale` raises `LANE_UNRESPONSIVE` into `blocked`; replace the lane task through the checkpoint flow, registering the continuation with `continue --supervised` so the restart consumes budget.
+- `over-budget` raises `RESTART_BUDGET_EXCEEDED` into `needs_decision`; stop for a user decision.
+- `recycle` requests a proactive checkpoint (a planned handoff, no `--supervised`).
+
+TTLs, the restart budget, and the recycle threshold come from `policies.supervision` in `workflow.json`. The command exits non-zero when any lane is stale or over-budget.
+
 ## Research task prompt
 
 Dispatch a research task only for multi-issue scope or a likely split/consolidate; otherwise Gepetto researches inline and persists the same artifact. Include the project path, issue URL, current default-branch SHA, repository instructions, and `coordinatorThreadId` when Gepetto resolved it. Use this request:

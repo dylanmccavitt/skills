@@ -229,6 +229,30 @@ class OrchestrationHookTest(unittest.TestCase):
         allowed = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": f"gh pr merge 1 --squash --match-head-commit {SHA}"})
         self.assertIsNone(allowed)
 
+    def session_state(self, session_id: str = "session-1") -> dict[str, object]:
+        path = Path(self.temporary.name) / "sessions" / f"{session_id}.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_hook_events_stamp_heartbeat_and_count_events(self) -> None:
+        self.register("implementation")
+        self.assertNotIn("last_heartbeat", self.session_state())
+        self.hook("SessionStart", source="startup")
+        state = self.session_state()
+        self.assertIsInstance(state["last_heartbeat"], int)
+        self.assertEqual(state["events"], 1)
+        self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "ls"})
+        self.assertEqual(self.session_state()["events"], 2)
+
+    def test_continue_resets_successor_events(self) -> None:
+        self.register("implementation")
+        self.hook("SessionStart", source="startup")
+        self.hook("SessionStart", source="startup")
+        self.state_command("continue", "--source-id", "session-1", "--successor-id", "session-2")
+        self.assertEqual(self.session_state()["events"], 2)
+        successor = self.session_state("session-2")
+        self.assertEqual(successor["events"], 0)
+        self.assertIsInstance(successor["last_heartbeat"], int)
+
 
 if __name__ == "__main__":
     unittest.main()

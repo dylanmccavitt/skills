@@ -27,13 +27,14 @@
     "hooks/orchestration_graph.py",
     "hooks/orchestration_hook.py",
     "hooks/orchestration_state.py",
+    "hooks/orchestration_watchdog.py",
     "jiminy/",
     "pinocchio/",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs && python3 -m unittest hooks/test_orchestration_hooks.py hooks/test_orchestration_graph.py && python3 hooks/orchestration_graph.py",
+    "test": "node --test test/*.test.mjs && python3 -m unittest hooks/test_orchestration_hooks.py hooks/test_orchestration_graph.py hooks/test_orchestration_watchdog.py && python3 hooks/orchestration_graph.py",
     "prepack": "npm test"
   },
   "engines": {
