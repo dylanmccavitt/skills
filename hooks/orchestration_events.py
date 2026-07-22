@@ -198,12 +198,14 @@ def _bash_writes_files(command: str, *, _depth: int = 0) -> bool:
             for argument in arguments:
                 if argument in SHELL_CONTROLS or argument == "--":
                     break
-                if not argument.startswith("-"):
-                    break
                 if (
                     argument == "--in-place"
                     or argument.startswith("--in-place=")
-                    or (not argument.startswith("--") and "i" in argument[1:])
+                    or (
+                        argument.startswith("-")
+                        and not argument.startswith("--")
+                        and "i" in argument[1:]
+                    )
                 ):
                     return True
         if executable == "git" and index + 1 < len(tokens):

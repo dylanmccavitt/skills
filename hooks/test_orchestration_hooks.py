@@ -506,6 +506,7 @@ class OrchestrationHookTest(unittest.TestCase):
             "tee hooks/new.py",
             "printf value > hooks/new.py",
             "sed -i.bak s/old/new/ hooks/file.py",
+            "sed -e 's/old/new/' -i '' hooks/file.py",
             "git checkout -- hooks/file.py",
             "git -C /tmp/repository checkout -- hooks/file.py",
             "sh -c 'rm hooks/file.py'",
@@ -513,6 +514,7 @@ class OrchestrationHookTest(unittest.TestCase):
             "eval 'rm hooks/file.py'",
             deeply_nested,
             "perl -pi -e 's/old/new/' hooks/file.py",
+            "perl -e 's/old/new/' -pi hooks/file.py",
             "sed -ni '' 's/old/new/' hooks/file.py",
             "find hooks -name '*.tmp' -delete",
         )
@@ -1617,10 +1619,17 @@ class OrchestrationHookTest(unittest.TestCase):
         self.register(
             "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
         )
+        self.register("gepetto", session_id="foreign-coordinator")
+        self.register(
+            "review", "--coordinator-thread-id", "foreign-coordinator",
+            session_id="foreign-review",
+        )
         pr_url = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
         valid_lane = self.merge_lane_state(pr_url)
         self.set_trusted_lane("review-1", valid_lane)
         self.set_trusted_lane("implementation-spoof", valid_lane)
+        foreign_lane = self.merge_lane_state("https://github.com/owner/repo/pull/3")
+        self.set_trusted_lane("foreign-review", foreign_lane)
 
         def rejected(packet: dict[str, object], message: str) -> None:
             state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
@@ -1650,6 +1659,10 @@ class OrchestrationHookTest(unittest.TestCase):
         spoofed["expected_pr_urls"].append(second["pr_url"])
         spoofed["merge_order"].append(second["pr_url"])
         rejected(spoofed, "not a registered review task")
+
+        foreign = copy.deepcopy(spoofed)
+        foreign["pull_requests"][1]["reviewer_task_id"] = "foreign-review"
+        rejected(foreign, "reviewer coordinator mismatch")
 
         duplicate = copy.deepcopy(spoofed)
         duplicate["pull_requests"][1]["reviewer_task_id"] = "review-1"

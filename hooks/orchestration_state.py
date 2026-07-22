@@ -1135,6 +1135,21 @@ def bind_jiminy_ready(
             raise ValueError(
                 f"merge authority reviewer is not a registered review task: {reviewer_task_id}"
             )
+        registered_coordinator = reviewer_registration.get("coordinator_thread_id")
+        candidate = registered_coordinator
+        visited: set[str] = set()
+        resolved_coordinator = None
+        while isinstance(candidate, str) and candidate not in visited:
+            visited.add(candidate)
+            observed = load_state(candidate)
+            if observed and observed.get("role") == "gepetto" and observed.get("active"):
+                resolved_coordinator = candidate
+                break
+            candidate = observed.get("successor_id") if observed else None
+        if resolved_coordinator != session_id:
+            raise ValueError(
+                f"merge authority reviewer coordinator mismatch: {reviewer_task_id}"
+            )
         authority_state = ledger.get(reviewer_task_id)
         if not isinstance(authority_state, dict) or authority_state.get("tombstone"):
             raise ValueError(f"no active review ledger lane: {reviewer_task_id}")

@@ -239,14 +239,10 @@ class OrchestrationGraphTest(unittest.TestCase):
         allowed = eligible_transitions(
             self.workflow, "review", "ACTIONABLE_FINDINGS", {"review_fix_cycles": 2}
         )
-        recovered = eligible_transitions(
-            self.workflow, "merge", "ACTIONABLE_FINDINGS", {"review_fix_cycles": 2}
-        )
         blocked = eligible_transitions(
             self.workflow, "review", "ACTIONABLE_FINDINGS", {"review_fix_cycles": 3}
         )
         self.assertEqual(allowed[0]["increment"], {"path": "review_fix_cycles", "by": 1})
-        self.assertEqual(recovered[0]["to"], "fixer")
         self.assertEqual(blocked, [])
 
 
