@@ -35,7 +35,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs && python3 -m unittest discover -s hooks -p 'test_*.py' && python3 hooks/orchestration_graph.py",
+    "test": "node --test test/*.test.mjs && python3 -m unittest discover -s hooks -p \"test_*.py\" && python3 hooks/orchestration_graph.py",
     "prepack": "npm test"
   },
   "engines": {
