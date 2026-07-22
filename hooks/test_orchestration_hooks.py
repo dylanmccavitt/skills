@@ -336,6 +336,32 @@ class OrchestrationHookTest(unittest.TestCase):
             check=check,
         )
 
+    def accept_command(
+        self,
+        event: str,
+        packet: dict[str, object],
+        *,
+        lane: str,
+        actor: str,
+        expected_revision: int | None = None,
+        observed_head: str | None = None,
+        runner: str | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        revision = expected_revision
+        if revision is None:
+            revision = int(self.session_state()["state_revision"])
+        arguments = [
+            "graph", "accept", "--session-id", "session-1", "--lane", lane,
+            "--actor-session-id", actor, "--expected-revision", str(revision),
+            "--event", event, "--packet-json", json.dumps(packet),
+        ]
+        if observed_head is not None:
+            arguments.extend(("--observed-pr-head-sha", observed_head))
+        if runner is not None:
+            arguments.extend(("--runner-session-id", runner))
+        return self.state_command(*arguments, check=check)
+
     def test_read_only_roles_cannot_edit_or_write(self) -> None:
         for index, role in enumerate(("gepetto", "jiminy", "research"), start=1):
             session_id = f"read-only-{index}"
@@ -446,127 +472,230 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(blocked.returncode, 1)
         self.assertIn("found 0", blocked.stderr)
 
-    def test_graph_transition_into_jiminy_node_requires_registered_runner(self) -> None:
+    def test_graph_accept_persists_typed_event_and_receipt_in_one_revision(self) -> None:
         self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        trusted = {
+            "node": "implementation", "review_fix_cycles": 2, "resume_node": "review",
+            "head_sha": SHA, "expected_pr_urls": ["https://example.test/pr/1"],
+            "owner": "impl-1", "coordinator_thread_id": "session-1",
+        }
         self.state_command(
-            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps(trusted),
+        )
+        before_revision = int(self.session_state()["state_revision"])
+
+        result = json.loads(self.accept_command(
+            "IMPLEMENTATION_PACKET", valid_packets()["IMPLEMENTATION_PACKET"],
+            lane="impl-1", actor="impl-1", observed_head=SHA,
+        ).stdout)
+
+        after = self.session_state()
+        self.assertEqual(after["state_revision"], before_revision + 1)
+        lane = after["ledger"]["impl-1"]
+        self.assertEqual(lane["node"], "review")
+        for key, value in trusted.items():
+            if key != "node":
+                self.assertEqual(lane[key], value)
+        receipt = lane["acceptance_receipts"][0]
+        self.assertEqual(receipt, result["acceptance_receipt"])
+        self.assertEqual(receipt["event"], "IMPLEMENTATION_PACKET")
+        self.assertEqual(receipt["transition_id"], "implementation-proved")
+        self.assertEqual(receipt["resulting_node"], "review")
+        self.assertEqual(receipt["actor_session_id"], "impl-1")
+        self.assertEqual(receipt["observed_pr_head_sha"], SHA)
+        self.assertRegex(receipt["packet_digest"], r"^sha256:[0-9a-f]{64}$")
+        self.assertIsInstance(receipt["timestamp"], int)
+
+    def test_graph_accept_failures_leave_state_byte_for_byte_unchanged(self) -> None:
+        wrong_version = valid_packets()["IMPLEMENTATION_PACKET"]
+        wrong_version["packet_version"] = 2
+        cases = (
+            ("head mismatch", valid_packets()["IMPLEMENTATION_PACKET"], "b" * 40, None),
+            ("missing head", valid_packets()["IMPLEMENTATION_PACKET"], None, None),
+            ("wrong packet type", valid_packets()["REVIEW_PACKET"], SHA, None),
+            ("wrong packet version", wrong_version, SHA, None),
+            ("malformed packet", {"packet_version": 1}, SHA, None),
+            ("stale revision", valid_packets()["IMPLEMENTATION_PACKET"], SHA, 0),
+        )
+        for name, packet, observed_head, revision in cases:
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.register("gepetto")
+                self.register(
+                    "implementation", "--coordinator-thread-id", "session-1",
+                    session_id="impl-1",
+                )
+                self.state_command(
+                    "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+                    "--json", '{"node":"implementation"}',
+                )
+                state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+                before = state_path.read_bytes()
+                blocked = self.accept_command(
+                    "IMPLEMENTATION_PACKET", packet, lane="impl-1", actor="impl-1",
+                    expected_revision=revision, observed_head=observed_head, check=False,
+                )
+                self.assertEqual(blocked.returncode, 1)
+                self.assertEqual(state_path.read_bytes(), before)
+
+    def test_graph_accept_enforces_actor_and_jiminy_runner_authority(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-2"
+        )
+        self.register("review", "--coordinator-thread-id", "session-1", session_id="review-1")
+        self.register("gepetto", session_id="other-coordinator")
+        self.register(
+            "implementation", "--coordinator-thread-id", "other-coordinator",
+            session_id="impl-other",
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", '{"node":"implementation"}',
+        )
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        for actor in ("impl-2", "review-1", "impl-other"):
+            before = state_path.read_bytes()
+            blocked = self.accept_command(
+                "IMPLEMENTATION_PACKET", valid_packets()["IMPLEMENTATION_PACKET"],
+                lane="impl-1", actor=actor, observed_head=SHA, check=False,
+            )
+            self.assertEqual(blocked.returncode, 1)
+            self.assertEqual(state_path.read_bytes(), before)
+
+        self.state_command("complete", "--session-id", "impl-1")
+        before = state_path.read_bytes()
+        inactive = self.accept_command(
+            "IMPLEMENTATION_PACKET", valid_packets()["IMPLEMENTATION_PACKET"],
+            lane="impl-1", actor="impl-1", observed_head=SHA, check=False,
+        )
+        self.assertEqual(inactive.returncode, 1)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_graph_accept_requires_authorized_jiminy_runner_when_entering_merge(self) -> None:
+        self.register("gepetto")
+        self.register("review", "--coordinator-thread-id", "session-1", session_id="review-1")
+        self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1")
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-1",
             "--json", '{"node":"review","review_fix_cycles":0}',
         )
-        context = json.dumps(
-            {
-                "packet": valid_packets()["REVIEW_PACKET"],
-                "live": {"pr_head_sha": SHA},
-            }
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        missing = self.accept_command(
+            "REVIEW_PACKET", valid_packets()["REVIEW_PACKET"],
+            lane="review-1", actor="review-1", observed_head=SHA, check=False,
         )
-        blocked = self.state_command(
-            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
-            "--current-node", "review", "--event", "REVIEW_PACKET",
-            "--context-json", context, check=False,
-        )
-        self.assertEqual(blocked.returncode, 1)
-        self.assertIn("Jiminy runner", blocked.stderr)
-        self.assertEqual(self.session_state()["ledger"]["review-lane"]["node"], "review")
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("Jiminy runner", missing.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
 
-    def test_graph_transition_accepts_jiminy_runner_bound_to_coordinator(self) -> None:
-        self.register("gepetto")
-        self.register(
-            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
-        )
-        self.state_command(
-            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", '{"node":"review","review_fix_cycles":0}',
-        )
-        context = json.dumps(
-            {
-                "packet": valid_packets()["REVIEW_PACKET"],
-                "live": {"pr_head_sha": SHA},
-            }
-        )
-        applied = self.state_command(
-            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
-            "--current-node", "review", "--event", "REVIEW_PACKET",
-            "--context-json", context, "--runner-session-id", "jiminy-1",
-        )
-        result = json.loads(applied.stdout)
-        self.assertEqual(result["transition_id"], "review-approved")
-        self.assertEqual(result["state"]["node"], "merge")
-        self.assertEqual(result["state"]["jiminy_runner_session_id"], "jiminy-1")
+        accepted = json.loads(self.accept_command(
+            "REVIEW_PACKET", valid_packets()["REVIEW_PACKET"],
+            lane="review-1", actor="review-1", observed_head=SHA, runner="jiminy-1",
+        ).stdout)
+        self.assertEqual(accepted["state"]["node"], "merge")
+        self.assertEqual(accepted["state"]["jiminy_runner_session_id"], "jiminy-1")
 
-    def test_graph_transition_rejects_replacing_bound_jiminy_runner(self) -> None:
+    def test_graph_accept_binds_and_preserves_jiminy_runner(self) -> None:
         self.register("gepetto")
-        self.register(
-            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
-        )
-        self.register(
-            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-2"
-        )
+        self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1")
+        self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-2")
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
             "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
         )
-        context = json.dumps({"packet": valid_packets()["JIMINY_PR_RESULT"]})
-
-        blocked = self.state_command(
-            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
-            "--current-node", "merge", "--event", "JIMINY_PR_RESULT",
-            "--context-json", context, "--runner-session-id", "jiminy-2", check=False,
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        wrong = self.accept_command(
+            "JIMINY_PR_RESULT", valid_packets()["JIMINY_PR_RESULT"],
+            lane="review-lane", actor="jiminy-2", check=False,
         )
+        self.assertEqual(wrong.returncode, 1)
+        self.assertEqual(state_path.read_bytes(), before)
 
-        self.assertEqual(blocked.returncode, 1)
-        self.assertIn("bound to Jiminy runner jiminy-1", blocked.stderr)
-        lane = self.session_state()["ledger"]["review-lane"]
-        self.assertEqual(lane["node"], "merge")
-        self.assertEqual(lane["jiminy_runner_session_id"], "jiminy-1")
+        self.state_command("continue", "--source-id", "jiminy-1", "--successor-id", "jiminy-3")
+        accepted = json.loads(self.accept_command(
+            "JIMINY_PR_RESULT", valid_packets()["JIMINY_PR_RESULT"],
+            lane="review-lane", actor="jiminy-3",
+        ).stdout)
+        self.assertEqual(accepted["state"]["jiminy_runner_session_id"], "jiminy-3")
 
-    def test_graph_transition_accepts_bound_jiminy_checkpoint_successor(self) -> None:
+    def test_graph_accept_concurrent_expected_revision_has_one_winner(self) -> None:
         self.register("gepetto")
         self.register(
-            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
         )
         self.state_command(
-            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", '{"node":"implementation"}',
         )
-        self.state_command(
-            "continue", "--source-id", "jiminy-1", "--successor-id", "jiminy-2",
-        )
-        context = json.dumps({"packet": valid_packets()["JIMINY_PR_RESULT"]})
+        revision = int(self.session_state()["state_revision"])
+        arguments = [
+            PYTHON, str(STATE), "graph", "accept", "--session-id", "session-1",
+            "--lane", "impl-1", "--actor-session-id", "impl-1",
+            "--expected-revision", str(revision), "--event", "IMPLEMENTATION_PACKET",
+            "--packet-json", json.dumps(valid_packets()["IMPLEMENTATION_PACKET"]),
+            "--observed-pr-head-sha", SHA,
+        ]
+        processes = [
+            subprocess.Popen(
+                arguments, env=self.env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for _ in range(2)
+        ]
+        results = [process.communicate(timeout=10) + (process.returncode,) for process in processes]
+        self.assertEqual(sorted(result[2] for result in results), [0, 1], results)
+        failure = next(result for result in results if result[2] == 1)
+        self.assertIn("state revision conflict", failure[1])
 
-        applied = self.state_command(
-            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
-            "--current-node", "merge", "--event", "JIMINY_PR_RESULT",
-            "--context-json", context, "--runner-session-id", "jiminy-2",
-        )
-
-        result = json.loads(applied.stdout)
-        self.assertEqual(result["state"]["node"], "merge")
-        self.assertEqual(result["state"]["jiminy_runner_session_id"], "jiminy-2")
-
-    def test_graph_transition_rejects_merge_result_for_unreviewed_head(self) -> None:
+    def test_packet_events_cannot_use_free_form_graph_apply(self) -> None:
         self.register("gepetto")
-        self.register(
-            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
-        )
         self.state_command(
-            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", '{"node":"implementation","review_fix_cycles":4}',
         )
-        packet = valid_packets()["JIMINY_PR_RESULT"]
-        packet["reviewed_head_sha"] = "b" * 40
-        context = json.dumps({
-            "packet": packet,
-            "persisted": {"head_sha": "b" * 40},
-        })
-
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
         blocked = self.state_command(
-            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
-            "--current-node", "merge", "--event", "JIMINY_PR_RESULT",
-            "--context-json", context, "--runner-session-id", "jiminy-1", check=False,
+            "graph", "apply", "--session-id", "session-1", "--lane", "impl-1",
+            "--current-node", "implementation", "--event", "IMPLEMENTATION_PACKET",
+            "--context-json", json.dumps({
+                "packet": valid_packets()["IMPLEMENTATION_PACKET"],
+                "live": {"pr_head_sha": SHA}, "review_fix_cycles": 0,
+            }), check=False,
         )
-
         self.assertEqual(blocked.returncode, 1)
-        self.assertIn("found 0", blocked.stderr)
-        self.assertEqual(self.session_state()["ledger"]["review-lane"]["head_sha"], SHA)
+        self.assertIn("must use graph accept", blocked.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_atomic_state_replace_failure_preserves_prior_bytes_and_cleans_stage(self) -> None:
+        self.register("gepetto")
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        candidate = self.session_state()
+        candidate["active"] = False
+
+        with patch.dict(os.environ, {
+            "CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name,
+        }), patch.object(Path, "replace", side_effect=OSError("injected replace failure")):
+            with self.assertRaisesRegex(OSError, "injected replace failure"):
+                orchestration_state.write_state(
+                    "session-1", candidate,
+                    expected_revision=int(candidate["state_revision"]),
+                )
+
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertEqual(list(state_path.parent.glob(".session-1.json.*.tmp")), [])
 
     def test_blocking_workflow_load_does_not_hold_registry_lock(self) -> None:
         self.register("gepetto")

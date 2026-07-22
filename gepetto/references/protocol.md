@@ -164,6 +164,12 @@ Use $pinocchio to deliver <leaf-issue-url> from the approved contract at <resear
 
 Use Pinocchio's packet schema and gates exactly. Dispatch review only after confirming the live PR head equals `pr_head_sha`.
 
+Accept the verified packet against the live head and current coordinator revision. Packet events must use `graph accept`; `graph apply` remains the explicit administrative path for non-packet transitions.
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph accept --session-id <gepetto-task-id> --lane <implementation-task-id> --actor-session-id <implementation-task-id> --expected-revision <current-coordinator-revision> --event IMPLEMENTATION_PACKET --packet-json '<packet-json>' --observed-pr-head-sha <live-pr-head-sha>
+```
+
 ## Review task prompt
 
 Include the issue URL, PR URL, exact expected head SHA, repository instructions, acceptance criteria, and `coordinatorThreadId` when available. Use this request:
@@ -215,7 +221,7 @@ REVIEW_PACKET:
 After every required review packet is ready, create or reuse and authoritatively register the single Jiminy task. Only then move each ready review lane into the Jiminy-owned graph with the live runner bound mechanically:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph apply --session-id <gepetto-task-id> --lane <review-task-id> --current-node review --event REVIEW_PACKET --runner-session-id <jiminy-task-id> --context-json '<packet-and-live-head-context>'
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph accept --session-id <gepetto-task-id> --lane <review-task-id> --actor-session-id <review-task-id> --expected-revision <current-coordinator-revision> --event REVIEW_PACKET --packet-json '<packet-json>' --observed-pr-head-sha <live-pr-head-sha> --runner-session-id <jiminy-task-id>
 ```
 
 The state CLI verifies that the runner is an active `jiminy` registration resolving to this Gepetto coordinator and records its task ID on the lane. Pass the same current runner ID to every later graph transition whose source or target node is Jiminy-owned. After a Jiminy checkpoint, use the verified successor ID.
@@ -292,7 +298,7 @@ JIMINY_PR_RESULT:
 }
 ```
 
-Each result is intermediate and advances no phase by itself. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public `graph apply` command with `ready.expected_pr_urls` and `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. It is eligible only when the result-map keys exactly equal `JIMINY_READY.expected_pr_urls` and every value is a full SHA; missing, extra, or malformed PR/commit results block integration verification.
+Each result is intermediate and advances no phase by itself. Accept it with `graph accept`, the current coordinator revision, the bound Jiminy actor, and the exact packet JSON; this records the same-node acceptance receipt atomically. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public administrative `graph apply` command with `ready.expected_pr_urls` and `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. It is eligible only when the result-map keys exactly equal `JIMINY_READY.expected_pr_urls` and every value is a full SHA; missing, extra, or malformed PR/commit results block integration verification.
 
 ## JIMINY_INTEGRATION_FAILED
 
