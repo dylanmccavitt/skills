@@ -149,7 +149,7 @@ def _state_cli_invocations(command: str) -> tuple[list[list[str]], bool]:
     return invocations, ambiguous
 
 
-def _bash_writes_files(command: str) -> bool:
+def _bash_writes_files(command: str, *, _depth: int = 0) -> bool:
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
         lexer.whitespace_split = True
@@ -166,18 +166,60 @@ def _bash_writes_files(command: str) -> bool:
         executable = os.path.basename(token)
         if executable in FILE_WRITE_COMMANDS:
             return True
+        if executable in {"bash", "dash", "ksh", "sh", "zsh"} and _depth < 4:
+            shell_arguments = tokens[index + 1:]
+            for argument_index, argument in enumerate(shell_arguments):
+                if argument in SHELL_CONTROLS:
+                    break
+                if argument == "-c" or (
+                    argument.startswith("-")
+                    and not argument.startswith("--")
+                    and "c" in argument[1:]
+                ):
+                    if argument_index + 1 < len(shell_arguments) and _bash_writes_files(
+                        shell_arguments[argument_index + 1], _depth=_depth + 1
+                    ):
+                        return True
+                    break
         if executable in {"sed", "perl"}:
             arguments = tokens[index + 1:]
-            if any(
-                argument == "--in-place"
-                or argument.startswith("--in-place=")
-                or argument.startswith("-i")
-                for argument in arguments
-                if argument not in SHELL_CONTROLS
-            ):
-                return True
+            for argument in arguments:
+                if argument in SHELL_CONTROLS or argument == "--":
+                    break
+                if not argument.startswith("-"):
+                    break
+                if (
+                    argument == "--in-place"
+                    or argument.startswith("--in-place=")
+                    or (not argument.startswith("--") and "i" in argument[1:])
+                ):
+                    return True
         if executable == "git" and index + 1 < len(tokens):
-            if tokens[index + 1] in GIT_WRITE_COMMANDS:
+            arguments = tokens[index + 1:]
+            value_options = {
+                "-C", "-c", "--config-env", "--exec-path", "--git-dir",
+                "--namespace", "--super-prefix", "--work-tree",
+            }
+            subcommand = None
+            skip = False
+            for argument in arguments:
+                if argument in SHELL_CONTROLS or argument == "--":
+                    break
+                if skip:
+                    skip = False
+                    continue
+                if argument in value_options:
+                    skip = True
+                    continue
+                if any(argument.startswith(f"{option}=") for option in value_options):
+                    continue
+                if argument.startswith(("-C", "-c")) and len(argument) > 2:
+                    continue
+                if argument.startswith("-"):
+                    continue
+                subcommand = argument
+                break
+            if subcommand in GIT_WRITE_COMMANDS:
                 return True
         if executable == "find" and "-delete" in tokens[index + 1:]:
             return True
@@ -194,12 +236,15 @@ def _merge_scope(command: str) -> tuple[str, str, str] | None:
         tokens = list(lexer)
     except ValueError:
         return None
-    for index in range(len(tokens) - 2):
-        if (
-            os.path.basename(tokens[index]) != "gh"
-            or tokens[index + 1:index + 3] != ["pr", "merge"]
-        ):
-            continue
+    merge_indexes = [
+        index
+        for index in range(len(tokens) - 2)
+        if os.path.basename(tokens[index]) == "gh"
+        and tokens[index + 1:index + 3] == ["pr", "merge"]
+    ]
+    if len(merge_indexes) != 1:
+        return None
+    for index in merge_indexes:
         arguments: list[str] = []
         for token in tokens[index + 3:]:
             if token in SHELL_CONTROLS:

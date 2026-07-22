@@ -89,9 +89,14 @@ class OrchestrationContractTest(unittest.TestCase):
         self.assertIsNone(overlapping_path("test", "testing"))
         self.assertTrue(path_is_owned("gepetto/SKILL.md", ["gepetto/"]))
         self.assertFalse(path_is_owned("gepetto-old/SKILL.md", ["gepetto/"]))
-        for invalid in ("../hooks", "/hooks", "hooks/./file", "hooks//file"):
+        for invalid in (
+            "../hooks", "/hooks", "hooks/./file", "hooks//file",
+            "hooks\\file.py", " hooks/file.py", "hooks/file.py ",
+        ):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 normalize_path_prefix(invalid)
+        self.assertFalse(path_is_owned("hooks\\outside.py", ["hooks/"]))
+        self.assertFalse(path_is_owned("hooks/file with spaces.py", ["hooks/"]))
 
     def test_valid_single_and_multi_leaf_version_one_specs_pass(self) -> None:
         for multi_leaf in (False, True):

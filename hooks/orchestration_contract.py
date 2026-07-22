@@ -173,7 +173,9 @@ def repository_from_github_url(value: str, *, kind: str) -> str:
 
 def normalize_path_prefix(value: str) -> str:
     """Normalize one repository-relative path/prefix without broadening it."""
-    candidate = value.strip().replace("\\", "/")
+    candidate = value
+    if candidate != candidate.strip() or "\\" in candidate:
+        raise ValueError(f"invalid repository-relative path prefix: {value!r}")
     if not PATH_PREFIX.fullmatch(candidate):
         raise ValueError(f"invalid repository-relative path prefix: {value!r}")
     segments = candidate.rstrip("/").split("/")
@@ -214,11 +216,17 @@ def overlapping_path(left: str, right: str) -> str | None:
 
 
 def path_is_owned(path: str, prefixes: list[str]) -> bool:
-    normalized = normalize_path_prefix(path)
-    return any(path_prefixes_overlap(normalized, prefix) and (
-        normalized == normalize_path_prefix(prefix)
-        or normalized.startswith(normalize_path_prefix(prefix) + "/")
-    ) for prefix in prefixes)
+    try:
+        normalized = normalize_path_prefix(path)
+    except ValueError:
+        # Git permits names outside the delivery-spec path alphabet. They are
+        # valid changed files, but can never be covered by a normalized claim.
+        return False
+    for prefix in prefixes:
+        normalized_prefix = normalize_path_prefix(prefix)
+        if normalized == normalized_prefix or normalized.startswith(normalized_prefix + "/"):
+            return True
+    return False
 
 
 def _validate_semantics(specification: dict[str, Any]) -> None:

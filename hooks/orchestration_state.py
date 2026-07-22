@@ -557,14 +557,37 @@ def acquire_claim(
         and all(current.get(key) == value for key, value in candidate.items())
     ):
         return {"claim": current, "idempotent": True}
-    if current is not None:
+    stale_current = (
+        isinstance(current, dict)
+        and current.get("status") == "active"
+        and (
+            current.get("generations") != candidate["generations"]
+            or current.get("base_sha") != candidate["base_sha"]
+        )
+    )
+    if current is not None and not stale_current:
         raise ValueError(f"lane already has a different ownership claim: {lane}")
-    for existing in claims.values():
+    for existing_lane, existing in claims.items():
+        if existing_lane == lane:
+            continue
         if not isinstance(existing, dict) or existing.get("status") != "active":
             continue
         conflict = _claims_conflict(candidate, existing)
         if conflict:
             raise ValueError(conflict)
+    if stale_current:
+        history = state.get("ownership_claim_history")
+        if history is None:
+            history = []
+            state["ownership_claim_history"] = history
+        if not isinstance(history, list):
+            raise ValueError("invalid ownership claim history")
+        history.append({
+            **current,
+            "status": "superseded",
+            "superseded_reason": "proof_invalidation",
+            "superseded_at": int(time.time()),
+        })
     candidate["acquired_at"] = int(time.time())
     claims[lane] = candidate
     lane_state["ownership_claim_id"] = lane
@@ -597,6 +620,20 @@ def _release_claim_in_state(
         raise ValueError("invalid ownership claim history")
     history.append(released)
     return released
+
+
+def _revoke_merge_authorities_for_lane(state: dict[str, Any], lane: str) -> None:
+    authorities = state.get("merge_authorities")
+    if authorities is None:
+        return
+    if not isinstance(authorities, dict):
+        raise ValueError("invalid merge authority container")
+    for pr_url in [
+        pr_url
+        for pr_url, authority in authorities.items()
+        if isinstance(authority, dict) and authority.get("lane") == lane
+    ]:
+        authorities.pop(pr_url)
 
 
 def release_claim(
@@ -1209,7 +1246,11 @@ def verify_merge_authority(
         raise ValueError("merge authority belongs to a different Jiminy runner")
     lane_id = authority.get("lane")
     lane_state = coordinator.get("ledger", {}).get(lane_id)
-    if not isinstance(lane_state, dict) or lane_state.get("tombstone"):
+    if (
+        not isinstance(lane_state, dict)
+        or lane_state.get("tombstone")
+        or lane_state.get("node") != "merge"
+    ):
         raise ValueError("merge authority lane is unavailable")
     lifecycle = _proof_lifecycle(lane_state)
     if (
@@ -1355,6 +1396,7 @@ def apply_graph_transition(
     lane_state["node"] = target_node
     if event == "DELIVERY_CANCELLED":
         _release_claim_in_state(state, lane, "delivery_cancellation")
+        _revoke_merge_authorities_for_lane(state, lane)
     write_state(session_id, state, expected_revision=observed_revision)
     return {"transition_id": transition["id"], "lane": lane, "state": lane_state}
 
@@ -1688,6 +1730,7 @@ def accept_graph_event(
             "ready_for_jiminy": packet["ready_for_jiminy"],
             "reviewed_head_sha": packet["reviewed_head_sha"],
         })
+        _release_claim_in_state(state, lane, "verified_handoff")
     elif event == "JIMINY_PR_RESULT":
         _bind_current_proof(lifecycle, "merge_result", {
             "packet_digest": packet_digest,
