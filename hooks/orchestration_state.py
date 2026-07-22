@@ -867,8 +867,12 @@ def accept_graph_event(
         artifact_ref = f"sha256:{_context_digest_contents([artifact_bytes])}"
         if artifact_ref != packet["artifact"]["content_ref"]:
             raise ValueError("research artifact file does not match packet content_ref")
-        from orchestration_contract import validate_delivery_artifact_bytes
-        _, validated_spec_digest = validate_delivery_artifact_bytes(artifact_bytes)
+        from orchestration_contract import (
+            validate_delivery_artifact_bytes,
+            validate_delivery_packet_binding,
+        )
+        specification, validated_spec_digest = validate_delivery_artifact_bytes(artifact_bytes)
+        validate_delivery_packet_binding(specification, packet)
     elif research_artifact_file is not None:
         raise ValueError("--research-artifact-file is only valid for RESEARCH_PACKET")
 

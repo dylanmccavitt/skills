@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hooks import orchestration_state
-from hooks.test_orchestration_contract import artifact_text
+from hooks.test_orchestration_contract import artifact_text, valid_specification
 from hooks.test_orchestration_packets import valid_packets
 
 
@@ -793,6 +793,104 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(blocked.returncode, 1)
         self.assertIn("exactly one readable", blocked.stderr)
         self.assertEqual(state_path.read_bytes(), before)
+
+    def test_research_packet_contract_binding_preserves_valid_decisions(self) -> None:
+        source = "https://github.com/owner/repo/issues/1"
+        canonical = "https://github.com/owner/repo/issues/2"
+        cases = (
+            ("keep", valid_specification(), source, [source]),
+            ("clarify", valid_specification(), source, [source]),
+            ("split", valid_specification(multi_leaf=True), source, [source, canonical]),
+            (
+                "consolidate",
+                {
+                    **valid_specification(),
+                    "leaves": [{
+                        **valid_specification()["leaves"][0],
+                        "issue_url": canonical,
+                    }],
+                },
+                source,
+                [canonical],
+            ),
+        )
+        for decision, specification, issue_url, delivery_issue_urls in cases:
+            with self.subTest(decision=decision):
+                self.tearDown()
+                self.setUp()
+                self.register("gepetto")
+                self.register(
+                    "research", "--coordinator-thread-id", "session-1",
+                    session_id="research-1",
+                )
+                self.state_command(
+                    "ledger", "set", "--session-id", "session-1", "--lane", "research-1",
+                    "--json", '{"node":"research"}',
+                )
+                artifact = Path(self.temporary.name) / f"{decision}.md"
+                artifact.write_text(artifact_text(specification), encoding="utf-8")
+                packet = valid_packets()["RESEARCH_PACKET"]
+                packet["decision"] = decision
+                packet["issue_url"] = issue_url
+                packet["delivery_issue_urls"] = delivery_issue_urls
+
+                accepted = json.loads(self.accept_command(
+                    "RESEARCH_PACKET", packet, lane="research-1", actor="research-1",
+                    research_artifact=artifact,
+                ).stdout)
+
+                self.assertEqual(accepted["state"]["node"], "implementation")
+
+    def test_research_packet_contract_mismatches_do_not_mutate_coordinator_state(self) -> None:
+        source = "https://github.com/owner/repo/issues/1"
+        other = "https://github.com/owner/repo/issues/2"
+        third = "https://github.com/owner/repo/issues/3"
+        split_with_three = valid_specification(multi_leaf=True)
+        split_with_three["leaves"].append({
+            **split_with_three["leaves"][1],
+            "id": "leaf-3",
+            "issue_url": third,
+            "dependencies": ["leaf-2"],
+        })
+        cases = (
+            ("leaf mismatch", valid_specification(), "keep", source, [other]),
+            ("keep source mismatch", valid_specification(), "keep", other, [source]),
+            ("clarify source mismatch", valid_specification(), "clarify", other, [source]),
+            ("split shape", split_with_three, "split", source, [source, other]),
+            (
+                "consolidate shape", valid_specification(multi_leaf=True),
+                "consolidate", source, [source],
+            ),
+        )
+        for name, specification, decision, issue_url, delivery_issue_urls in cases:
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.register("gepetto")
+                self.register(
+                    "research", "--coordinator-thread-id", "session-1",
+                    session_id="research-1",
+                )
+                self.state_command(
+                    "ledger", "set", "--session-id", "session-1", "--lane", "research-1",
+                    "--json", '{"node":"research"}',
+                )
+                artifact = Path(self.temporary.name) / f"invalid-{name}.md"
+                artifact.write_text(artifact_text(specification), encoding="utf-8")
+                packet = valid_packets()["RESEARCH_PACKET"]
+                packet["decision"] = decision
+                packet["issue_url"] = issue_url
+                packet["delivery_issue_urls"] = delivery_issue_urls
+                state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+                before = state_path.read_bytes()
+
+                blocked = self.accept_command(
+                    "RESEARCH_PACKET", packet, lane="research-1", actor="research-1",
+                    research_artifact=artifact, check=False,
+                )
+
+                self.assertEqual(blocked.returncode, 1)
+                self.assertEqual(state_path.read_bytes(), before)
 
     def test_graph_accept_preserves_dedicated_research_actor_authority(self) -> None:
         self.register("gepetto")

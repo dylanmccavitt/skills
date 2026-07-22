@@ -9,7 +9,11 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from orchestration_contract import canonical_delivery_spec_digest, parse_delivery_spec
+from orchestration_contract import (
+    canonical_delivery_spec_digest,
+    parse_delivery_spec,
+    validate_delivery_packet_binding,
+)
 
 
 def valid_specification(*, multi_leaf: bool = False) -> dict[str, object]:
@@ -151,6 +155,53 @@ class OrchestrationContractTest(unittest.TestCase):
             canonical_delivery_spec_digest(second),
         )
         self.assertRegex(canonical_delivery_spec_digest(first), r"^sha256:[0-9a-f]{64}$")
+
+    def test_packet_binding_preserves_valid_research_decisions(self) -> None:
+        source = "https://github.com/owner/repo/issues/1"
+        canonical = "https://github.com/owner/repo/issues/2"
+        cases = (
+            ("keep", valid_specification(), source, [source]),
+            ("clarify", valid_specification(), source, [source]),
+            ("split", valid_specification(multi_leaf=True), source, [source, canonical]),
+            (
+                "consolidate",
+                {
+                    **valid_specification(),
+                    "leaves": [{
+                        **valid_specification()["leaves"][0],
+                        "issue_url": canonical,
+                    }],
+                },
+                source,
+                [canonical],
+            ),
+        )
+        for decision, specification, issue_url, delivery_issue_urls in cases:
+            with self.subTest(decision=decision):
+                validate_delivery_packet_binding(specification, {
+                    "decision": decision,
+                    "issue_url": issue_url,
+                    "delivery_issue_urls": delivery_issue_urls,
+                })
+
+    def test_packet_binding_rejects_leaf_mismatches_and_invalid_decision_shapes(self) -> None:
+        source = "https://github.com/owner/repo/issues/1"
+        other = "https://github.com/owner/repo/issues/2"
+        multi_leaf = valid_specification(multi_leaf=True)
+        cases = (
+            ("leaf mismatch", valid_specification(), "keep", source, [other]),
+            ("keep source mismatch", valid_specification(), "keep", other, [source]),
+            ("clarify source mismatch", valid_specification(), "clarify", other, [source]),
+            ("split shape", valid_specification(), "split", source, [source]),
+            ("consolidate shape", multi_leaf, "consolidate", source, [source, other]),
+        )
+        for name, specification, decision, issue_url, delivery_issue_urls in cases:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                validate_delivery_packet_binding(specification, {
+                    "decision": decision,
+                    "issue_url": issue_url,
+                    "delivery_issue_urls": delivery_issue_urls,
+                })
 
 
 if __name__ == "__main__":

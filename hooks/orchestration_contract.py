@@ -255,5 +255,27 @@ def validate_delivery_artifact_bytes(artifact_bytes: bytes) -> tuple[dict[str, A
     return specification, digest
 
 
+def validate_delivery_packet_binding(
+    specification: dict[str, Any], packet: dict[str, Any]
+) -> None:
+    """Bind the validated contract leaves to the research packet decision."""
+    specification_urls = [leaf["issue_url"] for leaf in specification["leaves"]]
+    packet_urls = packet["delivery_issue_urls"]
+    if set(specification_urls) != set(packet_urls):
+        raise ValueError(
+            "delivery_spec leaf issue URLs must equal RESEARCH_PACKET delivery_issue_urls"
+        )
+
+    decision = packet["decision"]
+    if decision in {"keep", "clarify"} and specification_urls != [packet["issue_url"]]:
+        raise ValueError(
+            f"delivery_spec for {decision} must contain the RESEARCH_PACKET source issue"
+        )
+    if decision == "split" and len(specification_urls) < 2:
+        raise ValueError("delivery_spec for split must contain at least two leaves")
+    if decision == "consolidate" and len(specification_urls) != 1:
+        raise ValueError("delivery_spec for consolidate must contain exactly one leaf")
+
+
 def validate_delivery_artifact(path: Path) -> tuple[dict[str, Any], str]:
     return validate_delivery_artifact_bytes(path.read_bytes())
