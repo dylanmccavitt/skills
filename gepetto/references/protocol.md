@@ -135,7 +135,7 @@ RESEARCH_PACKET:
   "delivery_issue_urls": ["<canonical raw leaf URL; every child for split; empty for block>"],
   "artifact": {
     "kind": "github_issue",
-    "status": "<persisted, propose-only, or blocked>",
+    "status": "<persisted for github_issue; propose-only or blocked for tmp_markdown>",
     "marker": "gepetto-research",
     "content_ref": "sha256:<64 lowercase hex characters>",
     "locations": [
@@ -148,7 +148,7 @@ RESEARCH_PACKET:
 }
 ```
 
-The full artifact, not this receipt, contains the problem statement, evidence, scope, dependencies, leaf specifications, acceptance criteria, validation, clarifications, and blockers. For `keep`, the artifact defines one leaf matching the existing issue. For `split`, it defines at least two non-overlapping leaves and lists every child in `delivery_issue_urls`. For `consolidate`, it proves why the source is not independently useful, why the combined scope remains one leaf, and lists only the canonical issue in `delivery_issue_urls`; the artifact locations include both updated issues. For `clarify`, update the existing issue with concrete clarification additions. For `block`, persist the blocker and leave `delivery_issue_urls` empty. A `tmp_markdown` artifact uses `marker: null` and each location contains only an absolute `path`. Gepetto may advance only when `artifact.status` is `persisted`, except in an explicitly analysis-only run using a verified temporary Markdown artifact.
+The full artifact, not this receipt, contains the problem statement, evidence, scope, dependencies, leaf specifications, acceptance criteria, validation, clarifications, and blockers. For `keep`, the artifact defines one leaf matching the existing issue. For `split`, it defines at least two non-overlapping leaves and lists every child in `delivery_issue_urls`. For `consolidate`, it proves why the source is not independently useful, why the combined scope remains one leaf, and lists only the canonical issue in `delivery_issue_urls`; the artifact locations include both updated issues. For `clarify`, update the existing issue with concrete clarification additions. For `block`, persist the blocker and leave `delivery_issue_urls` empty. A `tmp_markdown` artifact uses `marker: null` and each location contains only an absolute `path`. With `propose-only` authority it has `status: propose-only`; with `persist` authority it is permitted only after a blocked write and has `status: blocked`. A `github_issue` artifact requires `persist` authority and `status: persisted`. Gepetto may advance only when `artifact.status` is `persisted`, except in an explicitly analysis-only run using a verified temporary Markdown artifact.
 
 ## Implementation task prompt
 

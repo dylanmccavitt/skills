@@ -30,7 +30,7 @@ IMPLEMENTATION_PACKET:
   "pr_head_sha": "<full 40-character live PR head SHA>",
   "artifact": {
     "kind": "github_issue",
-    "status": "<persisted or blocked>",
+    "status": "<persisted for github_issue; blocked for tmp_markdown>",
     "marker": "gepetto-implementation",
     "content_ref": "sha256:<64 lowercase hex characters>",
     "issue_url": "<raw live URL>",

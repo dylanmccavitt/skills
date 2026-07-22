@@ -220,6 +220,22 @@ def _research_packet(value: Any, path: str) -> None:
         _fail(f"{path}.delivery_issue_urls", "must contain at least two URLs for split")
     if expected in {"keep", "consolidate", "clarify"} and count != 1:
         _fail(f"{path}.delivery_issue_urls", f"must contain exactly one URL for {expected}")
+    artifact = packet["artifact"]
+    authority = packet["issue_write_authority"]
+    if authority == "propose-only":
+        if artifact["kind"] != "tmp_markdown" or artifact["status"] != "propose-only":
+            _fail(
+                f"{path}.artifact",
+                "must be a propose-only temporary artifact without issue-write authority",
+            )
+    elif not (
+        (artifact["kind"] == "github_issue" and artifact["status"] == "persisted")
+        or (artifact["kind"] == "tmp_markdown" and artifact["status"] == "blocked")
+    ):
+        _fail(
+            f"{path}.artifact",
+            "must be a persisted GitHub artifact or blocked temporary artifact with persist authority",
+        )
 
 
 def _implementation_packet(value: Any, path: str) -> None:
@@ -463,8 +479,17 @@ def parse_packet_message(message: Any, expected_type: str | None = None) -> tupl
     payload_text = "\n".join(lines[first_index + 1:]).strip()
     if not payload_text:
         raise ValueError("packet message has no payload")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> JsonObject:
+        result: JsonObject = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"packet payload contains duplicate key: {key}")
+            result[key] = value
+        return result
+
     try:
-        payload = json.loads(payload_text)
+        payload = json.loads(payload_text, object_pairs_hook=unique_object)
     except json.JSONDecodeError as error:
         raise ValueError(f"packet payload must be valid JSON: {error.msg}") from error
     return packet_type, validate_packet(packet_type, payload)

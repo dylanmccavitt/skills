@@ -71,6 +71,19 @@ class OrchestrationGraphTest(unittest.TestCase):
             [],
         )
 
+    def test_propose_only_research_cannot_claim_persisted_issue_artifact(self) -> None:
+        packet = valid_packets()["RESEARCH_PACKET"]
+        packet["issue_write_authority"] = "propose-only"
+        self.assertEqual(
+            eligible_transitions(
+                self.workflow,
+                "research",
+                "RESEARCH_PACKET",
+                {"packet": packet},
+            ),
+            [],
+        )
+
     def test_contradictory_ready_review_cannot_advance_to_merge(self) -> None:
         packet = valid_packets()["REVIEW_PACKET"]
         packet["ci_checks"][0]["conclusion"] = "failure"

@@ -168,6 +168,22 @@ class OrchestrationPacketTest(unittest.TestCase):
             with self.subTest(message=message), self.assertRaises(ValueError):
                 parse_packet_message(message)
 
+    def test_duplicate_json_keys_fail_at_every_nesting_level(self) -> None:
+        payload = json.dumps(valid_packets()["REVIEW_PACKET"])
+        top_level = payload.replace(
+            '"ready_for_jiminy": true',
+            '"ready_for_jiminy": false, "ready_for_jiminy": true',
+        )
+        nested = payload.replace(
+            '"draft": false',
+            '"draft": true, "draft": false',
+        )
+        for duplicate_payload in (top_level, nested):
+            with self.subTest(payload=duplicate_payload), self.assertRaisesRegex(
+                ValueError, "duplicate key"
+            ):
+                parse_packet_message(f"REVIEW_PACKET:\n{duplicate_payload}")
+
     def test_unknown_keys_versions_enums_and_packet_types_fail(self) -> None:
         base = valid_packets()["REVIEW_PACKET"]
         cases = []
@@ -233,6 +249,23 @@ class OrchestrationPacketTest(unittest.TestCase):
                 ValueError, "cannot satisfy persistence|must equal 'blocked'"
             ):
                 validate_packet(packet_type, payload)
+
+    def test_research_artifact_must_match_issue_write_authority(self) -> None:
+        propose_only_with_github = valid_packets()["RESEARCH_PACKET"]
+        propose_only_with_github["issue_write_authority"] = "propose-only"
+        persist_with_proposal = valid_packets()["RESEARCH_PACKET"]
+        persist_with_proposal["artifact"] = {
+            "kind": "tmp_markdown",
+            "status": "propose-only",
+            "marker": None,
+            "content_ref": CONTENT_REF,
+            "locations": [{"path": "/tmp/research.md"}],
+        }
+        for packet in (propose_only_with_github, persist_with_proposal):
+            with self.subTest(packet=packet), self.assertRaisesRegex(
+                ValueError, "issue-write authority|persist authority"
+            ):
+                validate_packet("RESEARCH_PACKET", packet)
 
     def test_ready_review_requires_consistent_green_evidence(self) -> None:
         cases = []
