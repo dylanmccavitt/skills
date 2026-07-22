@@ -13,14 +13,13 @@ HOOK = Path(__file__).with_name("orchestration_hook.py")
 STATE = Path(__file__).with_name("orchestration_state.py")
 WATCHDOG = Path(__file__).with_name("orchestration_watchdog.py")
 PYTHON = "python3"
-TINY_WORKFLOW = {
-    "workflow": "tiny",
-    "version": 1,
-    "initial_node": "review",
-    "nodes": {"review": {}},
-    "transitions": [{"id": "advance", "from": ["review"], "event": "ADVANCE", "to": "review"}],
-    "policies": {"supervision": {"heartbeat_ttl_seconds": {"review": 5}}},
-}
+TINY_WORKFLOW = json.loads(
+    (Path(__file__).parents[1] / "gepetto" / "references" / "workflow.json").read_text(
+        encoding="utf-8"
+    )
+)
+TINY_WORKFLOW["workflow"] = "tiny"
+TINY_WORKFLOW["policies"]["supervision"]["heartbeat_ttl_seconds"]["review"] = 5
 
 
 class OrchestrationWatchdogTest(unittest.TestCase):

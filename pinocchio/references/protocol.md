@@ -18,20 +18,25 @@ If the issue write is blocked, save the full proof in a uniquely named temporary
 
 ## Receipt
 
-```yaml
+The receipt is exactly the header below followed by one JSON object. Do not wrap the actual receipt in a Markdown fence. Unknown keys are invalid.
+
+```text
 IMPLEMENTATION_PACKET:
-  issue_url: <live URL>
-  task_role: pinocchio
-  pr_url: <live URL>
-  pr_head_sha: <full live PR head SHA>
-  artifact:
-    kind: github_issue|tmp_markdown
-    status: persisted|blocked
-    marker: <gepetto-implementation for GitHub, null for temporary Markdown>
-    content_ref: <sha256: digest of the exact verified proof snapshot>
-    issue_url: <raw live URL, present for a GitHub artifact>
-    observed_updated_at: <timestamp after re-read, present for a GitHub artifact>
-    path: <absolute path, present for a temporary Markdown artifact>
+{
+  "packet_version": 1,
+  "issue_url": "<raw live URL>",
+  "task_role": "pinocchio",
+  "pr_url": "<raw live URL>",
+  "pr_head_sha": "<full 40-character live PR head SHA>",
+  "artifact": {
+    "kind": "github_issue",
+    "status": "<persisted or blocked>",
+    "marker": "gepetto-implementation",
+    "content_ref": "sha256:<64 lowercase hex characters>",
+    "issue_url": "<raw live URL>",
+    "observed_updated_at": "<timestamp after re-read>"
+  }
+}
 ```
 
-Persistence is mandatory. Gepetto dispatches review only after confirming the live PR head equals `pr_head_sha`. Finish with exactly one receipt as the task final result; do not send it separately or paste proof contents into chat.
+For a temporary artifact, use `kind: "tmp_markdown"`, `marker: null`, and an absolute `path` instead of `issue_url` and `observed_updated_at`. Persistence is mandatory. Gepetto dispatches review only after confirming the live PR head equals `pr_head_sha`. Finish with exactly one receipt as the task final result; do not send it separately or paste proof contents into chat.

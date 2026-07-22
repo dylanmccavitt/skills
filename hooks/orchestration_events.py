@@ -8,6 +8,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from orchestration_packets import parse_packet_message
 from orchestration_state import write_state
 
 
@@ -15,10 +16,10 @@ JsonObject = dict[str, Any]
 HookResult = JsonObject | None
 
 LANE_RECEIPTS = {
-    "research": "RESEARCH_PACKET:",
-    "implementation": "IMPLEMENTATION_PACKET:",
-    "review": "REVIEW_PACKET:",
-    "jiminy": "JIMINY_COMPLETE:",
+    "research": "RESEARCH_PACKET",
+    "implementation": "IMPLEMENTATION_PACKET",
+    "review": "REVIEW_PACKET",
+    "jiminy": "JIMINY_COMPLETE",
 }
 
 AGENT_CONTRACTS = {
@@ -188,35 +189,6 @@ def continue_turn(reason: str) -> JsonObject:
     return {"decision": "block", "reason": reason}
 
 
-def has_exactly_one_receipt(message: Any, receipt: str) -> bool:
-    if not isinstance(message, str):
-        return False
-    lines = [line.strip() for line in message.splitlines()]
-    first = next((line for line in lines if line), "")
-    return first == receipt and lines.count(receipt) == 1
-
-
-def valid_jiminy_complete(message: Any) -> bool:
-    if not isinstance(message, str):
-        return False
-    required_scalars = (
-        "coordinator_thread_id", "repository", "default_branch", "private_log_path"
-    )
-    if any(not re.search(rf"(?m)^\s*{field}:\s*\S+", message) for field in required_scalars):
-        return False
-    if not re.search(r"(?m)^\s*verified_default_head_sha:\s*[0-9a-fA-F]{40}\s*$", message):
-        return False
-    if not re.search(r"(?m)^\s*pull_requests:\s*(?:\[\])?\s*$", message):
-        return False
-    for field in (
-        "expected_merges_present", "required_checks_green",
-        "linked_issues_verified", "runtime_ready_for_completion",
-    ):
-        if not re.search(rf"(?m)^\s*{field}:\s*true\s*$", message):
-            return False
-    return bool(re.search(r"(?m)^\s*blockers:\s*\[\]\s*$", message))
-
-
 def session_start(context: HookContext) -> HookResult:
     if context.payload.get("source") != "compact" or not context.active:
         return None
@@ -288,18 +260,25 @@ def stop(context: HookContext) -> JsonObject:
         return {}
 
     receipt = LANE_RECEIPTS.get(context.role)
-    valid = receipt is None or has_exactly_one_receipt(
-        context.payload.get("last_assistant_message"), receipt
-    )
-    if valid and context.role == "jiminy":
-        valid = valid_jiminy_complete(context.payload.get("last_assistant_message"))
+    valid = receipt is None
+    packet_error = ""
+    if receipt is not None:
+        try:
+            parse_packet_message(
+                context.payload.get("last_assistant_message"), expected_type=receipt
+            )
+            valid = True
+        except ValueError as error:
+            valid = False
+            packet_error = str(error)
     if not valid:
         if context.payload.get("stop_hook_active"):
             context.state["forced_stop_without_receipt"] = True
             context.save()
             return {}
         return continue_turn(
-            f"Verify the lane result and finish with exactly one {receipt[:-1]} receipt."
+            f"Verify the lane result and finish with exactly one valid {receipt} receipt. "
+            f"Packet validation failed: {packet_error}"
         )
 
     if receipt:

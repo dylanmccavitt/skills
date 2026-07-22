@@ -37,6 +37,15 @@
       "event_count_role": "compatibility_fallback"
     }
   },
+  "packet_types": [
+    "RESEARCH_PACKET",
+    "IMPLEMENTATION_PACKET",
+    "REVIEW_PACKET",
+    "JIMINY_READY",
+    "JIMINY_PR_RESULT",
+    "JIMINY_INTEGRATION_FAILED",
+    "JIMINY_COMPLETE"
+  ],
   "nodes": {
     "research": {"owner": "gepetto", "lane_role": "research"},
     "implementation": {"owner": "pinocchio", "lane_role": "implementation", "fanout": "approved_leaves"},
@@ -54,6 +63,7 @@
       "id": "research-approved",
       "from": ["research"],
       "event": "RESEARCH_PACKET",
+      "packet_type": "RESEARCH_PACKET",
       "to": "implementation",
       "all": [
         {"path": "packet.artifact.status", "equals": "persisted"},
@@ -64,6 +74,7 @@
       "id": "implementation-proved",
       "from": ["implementation"],
       "event": "IMPLEMENTATION_PACKET",
+      "packet_type": "IMPLEMENTATION_PACKET",
       "to": "review",
       "all": [
         {"path": "packet.artifact.status", "equals": "persisted"},
@@ -90,6 +101,7 @@
       "id": "review-approved",
       "from": ["review"],
       "event": "REVIEW_PACKET",
+      "packet_type": "REVIEW_PACKET",
       "to": "merge",
       "all": [
         {"path": "packet.ready_for_jiminy", "equals": true},
@@ -100,6 +112,7 @@
       "id": "merge-result-recorded",
       "from": ["merge"],
       "event": "JIMINY_PR_RESULT",
+      "packet_type": "JIMINY_PR_RESULT",
       "to": "merge",
       "all": [
         {"path": "packet.state", "equals": "MERGED"},
@@ -120,6 +133,7 @@
       "id": "integration-passed",
       "from": ["integration_verification"],
       "event": "JIMINY_COMPLETE",
+      "packet_type": "JIMINY_COMPLETE",
       "to": "complete",
       "all": [
         {"path": "packet.integration.expected_merges_present", "equals": true},
@@ -132,6 +146,7 @@
       "id": "integration-failed",
       "from": ["integration_verification"],
       "event": "JIMINY_INTEGRATION_FAILED",
+      "packet_type": "JIMINY_INTEGRATION_FAILED",
       "to": "research",
       "set": {"research_mode": "remediation_leaf"}
     },

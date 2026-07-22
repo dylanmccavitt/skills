@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from orchestration_graph import eligible_transitions, load_workflow, resolve_target, validate_workflow
+from test_orchestration_packets import SHA, valid_packets
 
 
 class OrchestrationGraphTest(unittest.TestCase):
@@ -35,16 +36,17 @@ class OrchestrationGraphTest(unittest.TestCase):
         self.assertTrue(expected <= actual)
 
     def test_implementation_requires_persisted_exact_head_proof(self) -> None:
+        packet = valid_packets()["IMPLEMENTATION_PACKET"]
         context = {
-            "packet": {"artifact": {"status": "persisted"}, "pr_head_sha": "abc"},
-            "live": {"pr_head_sha": "abc"},
+            "packet": packet,
+            "live": {"pr_head_sha": SHA},
         }
         matches = eligible_transitions(
             self.workflow, "implementation", "IMPLEMENTATION_PACKET", context
         )
         self.assertEqual([transition["id"] for transition in matches], ["implementation-proved"])
 
-        context["live"]["pr_head_sha"] = "def"
+        context["live"]["pr_head_sha"] = "b" * 40
         self.assertEqual(
             eligible_transitions(self.workflow, "implementation", "IMPLEMENTATION_PACKET", context),
             [],
@@ -52,7 +54,10 @@ class OrchestrationGraphTest(unittest.TestCase):
 
     def test_post_merge_failure_returns_to_research_as_remediation(self) -> None:
         matches = eligible_transitions(
-            self.workflow, "integration_verification", "JIMINY_INTEGRATION_FAILED", {}
+            self.workflow,
+            "integration_verification",
+            "JIMINY_INTEGRATION_FAILED",
+            {"packet": valid_packets()["JIMINY_INTEGRATION_FAILED"]},
         )
         self.assertEqual(matches[0]["to"], "research")
         self.assertEqual(matches[0]["set"]["research_mode"], "remediation_leaf")
@@ -69,17 +74,42 @@ class OrchestrationGraphTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown target"):
             validate_workflow(invalid)
 
+    def test_validator_rejects_malformed_policies_guards_and_packet_references(self) -> None:
+        invalid_policy = copy.deepcopy(self.workflow)
+        invalid_policy["policies"]["unknown"] = True
+        malformed_guard = copy.deepcopy(self.workflow)
+        malformed_guard["transitions"][0]["all"][0]["non_empty"] = True
+        packet_mismatch = copy.deepcopy(self.workflow)
+        packet_mismatch["transitions"][0]["packet_type"] = "REVIEW_PACKET"
+        unknown_packet = copy.deepcopy(self.workflow)
+        unknown_packet["transitions"][0]["event"] = "UNKNOWN_PACKET"
+        unknown_packet["transitions"][0].pop("packet_type")
+        unknown_transition_key = copy.deepcopy(self.workflow)
+        unknown_transition_key["transitions"][0]["surprise"] = True
+        for workflow in (
+            invalid_policy, malformed_guard, packet_mismatch, unknown_packet,
+            unknown_transition_key,
+        ):
+            with self.subTest(workflow=workflow), self.assertRaises(ValueError):
+                validate_workflow(workflow)
+
+    def test_packet_driven_transition_rejects_invalid_packet_before_guards(self) -> None:
+        packet = valid_packets()["IMPLEMENTATION_PACKET"]
+        packet["pr_head_sha"] = "abc"
+        context = {"packet": packet, "live": {"pr_head_sha": "abc"}}
+        self.assertEqual(
+            eligible_transitions(
+                self.workflow, "implementation", "IMPLEMENTATION_PACKET", context
+            ),
+            [],
+        )
+
     def test_jiminy_completion_and_merge_set_use_packet_root_guards(self) -> None:
         complete = eligible_transitions(
             self.workflow,
             "integration_verification",
             "JIMINY_COMPLETE",
-            {"packet": {"integration": {
-                "expected_merges_present": True,
-                "required_checks_green": True,
-                "linked_issues_verified": True,
-                "runtime_ready_for_completion": True,
-            }}},
+            {"packet": valid_packets()["JIMINY_COMPLETE"]},
         )
         self.assertEqual([item["id"] for item in complete], ["integration-passed"])
         merges = eligible_transitions(
