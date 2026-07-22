@@ -283,6 +283,8 @@ class OrchestrationHookTest(unittest.TestCase):
             "python3 hooks/orchestration_state.py continue --source-id session-1-coordinator --successor-id fake",
             "python3 hooks/orchestration_state.py ledger set --session-id session-1-coordinator --lane x --json {}",
             "python3 hooks/orchestration_state.py graph apply --session-id session-1-coordinator --lane x --current-node review --event ACTIONABLE_FINDINGS",
+            "python3 hooks/orchestration_state.py claim acquire --session-id session-1-coordinator --lane x --expected-revision 1 --json {}",
+            "python3 hooks/orchestration_state.py claim release --session-id session-1-coordinator --lane x --expected-revision 1 --reason delivery_cancellation",
         )
         for command in denied_commands:
             result = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": command})
@@ -361,6 +363,62 @@ class OrchestrationHookTest(unittest.TestCase):
             check=check,
         )
 
+    def claim_payload(
+        self,
+        lane: str,
+        *,
+        issue: int = 1,
+        branch: str | None = None,
+        worktree: str | None = None,
+        domains: list[str] | None = None,
+        owned: list[str] | None = None,
+        shared: list[str] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "repository": "owner/repo",
+            "issue_url": f"https://github.com/owner/repo/issues/{issue}",
+            "lane_task_id": lane,
+            "branch": branch or f"issue-{issue}",
+            "worktree": worktree or str(Path(self.temporary.name) / f"worktree-{issue}"),
+            "decision_domains": domains or [f"domain-{issue}"],
+            "owned_path_prefixes": owned or [f"owned-{issue}/"],
+            "shared_paths": shared or [],
+        }
+
+    def acquire_claim(self, lane: str, payload: dict[str, object]) -> dict[str, object]:
+        revision = int(self.session_state()["state_revision"])
+        return json.loads(self.state_command(
+            "claim", "acquire", "--session-id", "session-1", "--lane", lane,
+            "--expected-revision", str(revision), "--json", json.dumps(payload),
+        ).stdout)
+
+    def make_git_delivery(
+        self, name: str, *, outside_claim: bool = False
+    ) -> tuple[Path, str, str, str]:
+        repository = Path(self.temporary.name) / name
+        branch = f"{name}-branch"
+        repository.mkdir()
+        subprocess.run(["git", "init", "-b", branch], cwd=repository, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repository, check=True)
+        (repository / "hooks").mkdir()
+        (repository / "hooks" / "owned.py").write_text("first\n", encoding="utf-8")
+        subprocess.run(["git", "add", "hooks/owned.py"], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True, capture_output=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+            text=True, capture_output=True,
+        ).stdout.strip()
+        changed = repository / ("README.md" if outside_claim else "hooks/owned.py")
+        changed.write_text("changed\n", encoding="utf-8")
+        subprocess.run(["git", "add", str(changed)], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-m", "change"], cwd=repository, check=True, capture_output=True)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+            text=True, capture_output=True,
+        ).stdout.strip()
+        return repository, branch, base, head
+
     def accept_command(
         self,
         event: str,
@@ -403,6 +461,33 @@ class OrchestrationHookTest(unittest.TestCase):
             for tool in ("Edit", "Write"):
                 result = self.hook("PreToolUse", session_id=session_id, tool_name=tool, tool_input={"file_path": "/tmp/x", "content": "y"})
                 self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny", (role, tool))
+
+    def test_read_only_roles_deny_recognized_bash_file_mutations(self) -> None:
+        commands = (
+            "cp source hooks/copy.py",
+            "mv hooks/old.py hooks/new.py",
+            "rm hooks/old.py",
+            "touch hooks/new.py",
+            "tee hooks/new.py",
+            "printf value > hooks/new.py",
+            "sed -i.bak s/old/new/ hooks/file.py",
+            "git checkout -- hooks/file.py",
+            "find hooks -name '*.tmp' -delete",
+        )
+        for index, role in enumerate(("gepetto", "jiminy", "research"), start=1):
+            session_id = f"bash-read-only-{index}"
+            self.register(role, session_id=session_id)
+            for command in commands:
+                with self.subTest(role=role, command=command):
+                    result = self.hook(
+                        "PreToolUse", session_id=session_id, tool_name="Bash",
+                        tool_input={"command": command},
+                    )
+                    self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIsNone(self.hook(
+                "PreToolUse", session_id=session_id, tool_name="Bash",
+                tool_input={"command": "git diff -- hooks/file.py && sed -n '1,20p' hooks/file.py"},
+            ))
 
     def test_implementation_can_edit_and_write(self) -> None:
         self.register("implementation")
@@ -482,6 +567,166 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(shown["lane-new"]["continued_from"], "lane-old")
         self.assertEqual(shown["lane-new"]["cycles"], 2)
 
+    def test_non_overlapping_claims_succeed_and_conflicts_do_not_mutate_state(self) -> None:
+        self.register("gepetto")
+        for lane, issue in (("lane-1", 1), ("lane-2", 2), ("lane-3", 3)):
+            self.register(
+                "implementation", "--coordinator-thread-id", "session-1", session_id=lane
+            )
+            self.state_command(
+                "ledger", "set", "--session-id", "session-1", "--lane", lane,
+                "--json", json.dumps({
+                    "node": "implementation",
+                    "issue": f"https://github.com/owner/repo/issues/{issue}",
+                    "base_sha": "b" * 40,
+                    "head_sha": "b" * 40,
+                    "research_content_ref": "sha256:" + "c" * 64,
+                }),
+            )
+        first_payload = self.claim_payload("lane-1")
+        self.acquire_claim("lane-1", first_payload)
+        unchanged = self.session_state()
+        repeated = self.acquire_claim("lane-1", first_payload)
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(self.session_state(), unchanged)
+        self.acquire_claim("lane-2", self.claim_payload("lane-2", issue=2))
+        before = self.session_state()
+        conflicting = self.claim_payload("lane-3", issue=3, owned=["owned-1/sub/"])
+        blocked = self.state_command(
+            "claim", "acquire", "--session-id", "session-1", "--lane", "lane-3",
+            "--expected-revision", str(before["state_revision"]),
+            "--json", json.dumps(conflicting), check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("path overlap", blocked.stderr)
+        self.assertEqual(self.session_state(), before)
+
+    def test_claim_identity_and_decision_duplicates_fail_atomically(self) -> None:
+        cases = ("issue_url", "branch", "worktree", "decision_domains")
+        for duplicate in cases:
+            with self.subTest(duplicate=duplicate):
+                self.tearDown()
+                self.setUp()
+                self.register("gepetto")
+                for lane, issue in (("lane-1", 1), ("lane-2", 2)):
+                    self.register(
+                        "implementation", "--coordinator-thread-id", "session-1",
+                        session_id=lane,
+                    )
+                    self.state_command(
+                        "ledger", "set", "--session-id", "session-1", "--lane", lane,
+                        "--json", json.dumps({
+                            "node": "implementation",
+                            "issue": f"https://github.com/owner/repo/issues/{issue}",
+                            "base_sha": "b" * 40,
+                            "head_sha": "b" * 40,
+                            "research_content_ref": "sha256:" + "c" * 64,
+                        }),
+                    )
+                first = self.claim_payload("lane-1")
+                self.acquire_claim("lane-1", first)
+                second = self.claim_payload("lane-2", issue=2)
+                second[duplicate] = first[duplicate]
+                if duplicate == "issue_url":
+                    # The trusted lane issue must match before duplicate detection.
+                    self.state_command(
+                        "ledger", "set", "--session-id", "session-1", "--lane", "lane-2",
+                        "--json", json.dumps({"issue": first["issue_url"]}),
+                    )
+                before = self.session_state()
+                blocked = self.state_command(
+                    "claim", "acquire", "--session-id", "session-1", "--lane", "lane-2",
+                    "--expected-revision", str(before["state_revision"]),
+                    "--json", json.dumps(second), check=False,
+                )
+                self.assertEqual(blocked.returncode, 1)
+                self.assertEqual(self.session_state(), before)
+
+    def test_path_overlap_requires_the_same_bilateral_shared_boundary(self) -> None:
+        for first_shared, second_shared, succeeds in (
+            ([], ["owned/sub"], False),
+            (["owned"], ["owned/sub"], False),
+            (["owned/sub"], ["owned/sub"], True),
+        ):
+            with self.subTest(first=first_shared, second=second_shared):
+                self.tearDown()
+                self.setUp()
+                self.register("gepetto")
+                for lane, issue in (("lane-1", 1), ("lane-2", 2)):
+                    self.register(
+                        "implementation", "--coordinator-thread-id", "session-1",
+                        session_id=lane,
+                    )
+                    self.state_command(
+                        "ledger", "set", "--session-id", "session-1", "--lane", lane,
+                        "--json", json.dumps({
+                            "node": "implementation",
+                            "issue": f"https://github.com/owner/repo/issues/{issue}",
+                            "base_sha": "b" * 40,
+                            "head_sha": "b" * 40,
+                            "research_content_ref": "sha256:" + "c" * 64,
+                        }),
+                    )
+                self.acquire_claim(
+                    "lane-1", self.claim_payload(
+                        "lane-1", owned=["owned/"], shared=first_shared,
+                    ),
+                )
+                before = self.session_state()
+                result = self.state_command(
+                    "claim", "acquire", "--session-id", "session-1", "--lane", "lane-2",
+                    "--expected-revision", str(before["state_revision"]),
+                    "--json", json.dumps(self.claim_payload(
+                        "lane-2", issue=2, owned=["owned/sub/"], shared=second_shared,
+                    )), check=succeeds,
+                )
+                if succeeds:
+                    self.assertEqual(result.returncode, 0)
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(self.session_state(), before)
+
+    def test_claim_releases_only_for_authorized_lifecycle_events(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="lane-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("lane-1", self.claim_payload("lane-1"))
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", '{"review_fix_cycles":1}',
+        )
+        self.assertIn("lane-1", self.session_state()["ownership_claims"])
+        before = self.session_state()
+        premature = self.state_command(
+            "claim", "release", "--session-id", "session-1", "--lane", "lane-1",
+            "--expected-revision", str(before["state_revision"]),
+            "--reason", "verified_handoff", check=False,
+        )
+        self.assertEqual(premature.returncode, 1)
+        self.assertEqual(self.session_state(), before)
+
+        self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "implementation", "--event", "DELIVERY_CANCELLED",
+        )
+        after = self.session_state()
+        self.assertNotIn("lane-1", after["ownership_claims"])
+        self.assertEqual(
+            after["ownership_claim_history"][-1]["release_reason"],
+            "delivery_cancellation",
+        )
+
     def test_graph_apply_atomically_enforces_and_increments_review_cycle(self) -> None:
         self.register("gepetto")
         self.state_command(
@@ -543,6 +788,119 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(receipt["observed_pr_head_sha"], SHA)
         self.assertRegex(receipt["packet_digest"], r"^sha256:[0-9a-f]{64}$")
         self.assertIsInstance(receipt["timestamp"], int)
+
+    def test_implementation_acceptance_verifies_complete_claimed_diff_and_releases_on_handoff(self) -> None:
+        repository, branch, base, head = self.make_git_delivery("claimed")
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": base,
+                "head_sha": base,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload(
+            "impl-1", branch=branch, worktree=str(repository), owned=["hooks/"],
+        ))
+        packet = valid_packets()["IMPLEMENTATION_PACKET"]
+        packet["pr_head_sha"] = head
+
+        accepted = json.loads(self.accept_command(
+            "IMPLEMENTATION_PACKET", packet, lane="impl-1", actor="impl-1",
+            observed_head=head,
+        ).stdout)
+
+        state = self.session_state()
+        self.assertEqual(accepted["state"]["node"], "review")
+        evidence = accepted["state"]["proof_lifecycle"]["bindings"]["implementation"]["evidence"]
+        self.assertEqual(evidence["changed_files"], ["hooks/owned.py"])
+        self.assertNotIn("impl-1", state["ownership_claims"])
+        self.assertEqual(
+            state["ownership_claim_history"][-1]["release_reason"], "verified_handoff"
+        )
+
+    def test_out_of_claim_diff_returns_to_research_without_accepting_packet(self) -> None:
+        repository, branch, base, head = self.make_git_delivery(
+            "outside", outside_claim=True
+        )
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": base,
+                "head_sha": base,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload(
+            "impl-1", branch=branch, worktree=str(repository), owned=["hooks/"],
+        ))
+        before = self.session_state()
+        packet = valid_packets()["IMPLEMENTATION_PACKET"]
+        packet["pr_head_sha"] = head
+
+        blocked = self.accept_command(
+            "IMPLEMENTATION_PACKET", packet, lane="impl-1", actor="impl-1",
+            observed_head=head, check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 1)
+        after = self.session_state()
+        lane = after["ledger"]["impl-1"]
+        self.assertEqual(lane["node"], "research")
+        self.assertEqual(lane["resume_node"], "implementation")
+        self.assertNotIn("acceptance_receipts", lane)
+        self.assertEqual(lane["ownership_boundary_failures"][-1]["changed_files"], ["README.md"])
+        self.assertIn("impl-1", after["ownership_claims"])
+        self.assertEqual(
+            lane["proof_lifecycle"]["bindings"],
+            before["ledger"]["impl-1"]["proof_lifecycle"]["bindings"],
+        )
+
+    def test_versioned_delivery_rejects_missing_ownership_claim(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "session-1",
+            "--json", '{"node":"research"}',
+        )
+        self.accept_command(
+            "RESEARCH_PACKET", valid_packets()["RESEARCH_PACKET"],
+            lane="session-1", actor="session-1",
+        )
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+
+        blocked = self.accept_command(
+            "IMPLEMENTATION_PACKET", valid_packets()["IMPLEMENTATION_PACKET"],
+            lane="impl-1", actor="impl-1", observed_head=SHA, check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 1)
+        lane = self.session_state()["ledger"]["impl-1"]
+        self.assertEqual(lane["node"], "research")
+        self.assertIn("no authoritative ownership claim", lane["ownership_boundary_failures"][-1]["reason"])
 
     def test_graph_accept_failures_leave_state_byte_for_byte_unchanged(self) -> None:
         wrong_version = valid_packets()["IMPLEMENTATION_PACKET"]
@@ -1963,16 +2321,76 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(verified["coordinator_thread_id"], "session-3")
         self.assertTrue(verified["verified"])
 
-    def test_merge_requires_authorized_jiminy_and_bound_head(self) -> None:
+    def test_merge_requires_exact_coordinator_repository_pr_and_head_authority(self) -> None:
         self.register("jiminy")
-        denied = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": f"gh pr merge 1 --squash --match-head-commit {SHA}"})
+        denied = self.hook("PreToolUse", tool_name="Bash", tool_input={
+            "command": f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"
+        })
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
 
         self.register("jiminy", "--merge-authorized", session_id="authorized-jiminy")
-        unbound = self.hook("PreToolUse", session_id="authorized-jiminy", tool_name="Bash", tool_input={"command": "gh pr merge 1 --squash"})
+        unbound = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={"command": f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"},
+        )
         self.assertEqual(unbound["hookSpecificOutput"]["permissionDecision"], "deny")
-        allowed = self.hook("PreToolUse", session_id="authorized-jiminy", tool_name="Bash", tool_input={"command": f"gh pr merge 1 --squash --match-head-commit {SHA}"})
+
+        coordinator_id = "authorized-jiminy-coordinator"
+        coordinator = self.session_state(coordinator_id)
+        generations = {"contract": 0, "base": 0, "head": 0}
+        coordinator["ledger"] = {
+            "lane-1": {
+                "node": "merge",
+                "pr": "https://github.com/owner/repo/pull/1",
+                "repository": "owner/repo",
+                "proof_lifecycle": {
+                    "generations": generations,
+                    "observations": {
+                        "contract": "sha256:" + "c" * 64,
+                        "base": "b" * 40,
+                        "head": SHA,
+                    },
+                    "bindings": {
+                        "expected_merge_set": {
+                            "generations": generations,
+                            "evidence": {"merge_authority": "merge"},
+                        },
+                    },
+                    "invalidation_history": [],
+                },
+            },
+        }
+        coordinator["merge_authorities"] = {
+            "https://github.com/owner/repo/pull/1": {
+                "repository": "owner/repo",
+                "pr_url": "https://github.com/owner/repo/pull/1",
+                "reviewed_head_sha": SHA,
+                "generations": generations,
+                "runner_session_id": "authorized-jiminy",
+                "lane": "lane-1",
+                "ready_packet_digest": "sha256:" + "d" * 64,
+            },
+        }
+        coordinator_path = Path(self.temporary.name) / "sessions" / f"{coordinator_id}.json"
+        coordinator_path.write_text(json.dumps(coordinator), encoding="utf-8")
+
+        allowed = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={"command": f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"},
+        )
         self.assertIsNone(allowed)
+        for command in (
+            f"gh pr merge 1 --repo other/repo --squash --match-head-commit {SHA}",
+            f"gh pr merge 2 --repo owner/repo --squash --match-head-commit {SHA}",
+            f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {'b' * 40}",
+            f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA} --match-head-commit {'b' * 40}",
+        ):
+            with self.subTest(command=command):
+                drifted = self.hook(
+                    "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+                    tool_input={"command": command},
+                )
+                self.assertEqual(drifted["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def session_state(self, session_id: str = "session-1") -> dict[str, object]:
         path = Path(self.temporary.name) / "sessions" / f"{session_id}.json"
@@ -2016,6 +2434,91 @@ class OrchestrationHookTest(unittest.TestCase):
         successor = self.session_state("session-2")
         self.assertTrue(successor["context_refs"]["research-artifact"]["ref"].startswith("sha256:"))
         self.assertNotIn("pressure", successor)
+
+    def test_checkpoint_continuation_moves_claim_to_exactly_one_successor(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload("impl-1"))
+
+        self.state_command(
+            "continue", "--source-id", "impl-1", "--successor-id", "impl-2"
+        )
+
+        claims = self.session_state()["ownership_claims"]
+        self.assertNotIn("impl-1", claims)
+        self.assertEqual(claims["impl-2"]["lane_task_id"], "impl-2")
+        self.assertEqual(claims["impl-2"]["transferred_from"], "impl-1")
+
+    def test_claim_transfer_follows_the_active_coordinator_checkpoint_lineage(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload("impl-1"))
+        self.state_command(
+            "continue", "--source-id", "session-1", "--successor-id", "coordinator-2"
+        )
+
+        self.state_command(
+            "continue", "--source-id", "impl-1", "--successor-id", "impl-2"
+        )
+
+        active_claims = self.session_state("coordinator-2")["ownership_claims"]
+        self.assertEqual(list(active_claims), ["impl-2"])
+        self.assertEqual(active_claims["impl-2"]["lane_task_id"], "impl-2")
+
+    def test_interrupted_claim_continuation_recovers_one_active_owner(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload("impl-1"))
+        crash_env = dict(self.env, CODEX_ORCHESTRATION_TEST_CRASH_AFTER="successor")
+        crashed = subprocess.run(
+            [PYTHON, str(STATE), "continue", "--source-id", "impl-1", "--successor-id", "impl-2"],
+            env=crash_env, text=True, capture_output=True,
+        )
+        self.assertEqual(crashed.returncode, 91)
+
+        self.state_command("status")
+
+        claims = self.session_state()["ownership_claims"]
+        self.assertEqual(list(claims), ["impl-2"])
+        self.assertFalse(self.session_state("impl-1")["active"])
+        self.assertTrue(self.session_state("impl-2")["active"])
+        self.assertFalse((Path(self.temporary.name) / "transactions" / "continuation.json").exists())
 
     def test_continue_rejects_same_or_existing_successor_without_mutation(self) -> None:
         self.register("implementation")

@@ -11,7 +11,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from orchestration_contract import (
     canonical_delivery_spec_digest,
+    normalize_branch,
+    normalize_github_url,
+    normalize_path_prefix,
+    normalize_repository,
+    overlapping_path,
     parse_delivery_spec,
+    path_is_owned,
     validate_delivery_packet_binding,
 )
 
@@ -71,6 +77,22 @@ def artifact_text(specification: dict[str, object] | None = None) -> str:
 
 
 class OrchestrationContractTest(unittest.TestCase):
+    def test_claim_identity_and_path_normalization_is_segment_aware(self) -> None:
+        self.assertEqual(normalize_repository("Owner/Repo.git"), "owner/repo")
+        self.assertEqual(
+            normalize_github_url("https://github.com/Owner/Repo/issues/24", kind="issue"),
+            "https://github.com/owner/repo/issues/24",
+        )
+        self.assertEqual(normalize_path_prefix("hooks/file.py/"), "hooks/file.py")
+        self.assertEqual(normalize_branch("issue-24/claims"), "issue-24/claims")
+        self.assertEqual(overlapping_path("gepetto", "gepetto/references"), "gepetto/references")
+        self.assertIsNone(overlapping_path("test", "testing"))
+        self.assertTrue(path_is_owned("gepetto/SKILL.md", ["gepetto/"]))
+        self.assertFalse(path_is_owned("gepetto-old/SKILL.md", ["gepetto/"]))
+        for invalid in ("../hooks", "/hooks", "hooks/./file", "hooks//file"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                normalize_path_prefix(invalid)
+
     def test_valid_single_and_multi_leaf_version_one_specs_pass(self) -> None:
         for multi_leaf in (False, True):
             with self.subTest(multi_leaf=multi_leaf):

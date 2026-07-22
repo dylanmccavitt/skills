@@ -19,7 +19,9 @@ Use the GitHub API when `gh pr view` omits a required branch-protection, merge-q
 
 All conditions must hold:
 
-1. The PR is in Jiminy's explicit authority scope.
+1. The coordinator has recorded an effective authority tuple for this normalized repository,
+   exact PR URL, and exact reviewed head in the current proof generation. The legacy
+   session-wide merge flag is not sufficient.
 2. The PR is open and not a draft.
 3. The leaf issue and PR scope match.
 4. The live research and implementation artifact snapshots match the `content_ref` values in `JIMINY_READY`.
@@ -47,7 +49,7 @@ Do not delete the remote branch without explicit cleanup authority.
 Bind the action to the verified head. Use the selected method flag:
 
 ```bash
-gh pr merge <pr> --squash --match-head-commit <reviewed-head-sha>
+gh pr merge <pr> --repo <owner/repository> --squash --match-head-commit <reviewed-head-sha>
 ```
 
 Substitute `--merge` or `--rebase` only when selected by the rules above. If the repository requires a merge queue, use its supported queue or auto-merge path and keep monitoring; queued is not merged.

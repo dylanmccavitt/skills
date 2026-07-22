@@ -19,7 +19,10 @@ DELIVERY_SPEC_BLOCK = re.compile(
 )
 CONTENT_REF = re.compile(r"sha256:[0-9a-f]{64}")
 ISSUE_PATH = re.compile(r"/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*")
+PR_PATH = re.compile(r"/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*")
+REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 PATH_PREFIX = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?")
+BRANCH = re.compile(r"(?!.*(?:^|/)\.\.?(?:/|$))[A-Za-z0-9._/-]+")
 
 
 class _DuplicateKey(ValueError):
@@ -131,6 +134,91 @@ def _validate_path_prefix(value: str, path: str) -> None:
     segments = value.rstrip("/").split("/")
     if any(segment in {".", ".."} for segment in segments):
         _schema_error(path, "must not contain dot segments")
+
+
+def normalize_repository(value: str) -> str:
+    """Return the canonical case-insensitive owner/name repository identity."""
+    candidate = value.strip()
+    if candidate.lower().endswith(".git"):
+        candidate = candidate[:-4]
+    if not REPOSITORY.fullmatch(candidate):
+        raise ValueError("repository must be an owner/name identity")
+    return candidate.lower()
+
+
+def normalize_github_url(value: str, *, kind: str) -> str:
+    """Canonicalize one raw GitHub issue or pull-request URL."""
+    parsed = urlsplit(value.strip())
+    pattern = ISSUE_PATH if kind == "issue" else PR_PATH if kind == "pull" else None
+    if (
+        pattern is None
+        or parsed.scheme.lower() != "https"
+        or parsed.netloc.lower() != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+        or not pattern.fullmatch(parsed.path)
+    ):
+        raise ValueError(f"must be a raw live GitHub {kind} URL")
+    owner, repository, category, number = parsed.path.strip("/").split("/")
+    return f"https://github.com/{owner.lower()}/{repository.lower()}/{category}/{number}"
+
+
+def repository_from_github_url(value: str, *, kind: str) -> str:
+    normalized = normalize_github_url(value, kind=kind)
+    owner, repository = urlsplit(normalized).path.strip("/").split("/")[:2]
+    return f"{owner}/{repository}"
+
+
+def normalize_path_prefix(value: str) -> str:
+    """Normalize one repository-relative path/prefix without broadening it."""
+    candidate = value.strip().replace("\\", "/")
+    if not PATH_PREFIX.fullmatch(candidate):
+        raise ValueError(f"invalid repository-relative path prefix: {value!r}")
+    segments = candidate.rstrip("/").split("/")
+    if any(segment in {"", ".", ".."} for segment in segments):
+        raise ValueError(f"invalid repository-relative path prefix: {value!r}")
+    return "/".join(segments)
+
+
+def normalize_branch(value: str) -> str:
+    candidate = value.strip()
+    if (
+        not candidate
+        or not BRANCH.fullmatch(candidate)
+        or candidate.startswith("/")
+        or candidate.endswith(("/", "."))
+        or "//" in candidate
+        or ".." in candidate
+        or "@{" in candidate
+    ):
+        raise ValueError(f"invalid branch name: {value!r}")
+    return candidate
+
+
+def path_prefixes_overlap(left: str, right: str) -> bool:
+    left_parts = normalize_path_prefix(left).split("/")
+    right_parts = normalize_path_prefix(right).split("/")
+    width = min(len(left_parts), len(right_parts))
+    return left_parts[:width] == right_parts[:width]
+
+
+def overlapping_path(left: str, right: str) -> str | None:
+    """Return the narrower boundary covered by two overlapping prefixes."""
+    if not path_prefixes_overlap(left, right):
+        return None
+    left = normalize_path_prefix(left)
+    right = normalize_path_prefix(right)
+    return left if len(left.split("/")) >= len(right.split("/")) else right
+
+
+def path_is_owned(path: str, prefixes: list[str]) -> bool:
+    normalized = normalize_path_prefix(path)
+    return any(path_prefixes_overlap(normalized, prefix) and (
+        normalized == normalize_path_prefix(prefix)
+        or normalized.startswith(normalize_path_prefix(prefix) + "/")
+    ) for prefix in prefixes)
 
 
 def _validate_semantics(specification: dict[str, Any]) -> None:
