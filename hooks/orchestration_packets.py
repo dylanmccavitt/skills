@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -448,6 +449,11 @@ PACKET_TYPES = frozenset(PACKET_VALIDATORS)
 TERMINAL_PACKET_TYPES = frozenset({
     "RESEARCH_PACKET", "IMPLEMENTATION_PACKET", "REVIEW_PACKET", "JIMINY_COMPLETE"
 })
+
+
+def canonical_packet_digest(payload: JsonObject) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
 def validate_packet(packet_type: str, payload: Any) -> JsonObject:

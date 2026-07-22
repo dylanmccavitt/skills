@@ -433,7 +433,12 @@ def accept_graph_event(
 ) -> dict[str, Any]:
     """Validate and persist one packet-driven transition as one coordinator revision."""
     from orchestration_graph import eligible_transitions, load_workflow, resolve_target
-    from orchestration_packets import FULL_SHA, PACKET_TYPES, validate_packet
+    from orchestration_packets import (
+        FULL_SHA,
+        PACKET_TYPES,
+        canonical_packet_digest,
+        validate_packet,
+    )
 
     workflow = load_workflow()
     if event not in PACKET_TYPES:
@@ -482,11 +487,67 @@ def accept_graph_event(
     expected_role = workflow["nodes"][current_node].get("lane_role")
     if expected_role not in ROLES:
         raise ValueError(f"packet event {event} has no supported actor role at {current_node}")
-    verify_registration(
-        actor_session_id,
-        expected_role,
-        coordinator_thread_id=session_id,
+    artifact = packet.get("artifact")
+    inline_research = (
+        workflow.get("policies", {}).get("inline_research") == "single_leaf_keep"
+        and event == "RESEARCH_PACKET"
+        and current_node == "research"
+        and expected_role == "research"
+        and actor_session_id == session_id
+        and lane == session_id
+        and packet.get("decision") == "keep"
+        and len(packet.get("delivery_issue_urls", [])) == 1
+        and isinstance(artifact, dict)
+        and artifact.get("kind") == "github_issue"
+        and artifact.get("status") == "persisted"
     )
+    terminal_actor = False
+    if not inline_research:
+        actor_state = load_state(actor_session_id)
+        if actor_state is None:
+            raise ValueError(f"no registered session: {actor_session_id}")
+        if actor_state.get("active"):
+            verify_registration(
+                actor_session_id,
+                expected_role,
+                coordinator_thread_id=session_id,
+            )
+        else:
+            if actor_state.get("role") != expected_role:
+                raise ValueError(
+                    f"role mismatch for {actor_session_id}: expected {expected_role}, "
+                    f"registered {actor_state.get('role')}"
+                )
+            registered_coordinator = actor_state.get("coordinator_thread_id")
+            candidate = registered_coordinator
+            visited: set[str] = set()
+            resolved_coordinator = None
+            while isinstance(candidate, str) and candidate not in visited:
+                visited.add(candidate)
+                observed = load_state(candidate)
+                if observed and observed.get("role") == "gepetto" and observed.get("active"):
+                    resolved_coordinator = candidate
+                    break
+                candidate = observed.get("successor_id") if observed else None
+            if resolved_coordinator != session_id:
+                raise ValueError(
+                    f"coordinator mismatch for {actor_session_id}: expected {session_id}, "
+                    f"registered {registered_coordinator}"
+                )
+            if actor_state.get("successor_id"):
+                raise ValueError(
+                    f"checkpoint predecessor cannot accept a packet: {actor_session_id}"
+                )
+            if actor_state.get("forced_stop_without_receipt"):
+                raise ValueError(f"forced stop cannot authorize a packet: {actor_session_id}")
+            if (
+                actor_state.get("terminal_packet_type") != event
+                or actor_state.get("terminal_packet_digest") != canonical_packet_digest(packet)
+            ):
+                raise ValueError(
+                    f"inactive actor has no matching terminal receipt: {actor_session_id}"
+                )
+            terminal_actor = True
     if expected_role != "jiminy" and actor_session_id != lane:
         raise ValueError(f"actor {actor_session_id} does not own ledger lane {lane}")
     if runner_session_id is not None:
@@ -515,7 +576,12 @@ def accept_graph_event(
         )
         if selected_runner is None:
             raise ValueError("Jiminy runner session ID is required for this transition")
-        verify_registration(selected_runner, "jiminy", coordinator_thread_id=session_id)
+        if not (
+            terminal_actor
+            and expected_role == "jiminy"
+            and selected_runner == actor_session_id
+        ):
+            verify_registration(selected_runner, "jiminy", coordinator_thread_id=session_id)
         bound_runner = lane_state.get("jiminy_runner_session_id")
         if source_owner == "jiminy" and bound_runner is None:
             raise ValueError(f"Jiminy-owned lane is not bound to a runner: {lane}")
@@ -549,9 +615,7 @@ def accept_graph_event(
     if not isinstance(receipts, list):
         raise ValueError(f"invalid acceptance receipt container for lane: {lane}")
     receipt = {
-        "packet_digest": "sha256:" + hashlib.sha256(
-            json.dumps(packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest(),
+        "packet_digest": canonical_packet_digest(packet),
         "actor_session_id": actor_session_id,
         "timestamp": int(time.time()),
         "event": event,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -170,6 +171,26 @@ class OrchestrationHookTest(unittest.TestCase):
                 )
                 self.assertEqual(allowed, {})
                 self.assertFalse(self.session_state(session_id)["active"])
+
+    def test_valid_lane_stop_persists_canonical_terminal_receipt(self) -> None:
+        self.register("implementation")
+        packet = valid_packets()["IMPLEMENTATION_PACKET"]
+
+        allowed = self.hook(
+            "Stop",
+            last_assistant_message=f"IMPLEMENTATION_PACKET:\n{json.dumps(packet)}",
+            stop_hook_active=False,
+        )
+
+        self.assertEqual(allowed, {})
+        state = self.session_state()
+        self.assertFalse(state["active"])
+        self.assertEqual(state["terminal_packet_type"], "IMPLEMENTATION_PACKET")
+        canonical = json.dumps(packet, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(
+            state["terminal_packet_digest"],
+            "sha256:" + hashlib.sha256(canonical).hexdigest(),
+        )
 
     def test_lane_stop_rejects_duplicate_packet_headers(self) -> None:
         self.register("implementation")
@@ -633,6 +654,178 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         self.assertEqual(inactive.returncode, 1)
         self.assertEqual(state_path.read_bytes(), before)
+
+    def test_graph_accept_authorizes_matching_inactive_terminal_actor(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", '{"node":"implementation"}',
+        )
+        packet = valid_packets()["IMPLEMENTATION_PACKET"]
+        self.assertEqual(
+            self.hook_for(
+                "impl-1", "Stop",
+                last_assistant_message=f"IMPLEMENTATION_PACKET:\n{json.dumps(packet)}",
+                stop_hook_active=False,
+            ),
+            {},
+        )
+
+        accepted = json.loads(self.accept_command(
+            "IMPLEMENTATION_PACKET", packet,
+            lane="impl-1", actor="impl-1", observed_head=SHA,
+        ).stdout)
+
+        self.assertEqual(accepted["state"]["node"], "review")
+        self.assertEqual(accepted["acceptance_receipt"]["actor_session_id"], "impl-1")
+
+    def test_graph_accept_rejects_untrusted_inactive_terminal_variants_without_mutation(self) -> None:
+        cases = ("packet mismatch", "wrong coordinator", "checkpoint predecessor", "forced stop")
+        for case in cases:
+            with self.subTest(case=case):
+                self.tearDown()
+                self.setUp()
+                self.register("gepetto")
+                coordinator = "session-1" if case != "wrong coordinator" else "other-coordinator"
+                if coordinator != "session-1":
+                    self.register("gepetto", session_id=coordinator)
+                self.register(
+                    "implementation", "--coordinator-thread-id", coordinator,
+                    session_id="impl-1",
+                )
+                self.state_command(
+                    "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+                    "--json", '{"node":"implementation"}',
+                )
+                packet = valid_packets()["IMPLEMENTATION_PACKET"]
+                if case == "checkpoint predecessor":
+                    self.state_command(
+                        "continue", "--source-id", "impl-1", "--successor-id", "impl-2"
+                    )
+                else:
+                    if case == "forced stop":
+                        self.assertEqual(self.hook_for(
+                            "impl-1", "Stop", last_assistant_message="invalid",
+                            stop_hook_active=True,
+                        ), {})
+                    self.assertEqual(self.hook_for(
+                        "impl-1", "Stop",
+                        last_assistant_message=(
+                            f"IMPLEMENTATION_PACKET:\n{json.dumps(packet)}"
+                        ),
+                        stop_hook_active=False,
+                    ), {})
+                supplied = json.loads(json.dumps(packet))
+                if case == "packet mismatch":
+                    supplied["artifact"]["observed_updated_at"] = "2026-07-23T00:00:00Z"
+                state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+                before = state_path.read_bytes()
+
+                blocked = self.accept_command(
+                    "IMPLEMENTATION_PACKET", supplied,
+                    lane="impl-1", actor="impl-1", observed_head=SHA, check=False,
+                )
+
+                self.assertEqual(blocked.returncode, 1)
+                self.assertEqual(state_path.read_bytes(), before)
+
+    def test_graph_accept_authorizes_coordinator_inline_single_leaf_research(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "session-1",
+            "--json", '{"node":"research"}',
+        )
+        packet = valid_packets()["RESEARCH_PACKET"]
+
+        accepted = json.loads(self.accept_command(
+            "RESEARCH_PACKET", packet, lane="session-1", actor="session-1",
+        ).stdout)
+
+        self.assertEqual(accepted["state"]["node"], "implementation")
+        self.assertEqual(accepted["acceptance_receipt"]["actor_session_id"], "session-1")
+
+    def test_graph_accept_preserves_dedicated_research_actor_authority(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "research", "--coordinator-thread-id", "session-1", session_id="research-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "research-1",
+            "--json", '{"node":"research"}',
+        )
+
+        accepted = json.loads(self.accept_command(
+            "RESEARCH_PACKET", valid_packets()["RESEARCH_PACKET"],
+            lane="research-1", actor="research-1",
+        ).stdout)
+
+        self.assertEqual(accepted["state"]["node"], "implementation")
+
+    def test_graph_accept_authorizes_matching_terminal_jiminy_actor(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "delivery-lane",
+            "--json", (
+                '{"node":"integration_verification",'
+                '"jiminy_runner_session_id":"jiminy-1"}'
+            ),
+        )
+        packet = valid_packets()["JIMINY_COMPLETE"]
+        self.assertEqual(self.hook_for(
+            "jiminy-1", "Stop",
+            last_assistant_message=f"JIMINY_COMPLETE:\n{json.dumps(packet)}",
+            stop_hook_active=False,
+        ), {})
+
+        accepted = json.loads(self.accept_command(
+            "JIMINY_COMPLETE", packet,
+            lane="delivery-lane", actor="jiminy-1", runner="jiminy-1",
+        ).stdout)
+
+        self.assertEqual(accepted["state"]["node"], "complete")
+
+    def test_graph_accept_rejects_non_fast_path_coordinator_research_without_mutation(self) -> None:
+        for case in ("clarify", "split", "blocked artifact", "dedicated lane", "other coordinator"):
+            with self.subTest(case=case):
+                self.tearDown()
+                self.setUp()
+                self.register("gepetto")
+                self.register("gepetto", session_id="other-coordinator")
+                lane = "research-lane" if case == "dedicated lane" else "session-1"
+                actor = "other-coordinator" if case == "other coordinator" else "session-1"
+                self.state_command(
+                    "ledger", "set", "--session-id", "session-1", "--lane", lane,
+                    "--json", '{"node":"research"}',
+                )
+                packet = valid_packets()["RESEARCH_PACKET"]
+                if case == "clarify":
+                    packet["decision"] = "clarify"
+                elif case == "split":
+                    packet["decision"] = "split"
+                    packet["delivery_issue_urls"].append(
+                        "https://github.com/owner/repo/issues/2"
+                    )
+                elif case == "blocked artifact":
+                    packet["artifact"] = {
+                        "kind": "tmp_markdown", "status": "blocked", "marker": None,
+                        "content_ref": "sha256:" + "c" * 64,
+                        "locations": [{"path": "/tmp/research.md"}],
+                    }
+                state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+                before = state_path.read_bytes()
+
+                blocked = self.accept_command(
+                    "RESEARCH_PACKET", packet, lane=lane, actor=actor, check=False,
+                )
+
+                self.assertEqual(blocked.returncode, 1)
+                self.assertEqual(state_path.read_bytes(), before)
 
     def test_graph_accept_requires_authorized_jiminy_runner_when_entering_merge(self) -> None:
         self.register("gepetto")
