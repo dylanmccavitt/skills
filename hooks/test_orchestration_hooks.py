@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hooks import orchestration_state
+from hooks.test_orchestration_contract import artifact_text
 from hooks.test_orchestration_packets import valid_packets
 
 
@@ -32,6 +34,8 @@ class OrchestrationHookTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.env = dict(os.environ, CODEX_ORCHESTRATION_STATE_DIR=self.temporary.name)
+        self.research_artifact = Path(self.temporary.name) / "research.md"
+        self.research_artifact.write_text(artifact_text(), encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -367,20 +371,29 @@ class OrchestrationHookTest(unittest.TestCase):
         expected_revision: int | None = None,
         observed_head: str | None = None,
         runner: str | None = None,
+        research_artifact: Path | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         revision = expected_revision
         if revision is None:
             revision = int(self.session_state()["state_revision"])
+        supplied_packet = copy.deepcopy(packet)
+        if event == "RESEARCH_PACKET":
+            research_artifact = research_artifact or self.research_artifact
+            supplied_packet["artifact"]["content_ref"] = (
+                orchestration_state.context_digest([research_artifact])["ref"]
+            )
         arguments = [
             "graph", "accept", "--session-id", "session-1", "--lane", lane,
             "--actor-session-id", actor, "--expected-revision", str(revision),
-            "--event", event, "--packet-json", json.dumps(packet),
+            "--event", event, "--packet-json", json.dumps(supplied_packet),
         ]
         if observed_head is not None:
             arguments.extend(("--observed-pr-head-sha", observed_head))
         if runner is not None:
             arguments.extend(("--runner-session-id", runner))
+        if research_artifact is not None:
+            arguments.extend(("--research-artifact-file", str(research_artifact)))
         return self.state_command(*arguments, check=check)
 
     def test_read_only_roles_cannot_edit_or_write(self) -> None:
@@ -746,6 +759,40 @@ class OrchestrationHookTest(unittest.TestCase):
 
         self.assertEqual(accepted["state"]["node"], "implementation")
         self.assertEqual(accepted["acceptance_receipt"]["actor_session_id"], "session-1")
+        self.assertRegex(
+            accepted["state"]["validated_delivery_spec_digest"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        research_proof = accepted["state"]["proof_lifecycle"]["bindings"]["research"]
+        self.assertEqual(
+            research_proof["evidence"]["validated_delivery_spec_digest"],
+            accepted["state"]["validated_delivery_spec_digest"],
+        )
+        self.assertEqual(
+            accepted["acceptance_receipt"]["validated_delivery_spec_digest"],
+            accepted["state"]["validated_delivery_spec_digest"],
+        )
+
+    def test_rejected_delivery_spec_does_not_mutate_coordinator_state(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "session-1",
+            "--json", '{"node":"research"}',
+        )
+        invalid_artifact = Path(self.temporary.name) / "invalid-research.md"
+        invalid_artifact.write_text("# Missing delivery specification\n", encoding="utf-8")
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+
+        blocked = self.accept_command(
+            "RESEARCH_PACKET", valid_packets()["RESEARCH_PACKET"],
+            lane="session-1", actor="session-1",
+            research_artifact=invalid_artifact, check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("exactly one readable", blocked.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_graph_accept_preserves_dedicated_research_actor_authority(self) -> None:
         self.register("gepetto")
@@ -1162,6 +1209,7 @@ class OrchestrationHookTest(unittest.TestCase):
             "jiminy_runner_session_id": "jiminy-1",
             "base_sha": "b" * 40,
             "head_sha": SHA,
+            "validated_delivery_spec_digest": "sha256:" + ("f" * 64),
             "proof_lifecycle": {
                 "generations": {"contract": 2, "base": 3, "head": 4},
                 "observations": {
@@ -1207,6 +1255,10 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(lifecycle["generations"], {"contract": 2, "base": 4, "head": 4})
         self.assertEqual(lifecycle["bindings"], {})
         self.assertEqual(base_change["state"]["node"], "implementation")
+        self.assertRegex(
+            base_change["state"]["validated_delivery_spec_digest"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
 
         # Restore a current implementation proof, then invalidate the contract.
         lifecycle["bindings"]["implementation"] = {
@@ -1236,6 +1288,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(lifecycle["bindings"], {})
         self.assertEqual(len(lifecycle["invalidation_history"]), 2)
         self.assertEqual(contract_change["state"]["node"], "research")
+        self.assertNotIn("validated_delivery_spec_digest", contract_change["state"])
 
     def test_merge_set_requires_current_accepted_result_for_every_expected_pr(self) -> None:
         self.register("gepetto")

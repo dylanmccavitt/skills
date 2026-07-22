@@ -24,6 +24,7 @@
     "gepetto/",
     "hooks/hooks.json",
     "hooks/orchestration_events.py",
+    "hooks/orchestration_contract.py",
     "hooks/orchestration_graph.py",
     "hooks/orchestration_hook.py",
     "hooks/orchestration_packets.py",

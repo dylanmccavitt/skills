@@ -84,6 +84,30 @@ class OrchestrationGraphTest(unittest.TestCase):
             [],
         )
 
+    def test_research_transition_requires_trusted_validated_spec_digest(self) -> None:
+        packet = valid_packets()["RESEARCH_PACKET"]
+        missing = {"packet": packet, "persisted": {}}
+        malformed = {
+            "packet": packet,
+            "persisted": {"validated_delivery_spec_digest": "sha256:not-a-digest"},
+        }
+        trusted = {
+            "packet": packet,
+            "persisted": {"validated_delivery_spec_digest": CONTENT_REF},
+        }
+        self.assertEqual(
+            eligible_transitions(self.workflow, "research", "RESEARCH_PACKET", missing), []
+        )
+        self.assertEqual(
+            eligible_transitions(self.workflow, "research", "RESEARCH_PACKET", malformed), []
+        )
+        self.assertEqual(
+            [item["id"] for item in eligible_transitions(
+                self.workflow, "research", "RESEARCH_PACKET", trusted
+            )],
+            ["research-approved"],
+        )
+
     def test_contradictory_ready_review_cannot_advance_to_merge(self) -> None:
         packet = valid_packets()["REVIEW_PACKET"]
         packet["ci_checks"][0]["conclusion"] = "failure"

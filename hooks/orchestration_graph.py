@@ -21,7 +21,7 @@ NODE_KEYS = {
 TRANSITION_KEYS = {"id", "from", "event", "to", "to_path", "packet_type", "all", "increment", "set"}
 CONDITION_OPERATORS = {
     "equals", "equals_path", "non_empty", "less_than_policy",
-    "map_keys_equal_path", "values_full_sha",
+    "map_keys_equal_path", "values_full_sha", "content_ref",
 }
 
 
@@ -116,7 +116,7 @@ def _validate_condition(condition: Any, transition_id: str, policies: dict[str, 
             raise ValueError(f"transition {transition_id} references unknown policy {operand!r}")
         if not isinstance(policies[operand], (int, float)) or isinstance(policies[operand], bool):
             raise ValueError(f"transition {transition_id} policy {operand!r} must be numeric")
-    elif operator in {"non_empty", "values_full_sha"} and operand is not True:
+    elif operator in {"non_empty", "values_full_sha", "content_ref"} and operand is not True:
         raise ValueError(f"transition {transition_id} {operator} must equal true")
 
 
@@ -266,6 +266,13 @@ def _condition_passes(
             isinstance(item, str) and len(item) == 40
             and all(character in "0123456789abcdefABCDEF" for character in item)
             for item in value.values()
+        )
+    if condition.get("content_ref") is True:
+        return (
+            isinstance(value, str)
+            and len(value) == 71
+            and value.startswith("sha256:")
+            and all(character in "0123456789abcdef" for character in value[7:])
         )
     raise ValueError(f"unsupported workflow condition: {condition}")
 
