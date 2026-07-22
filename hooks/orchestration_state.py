@@ -429,13 +429,13 @@ def accept_graph_event(
     event: str,
     packet: dict[str, Any],
     observed_pr_head_sha: str | None,
-    workflow: dict[str, Any],
     runner_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate and persist one packet-driven transition as one coordinator revision."""
-    from orchestration_graph import eligible_transitions, resolve_target
+    from orchestration_graph import eligible_transitions, load_workflow, resolve_target
     from orchestration_packets import FULL_SHA, PACKET_TYPES, validate_packet
 
+    workflow = load_workflow()
     if event not in PACKET_TYPES:
         raise ValueError(f"graph accept requires a supported packet event: {event}")
     validate_packet(event, packet)
@@ -517,6 +517,8 @@ def accept_graph_event(
             raise ValueError("Jiminy runner session ID is required for this transition")
         verify_registration(selected_runner, "jiminy", coordinator_thread_id=session_id)
         bound_runner = lane_state.get("jiminy_runner_session_id")
+        if source_owner == "jiminy" and bound_runner is None:
+            raise ValueError(f"Jiminy-owned lane is not bound to a runner: {lane}")
         if bound_runner is not None and (
             not isinstance(bound_runner, str)
             or (
@@ -786,10 +788,6 @@ def _parser() -> argparse.ArgumentParser:
     graph_accept_parser.add_argument("--packet-json", required=True)
     graph_accept_parser.add_argument("--observed-pr-head-sha")
     graph_accept_parser.add_argument("--runner-session-id")
-    graph_accept_parser.add_argument(
-        "--workflow", type=Path,
-        default=Path(__file__).parents[1] / "gepetto" / "references" / "workflow.json",
-    )
 
     subparsers.add_parser("status")
     return parser
@@ -913,13 +911,21 @@ def main() -> int:
     if args.command == "graph":
         from orchestration_graph import load_workflow
         try:
-            workflow = load_workflow(args.workflow)
             if args.graph_command == "apply":
+                workflow = load_workflow(args.workflow)
                 context = json.loads(args.context_json)
                 if not isinstance(context, dict):
                     raise ValueError("--context-json must be a JSON object")
             else:
-                packet = json.loads(args.packet_json)
+                def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                    value: dict[str, Any] = {}
+                    for key, item in pairs:
+                        if key in value:
+                            raise ValueError(f"--packet-json contains duplicate key: {key}")
+                        value[key] = item
+                    return value
+
+                packet = json.loads(args.packet_json, object_pairs_hook=unique_object)
                 if not isinstance(packet, dict):
                     raise ValueError("--packet-json must be a JSON object")
         except (json.JSONDecodeError, OSError, ValueError) as error:
@@ -937,7 +943,7 @@ def main() -> int:
                     result = accept_graph_event(
                         args.session_id, args.lane, args.actor_session_id,
                         args.expected_revision, args.event, packet,
-                        args.observed_pr_head_sha, workflow,
+                        args.observed_pr_head_sha,
                         runner_session_id=args.runner_session_id,
                     )
             except (OSError, ValueError) as error:

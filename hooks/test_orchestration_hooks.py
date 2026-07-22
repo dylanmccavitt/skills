@@ -543,6 +543,60 @@ class OrchestrationHookTest(unittest.TestCase):
                 self.assertEqual(blocked.returncode, 1)
                 self.assertEqual(state_path.read_bytes(), before)
 
+    def test_graph_accept_rejects_duplicate_packet_keys_without_mutation(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", '{"node":"implementation"}',
+        )
+        revision = int(self.session_state()["state_revision"])
+        packet_json = json.dumps(valid_packets()["IMPLEMENTATION_PACKET"])
+        packet_json = packet_json.replace(
+            '"packet_version": 1', '"packet_version": 2, "packet_version": 1', 1
+        )
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+
+        blocked = self.state_command(
+            "graph", "accept", "--session-id", "session-1", "--lane", "impl-1",
+            "--actor-session-id", "impl-1", "--expected-revision", str(revision),
+            "--event", "IMPLEMENTATION_PACKET", "--packet-json", packet_json,
+            "--observed-pr-head-sha", SHA, check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("duplicate key: packet_version", blocked.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_graph_accept_rejects_caller_supplied_workflow_without_mutation(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", '{"node":"implementation"}',
+        )
+        revision = int(self.session_state()["state_revision"])
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+
+        blocked = self.state_command(
+            "graph", "accept", "--session-id", "session-1", "--lane", "impl-1",
+            "--actor-session-id", "impl-1", "--expected-revision", str(revision),
+            "--event", "IMPLEMENTATION_PACKET", "--packet-json",
+            json.dumps(valid_packets()["IMPLEMENTATION_PACKET"]),
+            "--observed-pr-head-sha", SHA, "--workflow", "/tmp/untrusted-workflow.json",
+            check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("unrecognized arguments: --workflow", blocked.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
     def test_graph_accept_enforces_actor_and_jiminy_runner_authority(self) -> None:
         self.register("gepetto")
         self.register(
@@ -611,9 +665,22 @@ class OrchestrationHookTest(unittest.TestCase):
         self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-2")
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
+            "--json", f'{{"node":"merge","head_sha":"{SHA}"}}',
         )
         state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        unbound = self.accept_command(
+            "JIMINY_PR_RESULT", valid_packets()["JIMINY_PR_RESULT"],
+            lane="review-lane", actor="jiminy-1", check=False,
+        )
+        self.assertEqual(unbound.returncode, 1)
+        self.assertIn("not bound to a runner", unbound.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", '{"jiminy_runner_session_id":"jiminy-1"}',
+        )
         before = state_path.read_bytes()
         wrong = self.accept_command(
             "JIMINY_PR_RESULT", valid_packets()["JIMINY_PR_RESULT"],
