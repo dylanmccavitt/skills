@@ -1105,27 +1105,87 @@ def bind_jiminy_ready(
             f"{runner_session_id} is not its checkpoint successor"
         )
 
-    lifecycle = _proof_lifecycle(lane_state)
-    legacy_in_flight = not lifecycle["bindings"] and not lifecycle["invalidation_history"]
-    _require_current_proof(lifecycle, "JIMINY_READY")
-    pr_url = lane_state.get("pr")
-    if not isinstance(pr_url, str):
-        raise ValueError(f"ledger lane has no persisted PR URL: {lane}")
-    ready_entry = next(
-        (item for item in packet["pull_requests"] if item["pr_url"] == pr_url),
-        None,
-    )
-    if ready_entry is None:
-        raise ValueError(f"JIMINY_READY does not contain the lane PR: {pr_url}")
-    trusted_head = lifecycle["observations"].get("head")
-    if ready_entry["reviewed_head_sha"] != trusted_head:
-        raise ValueError("JIMINY_READY reviewed head does not match current proof")
     if any(
         item["gates"]["review_packet_verified"] is not True
         or item["gates"]["required_checks_green"] is not True
         for item in packet["pull_requests"]
     ):
         raise ValueError("JIMINY_READY requires verified review and CI gates")
+
+    ready_by_reviewer: dict[str, tuple[dict[str, Any], str]] = {}
+    for item in packet["pull_requests"]:
+        reviewer_task_id = _safe_id(item["reviewer_task_id"])
+        if reviewer_task_id in ready_by_reviewer:
+            raise ValueError(
+                f"duplicate JIMINY_READY reviewer mapping: {reviewer_task_id}"
+            )
+        ready_by_reviewer[reviewer_task_id] = (
+            item,
+            normalize_github_url(item["pr_url"], kind="pull"),
+        )
+    if lane not in ready_by_reviewer:
+        raise ValueError(f"JIMINY_READY does not identify its review lane: {lane}")
+
+    verified_authorities: list[
+        tuple[str, dict[str, Any], dict[str, Any], str, str]
+    ] = []
+    for reviewer_task_id, (item, pr_url) in ready_by_reviewer.items():
+        reviewer_registration = load_state(reviewer_task_id)
+        if reviewer_registration is None or reviewer_registration.get("role") != "review":
+            raise ValueError(
+                f"merge authority reviewer is not a registered review task: {reviewer_task_id}"
+            )
+        authority_state = ledger.get(reviewer_task_id)
+        if not isinstance(authority_state, dict) or authority_state.get("tombstone"):
+            raise ValueError(f"no active review ledger lane: {reviewer_task_id}")
+        if authority_state.get("node") != "merge":
+            raise ValueError(f"merge authority review lane is not at merge: {reviewer_task_id}")
+        repository = authority_state.get("repository")
+        if not isinstance(repository, str):
+            raise ValueError(f"merge authority lane has no repository: {reviewer_task_id}")
+        persisted_pr = authority_state.get("pr")
+        if (
+            not isinstance(persisted_pr, str)
+            or normalize_github_url(persisted_pr, kind="pull") != pr_url
+        ):
+            raise ValueError(f"merge authority PR does not match review lane: {pr_url}")
+        if (
+            normalize_repository(repository) != packet_repository
+            or repository_from_github_url(pr_url, kind="pull") != packet_repository
+        ):
+            raise ValueError(f"merge authority repository does not match lane PR: {pr_url}")
+        authority_runner = authority_state.get("jiminy_runner_session_id")
+        if not isinstance(authority_runner, str) or (
+            runner_session_id != authority_runner
+            and not _is_continuation_successor(authority_runner, runner_session_id)
+        ):
+            raise ValueError(
+                f"review lane is not bound to the selected Jiminy runner: {reviewer_task_id}"
+            )
+        authority_lifecycle = _proof_lifecycle(authority_state)
+        _require_current_proof(authority_lifecycle, "JIMINY_READY")
+        missing = [
+            name for name in ("review", "ci", "merge_ready")
+            if not _binding_is_current(authority_lifecycle, name)
+        ]
+        if missing:
+            raise ValueError(
+                "JIMINY_READY requires current-generation review lane proof: "
+                + ", ".join(missing)
+            )
+        if item["reviewed_head_sha"] != authority_lifecycle["observations"].get("head"):
+            raise ValueError(f"merge authority head does not match current lane proof: {pr_url}")
+        verified_authorities.append(
+            (
+                reviewer_task_id,
+                authority_state,
+                authority_lifecycle,
+                pr_url,
+                item["reviewed_head_sha"],
+            )
+        )
+
+    lifecycle = _proof_lifecycle(lane_state)
 
     packet_digest = canonical_packet_digest(packet)
     existing = lifecycle["bindings"].get("expected_merge_set")
@@ -1140,20 +1200,6 @@ def bind_jiminy_ready(
         raise ValueError("cannot replace JIMINY_READY after accepting merge results")
 
     lane_state["jiminy_runner_session_id"] = runner_session_id
-    if legacy_in_flight:
-        _bind_current_proof(lifecycle, "review", {
-            "migration_source": "JIMINY_READY",
-            "reviewed_head_sha": ready_entry["reviewed_head_sha"],
-        })
-        _bind_current_proof(lifecycle, "ci", {
-            "migration_source": "JIMINY_READY",
-            "required_checks_green": True,
-            "reviewed_head_sha": ready_entry["reviewed_head_sha"],
-        })
-        _bind_current_proof(lifecycle, "merge_ready", {
-            "migration_source": "JIMINY_READY",
-            "reviewed_head_sha": ready_entry["reviewed_head_sha"],
-        })
     _bind_current_proof(lifecycle, "expected_merge_set", {
         "packet_digest": packet_digest,
         "merge_authority": packet["merge_authority"],
@@ -1165,37 +1211,18 @@ def bind_jiminy_ready(
         },
     })
     authorities = _dict_container(state, "merge_authorities")
-    for item in packet["pull_requests"]:
-        pr_url = normalize_github_url(item["pr_url"], kind="pull")
-        matching = [
-            (candidate_lane, candidate)
-            for candidate_lane, candidate in ledger.items()
-            if isinstance(candidate, dict)
-            and not candidate.get("tombstone")
-            and isinstance(candidate.get("pr"), str)
-            and normalize_github_url(candidate["pr"], kind="pull") == pr_url
-        ]
-        if len(matching) != 1:
-            raise ValueError(f"expected one ledger lane for merge authority: {pr_url}")
-        authority_lane, authority_state = matching[0]
-        authority_lifecycle = _proof_lifecycle(authority_state)
-        repository = authority_state.get("repository")
-        if not isinstance(repository, str):
-            # Legacy lanes may complete monitoring, but cannot receive effective merge authority.
-            authorities.pop(pr_url, None)
-            continue
-        if (
-            normalize_repository(repository) != packet_repository
-            or repository_from_github_url(pr_url, kind="pull") != packet_repository
-        ):
-            raise ValueError(f"merge authority repository does not match lane PR: {pr_url}")
-        if item["reviewed_head_sha"] != authority_lifecycle["observations"].get("head"):
-            raise ValueError(f"merge authority head does not match current lane proof: {pr_url}")
+    for (
+        authority_lane,
+        authority_state,
+        authority_lifecycle,
+        pr_url,
+        reviewed_head_sha,
+    ) in verified_authorities:
         if packet["merge_authority"] == "merge":
             authorities[pr_url] = {
-                "repository": repository,
+                "repository": packet_repository,
                 "pr_url": pr_url,
-                "reviewed_head_sha": item["reviewed_head_sha"],
+                "reviewed_head_sha": reviewed_head_sha,
                 "generations": _generation_tuple(authority_lifecycle),
                 "runner_session_id": runner_session_id,
                 "lane": authority_lane,

@@ -457,6 +457,35 @@ class OrchestrationHookTest(unittest.TestCase):
             arguments.extend(("--research-artifact-file", str(research_artifact)))
         return self.state_command(*arguments, check=check)
 
+    def merge_lane_state(
+        self, pr_url: str, *, head: str = SHA, runner: str = "jiminy-1"
+    ) -> dict[str, object]:
+        generations = {"contract": 0, "base": 0, "head": 0}
+        return {
+            "node": "merge",
+            "repository": "owner/repo",
+            "pr": pr_url,
+            "jiminy_runner_session_id": runner,
+            "proof_lifecycle": {
+                "generations": generations,
+                "observations": {"contract": None, "base": None, "head": head},
+                "bindings": {
+                    name: {"generations": dict(generations), "evidence": {}}
+                    for name in ("review", "ci", "merge_ready")
+                },
+                "invalidation_history": [],
+            },
+        }
+
+    def set_trusted_lane(self, lane: str, value: dict[str, object]) -> None:
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}):
+            state = orchestration_state.load_state("session-1")
+            self.assertIsNotNone(state)
+            state.setdefault("ledger", {})[lane] = copy.deepcopy(value)
+            orchestration_state.write_state(
+                "session-1", state, expected_revision=int(state["state_revision"])
+            )
+
     def test_read_only_roles_cannot_edit_or_write(self) -> None:
         for index, role in enumerate(("gepetto", "jiminy", "research"), start=1):
             session_id = f"read-only-{index}"
@@ -784,6 +813,9 @@ class OrchestrationHookTest(unittest.TestCase):
 
     def test_graph_apply_atomically_enforces_and_increments_review_cycle(self) -> None:
         self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
             "--json", '{"node":"review","review_fix_cycles":2}',
@@ -795,6 +827,20 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(applied["transition_id"], "review-found-issues")
         self.assertEqual(applied["state"]["node"], "fixer")
         self.assertEqual(applied["state"]["review_fix_cycles"], 3)
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", json.dumps({
+                "node": "merge", "review_fix_cycles": 2,
+                "jiminy_runner_session_id": "jiminy-1",
+            }),
+        )
+        recovered = json.loads(self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "merge", "--event", "ACTIONABLE_FINDINGS",
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertEqual(recovered["state"]["node"], "fixer")
+        self.assertEqual(recovered["state"]["review_fix_cycles"], 3)
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
             "--json", '{"node":"review"}',
@@ -1487,15 +1533,16 @@ class OrchestrationHookTest(unittest.TestCase):
 
     def test_graph_accept_binds_and_preserves_jiminy_runner(self) -> None:
         self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-lane"
+        )
         self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1")
         self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-2")
-        self.state_command(
-            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", json.dumps({
-                "node": "merge", "head_sha": SHA,
-                "pr": valid_packets()["JIMINY_PR_RESULT"]["pr_url"],
-            }),
+        lane_state = self.merge_lane_state(
+            valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
         )
+        lane_state.pop("jiminy_runner_session_id")
+        self.set_trusted_lane("review-lane", lane_state)
         state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
         before = state_path.read_bytes()
         unbound = self.accept_command(
@@ -1521,6 +1568,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.state_command("continue", "--source-id", "jiminy-1", "--successor-id", "jiminy-3")
         ready = valid_packets()["JIMINY_READY"]
         ready["coordinator_thread_id"] = "session-1"
+        ready["pull_requests"][0]["reviewer_task_id"] = "review-lane"
         revision = int(self.session_state()["state_revision"])
         self.state_command(
             "graph", "ready", "--session-id", "session-1", "--lane", "review-lane",
@@ -1532,6 +1580,105 @@ class OrchestrationHookTest(unittest.TestCase):
             lane="review-lane", actor="jiminy-3",
         ).stdout)
         self.assertEqual(accepted["state"]["jiminy_runner_session_id"], "jiminy-3")
+
+    def test_graph_ready_uses_exact_reviewer_lane_despite_historical_same_pr_lane(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-1"
+        )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        pr_url = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
+        self.set_trusted_lane("implementation-1", {
+            "node": "review", "repository": "owner/repo", "pr": pr_url,
+        })
+        self.set_trusted_lane("review-1", self.merge_lane_state(pr_url))
+        ready = valid_packets()["JIMINY_READY"]
+        ready["coordinator_thread_id"] = "session-1"
+        revision = int(self.session_state()["state_revision"])
+        self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        )
+        authority = self.session_state()["merge_authorities"][pr_url]
+        self.assertEqual(authority["lane"], "review-1")
+
+    def test_graph_ready_rejects_spoofed_or_stale_reviewer_mappings_atomically(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-1"
+        )
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1",
+            session_id="implementation-spoof",
+        )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        pr_url = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
+        valid_lane = self.merge_lane_state(pr_url)
+        self.set_trusted_lane("review-1", valid_lane)
+        self.set_trusted_lane("implementation-spoof", valid_lane)
+
+        def rejected(packet: dict[str, object], message: str) -> None:
+            state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+            before = state_path.read_bytes()
+            result = self.state_command(
+                "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+                "--expected-revision", str(self.session_state()["state_revision"]),
+                "--packet-json", json.dumps(packet),
+                "--runner-session-id", "jiminy-1", check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(message, result.stderr)
+            self.assertEqual(state_path.read_bytes(), before)
+
+        missing = valid_packets()["JIMINY_READY"]
+        missing["coordinator_thread_id"] = "session-1"
+        missing["pull_requests"][0]["reviewer_task_id"] = "missing-reviewer"
+        rejected(missing, "does not identify its review lane")
+
+        spoofed = valid_packets()["JIMINY_READY"]
+        spoofed["coordinator_thread_id"] = "session-1"
+        second = copy.deepcopy(spoofed["pull_requests"][0])
+        second["pr_url"] = "https://github.com/owner/repo/pull/3"
+        second["branch"] = "issue-3"
+        second["reviewer_task_id"] = "implementation-spoof"
+        spoofed["pull_requests"].append(second)
+        spoofed["expected_pr_urls"].append(second["pr_url"])
+        spoofed["merge_order"].append(second["pr_url"])
+        rejected(spoofed, "not a registered review task")
+
+        duplicate = copy.deepcopy(spoofed)
+        duplicate["pull_requests"][1]["reviewer_task_id"] = "review-1"
+        rejected(duplicate, "duplicate JIMINY_READY reviewer mapping")
+
+        wrong_head = valid_packets()["JIMINY_READY"]
+        wrong_head["coordinator_thread_id"] = "session-1"
+        wrong_head["pull_requests"][0]["reviewed_head_sha"] = "b" * 40
+        rejected(wrong_head, "head does not match current lane proof")
+
+        for update, message in (
+            ({"pr": "https://github.com/owner/repo/pull/3"}, "PR does not match"),
+            ({"repository": "other/repo"}, "repository does not match"),
+            ({"node": "review"}, "can bind only at merge"),
+        ):
+            changed = copy.deepcopy(valid_lane)
+            changed.update(update)
+            self.set_trusted_lane("review-1", changed)
+            packet = valid_packets()["JIMINY_READY"]
+            packet["coordinator_thread_id"] = "session-1"
+            rejected(packet, message)
+            self.set_trusted_lane("review-1", valid_lane)
+
+        stale = copy.deepcopy(valid_lane)
+        stale["proof_lifecycle"]["bindings"]["review"]["generations"]["head"] = 1
+        self.set_trusted_lane("review-1", stale)
+        packet = valid_packets()["JIMINY_READY"]
+        packet["coordinator_thread_id"] = "session-1"
+        rejected(packet, "current-generation")
 
     def test_graph_accept_concurrent_expected_revision_has_one_winner(self) -> None:
         self.register("gepetto")
@@ -1575,15 +1722,13 @@ class OrchestrationHookTest(unittest.TestCase):
         self.register(
             "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
         )
-        self.state_command(
-            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
-            "--json", json.dumps({
-                "node": "implementation",
-                "base_sha": "c" * 40,
-                "pr": valid_packets()["IMPLEMENTATION_PACKET"]["pr_url"],
-                "research_content_ref": "sha256:" + ("c" * 64),
-            }),
-        )
+        self.set_trusted_lane("impl-1", {
+            "node": "implementation",
+            "base_sha": "c" * 40,
+            "pr": valid_packets()["IMPLEMENTATION_PACKET"]["pr_url"],
+            "repository": "owner/repo",
+            "research_content_ref": "sha256:" + ("c" * 64),
+        })
         implementation = valid_packets()["IMPLEMENTATION_PACKET"]
         self.accept_command(
             "IMPLEMENTATION_PACKET", implementation,
@@ -1884,21 +2029,18 @@ class OrchestrationHookTest(unittest.TestCase):
         pr_one = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
         pr_two = "https://github.com/owner/repo/pull/3"
         for lane, pr_url in (("lane-1", pr_one), ("lane-2", pr_two)):
-            self.state_command(
-                "ledger", "set", "--session-id", "session-1", "--lane", lane,
-                "--json", json.dumps({
-                    "node": "merge",
-                    "head_sha": SHA,
-                    "pr": pr_url,
-                    "jiminy_runner_session_id": "jiminy-1",
-                }),
+            self.register(
+                "review", "--coordinator-thread-id", "session-1", session_id=lane
             )
+            self.set_trusted_lane(lane, self.merge_lane_state(pr_url))
 
         ready = valid_packets()["JIMINY_READY"]
         ready["coordinator_thread_id"] = "session-1"
+        ready["pull_requests"][0]["reviewer_task_id"] = "lane-1"
         second = json.loads(json.dumps(ready["pull_requests"][0]))
         second["pr_url"] = pr_two
         second["branch"] = "issue-2"
+        second["reviewer_task_id"] = "lane-2"
         ready["pull_requests"].append(second)
         ready["expected_pr_urls"] = [pr_one, pr_two]
         ready["merge_order"] = [pr_one, pr_two]
