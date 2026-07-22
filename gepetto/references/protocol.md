@@ -291,6 +291,12 @@ JIMINY_READY:
 
 Every listed PR must have a verified persisted implementation artifact and a `REVIEW_PACKET` bound to `reviewed_head_sha`. Any false or unknown required gate keeps the PR out of merge-ready state and must be reported as a blocker.
 
+Before accepting any merge result, persist the validated `JIMINY_READY` packet on every included merge lane. This binds the authorized expected PR set to the lane's current contract/base/head generations and bound Jiminy runner:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph ready --session-id <gepetto-task-id> --lane <review-task-id> --expected-revision <current-coordinator-revision> --packet-json '<JIMINY_READY-json>' --runner-session-id <jiminy-task-id>
+```
+
 ## JIMINY_PR_RESULT
 
 ```text
@@ -306,7 +312,7 @@ JIMINY_PR_RESULT:
 }
 ```
 
-Each result is intermediate and advances no phase by itself. Accept it with `graph accept`, the current coordinator revision, the bound Jiminy actor, and the exact packet JSON; this records the same-node acceptance receipt atomically. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public administrative `graph apply` command with `ready.expected_pr_urls` and `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. It is eligible only when the result-map keys exactly equal `JIMINY_READY.expected_pr_urls` and every value is a full SHA; missing, extra, or malformed PR/commit results block integration verification.
+Each result is intermediate and advances no phase by itself. Accept it with `graph accept`, the current coordinator revision, the bound Jiminy actor, and the exact packet JSON; acceptance requires the persisted current-generation `JIMINY_READY` binding and records the same-node receipt atomically. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public administrative `graph apply` command with only `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. The runtime compares result keys only with the persisted authorized expected set; caller-supplied `ready.expected_pr_urls` is rejected. Missing, extra, malformed, or stale-generation results block integration verification.
 
 ## JIMINY_INTEGRATION_FAILED
 

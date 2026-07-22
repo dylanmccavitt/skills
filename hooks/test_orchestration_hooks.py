@@ -858,7 +858,10 @@ class OrchestrationHookTest(unittest.TestCase):
         self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-2")
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", f'{{"node":"merge","head_sha":"{SHA}"}}',
+            "--json", json.dumps({
+                "node": "merge", "head_sha": SHA,
+                "pr": valid_packets()["JIMINY_PR_RESULT"]["pr_url"],
+            }),
         )
         state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
         before = state_path.read_bytes()
@@ -883,6 +886,14 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), before)
 
         self.state_command("continue", "--source-id", "jiminy-1", "--successor-id", "jiminy-3")
+        ready = valid_packets()["JIMINY_READY"]
+        ready["coordinator_thread_id"] = "session-1"
+        revision = int(self.session_state()["state_revision"])
+        self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-lane",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-3",
+        )
         accepted = json.loads(self.accept_command(
             "JIMINY_PR_RESULT", valid_packets()["JIMINY_PR_RESULT"],
             lane="review-lane", actor="jiminy-3",
@@ -933,7 +944,12 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
-            "--json", '{"node":"implementation","base_sha":"' + ("c" * 40) + '"}',
+            "--json", json.dumps({
+                "node": "implementation",
+                "base_sha": "c" * 40,
+                "pr": valid_packets()["IMPLEMENTATION_PACKET"]["pr_url"],
+                "research_content_ref": "sha256:" + ("c" * 64),
+            }),
         )
         implementation = valid_packets()["IMPLEMENTATION_PACKET"]
         self.accept_command(
@@ -978,20 +994,39 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertTrue(replay["idempotent"])
         self.assertEqual(int(self.session_state()["state_revision"]), replay_revision)
 
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-1",
+            "--json", '{"node":"implementation"}',
+        )
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        unchanged = state_path.read_bytes()
+        illegal_replay = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-1",
+            "--current-node", "implementation", "--event", "PR_HEAD_CHANGED",
+            "--expected-revision", str(self.session_state()["state_revision"]),
+            "--context-json", invalidation, check=False,
+        )
+        self.assertEqual(illegal_replay.returncode, 1)
+        self.assertIn("found 0", illegal_replay.stderr)
+        self.assertEqual(state_path.read_bytes(), unchanged)
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-1",
+            "--json", '{"node":"review"}',
+        )
+
         # Even a caller that rewrites the public workflow node cannot make old
         # review/CI/readiness bindings satisfy a current merge gate.
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-1",
             "--json", '{"node":"merge"}',
         )
-        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
         unchanged = state_path.read_bytes()
         stale_merge = self.accept_command(
             "JIMINY_PR_RESULT", valid_packets()["JIMINY_PR_RESULT"],
             lane="review-1", actor="jiminy-1", runner="jiminy-1", check=False,
         )
         self.assertEqual(stale_merge.returncode, 1)
-        self.assertIn("current-generation proof", stale_merge.stderr)
+        self.assertIn("found 0", stale_merge.stderr)
         self.assertEqual(state_path.read_bytes(), unchanged)
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-1",
@@ -1025,18 +1060,89 @@ class OrchestrationHookTest(unittest.TestCase):
 
         merge_result = valid_packets()["JIMINY_PR_RESULT"]
         merge_result["reviewed_head_sha"] = new_head
+        before_ready = state_path.read_bytes()
+        unauthorized_result = self.accept_command(
+            "JIMINY_PR_RESULT", merge_result,
+            lane="review-1", actor="jiminy-1", runner="jiminy-1", check=False,
+        )
+        self.assertEqual(unauthorized_result.returncode, 1)
+        self.assertIn("expected_merge_set", unauthorized_result.stderr)
+        self.assertEqual(state_path.read_bytes(), before_ready)
+
+        ready = valid_packets()["JIMINY_READY"]
+        ready["coordinator_thread_id"] = "session-1"
+        ready["pull_requests"][0]["reviewed_head_sha"] = new_head
+        revision = int(self.session_state()["state_revision"])
+        stale_ready = self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision - 1),
+            "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1", check=False,
+        )
+        self.assertEqual(stale_ready.returncode, 1)
+        self.assertEqual(state_path.read_bytes(), before_ready)
+        monitoring_ready = json.loads(json.dumps(ready))
+        monitoring_ready["merge_authority"] = "monitoring-only"
+        self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision),
+            "--packet-json", json.dumps(monitoring_ready),
+            "--runner-session-id", "jiminy-1",
+        )
+        monitor_result = self.accept_command(
+            "JIMINY_PR_RESULT", merge_result,
+            lane="review-1", actor="jiminy-1", runner="jiminy-1", check=False,
+        )
+        self.assertEqual(monitor_result.returncode, 1)
+        self.assertIn("merge authority", monitor_result.stderr)
+        revision = int(self.session_state()["state_revision"])
+        bound = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision),
+            "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        expected_binding = bound["state"]["proof_lifecycle"]["bindings"]["expected_merge_set"]
+        self.assertEqual(
+            expected_binding["evidence"]["expected_pr_urls"], ready["expected_pr_urls"]
+        )
+        self.assertEqual(
+            expected_binding["generations"], {"contract": 0, "base": 0, "head": 1}
+        )
+
         merged = json.loads(self.accept_command(
             "JIMINY_PR_RESULT", merge_result,
             lane="review-1", actor="jiminy-1", runner="jiminy-1",
         ).stdout)
         self.assertEqual(merged["state"]["node"], "merge")
         revision = int(self.session_state()["state_revision"])
+        before_forged_ready = state_path.read_bytes()
+        forged_ready = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-1",
+            "--current-node", "merge", "--event", "MERGES_VERIFIED",
+            "--expected-revision", str(revision), "--runner-session-id", "jiminy-1",
+            "--context-json", json.dumps({
+                "ready": {"expected_pr_urls": ["https://example.test/forged"]},
+                "packet": {"merge_results": {"https://example.test/forged": "d" * 40}},
+            }), check=False,
+        )
+        self.assertEqual(forged_ready.returncode, 1)
+        self.assertEqual(state_path.read_bytes(), before_forged_ready)
+        wrong_results = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-1",
+            "--current-node", "merge", "--event", "MERGES_VERIFIED",
+            "--expected-revision", str(revision), "--runner-session-id", "jiminy-1",
+            "--context-json", json.dumps({
+                "packet": {"merge_results": {"https://example.test/forged": "d" * 40}},
+            }), check=False,
+        )
+        self.assertEqual(wrong_results.returncode, 1)
+        self.assertEqual(state_path.read_bytes(), before_forged_ready)
         verified = json.loads(self.state_command(
             "graph", "apply", "--session-id", "session-1", "--lane", "review-1",
             "--current-node", "merge", "--event", "MERGES_VERIFIED",
             "--expected-revision", str(revision), "--runner-session-id", "jiminy-1",
             "--context-json", json.dumps({
-                "ready": {"expected_pr_urls": [merge_result["pr_url"]]},
                 "packet": {
                     "merge_results": {
                         merge_result["pr_url"]: merge_result["merge_commit_sha"],
@@ -1160,6 +1266,64 @@ class OrchestrationHookTest(unittest.TestCase):
         ).stdout)
         self.assertEqual(resumed["state"]["node"], "review")
         self.assertNotIn("resume_node", resumed["state"])
+
+        for index, (event, target) in enumerate((
+            ("REVIEW_FIX_LIMIT_EXCEEDED", "needs_decision"),
+            ("LANE_UNRESPONSIVE", "blocked"),
+            ("RESTART_BUDGET_EXCEEDED", "needs_decision"),
+        ), start=2):
+            lane = f"lane-{index}"
+            self.state_command(
+                "ledger", "set", "--session-id", "session-1", "--lane", lane,
+                "--json", '{"node":"review"}',
+            )
+            paused = json.loads(self.state_command(
+                "graph", "apply", "--session-id", "session-1", "--lane", lane,
+                "--current-node", "review", "--event", event,
+            ).stdout)
+            self.assertEqual(paused["state"]["node"], target)
+            self.assertEqual(paused["state"]["resume_node"], "review")
+            resumed = json.loads(self.state_command(
+                "graph", "apply", "--session-id", "session-1", "--lane", lane,
+                "--current-node", target, "--event", "RESUME_AUTHORIZED",
+            ).stdout)
+            self.assertEqual(resumed["state"]["node"], "review")
+            self.assertNotIn("resume_node", resumed["state"])
+
+    def test_pre_f4_lane_backfills_typed_research_artifact_observation(self) -> None:
+        self.register("gepetto")
+        content_ref = valid_packets()["IMPLEMENTATION_PACKET"]["artifact"]["content_ref"]
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "legacy-lane",
+            "--json", json.dumps({
+                "node": "review",
+                "research_content_ref": content_ref,
+                "base_sha": "b" * 40,
+                "head_sha": SHA,
+            }),
+        )
+        migrated = json.loads(self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "legacy-lane",
+            "--current-node", "review", "--event", "FLOW_BLOCKED",
+        ).stdout)
+        self.assertEqual(
+            migrated["state"]["proof_lifecycle"]["observations"],
+            {"contract": content_ref, "base": "b" * 40, "head": SHA},
+        )
+
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "bad-legacy-lane",
+            "--json", '{"node":"review","research_content_ref":"not-a-ref"}',
+        )
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        malformed = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "bad-legacy-lane",
+            "--current-node", "review", "--event", "FLOW_BLOCKED", check=False,
+        )
+        self.assertEqual(malformed.returncode, 1)
+        self.assertIn("content reference", malformed.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_invalidation_malformed_or_stale_revision_is_no_mutation(self) -> None:
         self.register("gepetto")
