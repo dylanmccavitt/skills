@@ -1,6 +1,8 @@
 # Gepetto coordination protocol
 
-Use these packets as contracts between app tasks. Keep values concrete; use `null` only when the fact is genuinely unavailable. Never report a proposed URL, branch, task ID, or SHA as live.
+Use these packets as contracts between app tasks. Keep values concrete; use `null` only where a schema explicitly permits it. Never report a proposed URL, branch, task ID, or SHA as live.
+
+Every packet is exactly one `PACKET_TYPE:` header followed by one JSON object. `packet_version` is required and currently must be `1`. Actual packets do not use Markdown fences. Unknown keys, unknown packet types or versions, Markdown-formatted URLs, non-`sha256:` content references, and abbreviated SHAs are invalid.
 
 ## Machine-readable flow
 
@@ -14,6 +16,8 @@ Maintain each live lane's current node, prior node as `resume_node` when blocked
 - `FLOW_BLOCKED` and `AUTHORITY_REQUIRED` preserve `resume_node`; resume only after the blocking fact or authority changes.
 - `REVIEW_FIX_LIMIT_EXCEEDED` enters `needs_decision` using the workflow policy limit.
 - `DELIVERY_CANCELLED` is terminal and does not imply destructive cleanup.
+
+`JIMINY_PR_RESULT.reviewed_head_sha` must equal the lane's persisted reviewed `head_sha`; caller-supplied context cannot replace that ledger value.
 
 Resolve `project_id` from the live Codex project list. Resolve completion scope from the user's request plus the current issue graph; stop for direction only when those conflict materially.
 
@@ -121,27 +125,32 @@ You are a Gepetto research lane for <issue-url>. Work code-read-only. Verify the
 
 ## RESEARCH_PACKET
 
-```yaml
+```text
 RESEARCH_PACKET:
-  issue_url: <live URL>
-  repository: <owner/name>
-  base_sha: <full SHA>
-  issue_write_authority: persist|propose-only
-  decision: keep|split|consolidate|clarify|block
-  delivery_issue_urls:
-    - <canonical leaf URL; list every child for split; empty for block>
-  artifact:
-    kind: github_issue|tmp_markdown
-    status: persisted|propose-only|blocked
-    marker: <gepetto-research for GitHub, null for temporary Markdown>
-    content_ref: <sha256: digest of the exact verified artifact snapshot>
-    locations:
-      - issue_url: <raw live URL, present for a GitHub artifact>
-        observed_updated_at: <timestamp after re-read>
-        path: <absolute path, present for a temporary Markdown artifact>
+{
+  "packet_version": 1,
+  "issue_url": "<raw live URL>",
+  "repository": "<owner/name>",
+  "base_sha": "<full 40-character SHA>",
+  "issue_write_authority": "<persist or propose-only>",
+  "decision": "<keep, split, consolidate, clarify, or block>",
+  "delivery_issue_urls": ["<canonical raw leaf URL; every child for split; empty for block>"],
+  "artifact": {
+    "kind": "github_issue",
+    "status": "<persisted for github_issue; propose-only or blocked for tmp_markdown>",
+    "marker": "gepetto-research",
+    "content_ref": "sha256:<64 lowercase hex characters>",
+    "locations": [
+      {
+        "issue_url": "<raw live URL>",
+        "observed_updated_at": "<timestamp after re-read>"
+      }
+    ]
+  }
+}
 ```
 
-The full artifact, not this receipt, contains the problem statement, evidence, scope, dependencies, leaf specifications, acceptance criteria, validation, clarifications, and blockers. For `keep`, the artifact defines one leaf matching the existing issue. For `split`, it defines at least two non-overlapping leaves and lists every child in `delivery_issue_urls`. For `consolidate`, it proves why the source is not independently useful, why the combined scope remains one leaf, and lists only the canonical issue in `delivery_issue_urls`; the artifact locations include both updated issues. For `clarify`, update the existing issue with concrete clarification additions. For `block`, persist the blocker and leave `delivery_issue_urls` empty. URLs in receipts must be raw strings, not Markdown links. Gepetto may advance only when `artifact.status` is `persisted`, except in an explicitly analysis-only run using a verified temporary Markdown artifact.
+The full artifact, not this receipt, contains the problem statement, evidence, scope, dependencies, leaf specifications, acceptance criteria, validation, clarifications, and blockers. For `keep`, the artifact defines one leaf matching the existing issue. For `split`, it defines at least two non-overlapping leaves and lists every child in `delivery_issue_urls`. For `consolidate`, it proves why the source is not independently useful, why the combined scope remains one leaf, and lists only the canonical issue in `delivery_issue_urls`; the artifact locations include both updated issues. For `clarify`, update the existing issue with concrete clarification additions. For `block`, persist the blocker and leave `delivery_issue_urls` empty. A `tmp_markdown` artifact uses `marker: null` and each location contains only an absolute `path`. With `propose-only` authority it has `status: propose-only`; with `persist` authority it is permitted only after a blocked write and has `status: blocked`. A `github_issue` artifact requires `persist` authority and `status: persisted`. Gepetto may advance only when `artifact.status` is `persisted`, except in an explicitly analysis-only run using a verified temporary Markdown artifact.
 
 ## Implementation task prompt
 
@@ -173,30 +182,32 @@ If the command reports no eligible transition, emit `REVIEW_FIX_LIMIT_EXCEEDED`,
 
 ## REVIEW_PACKET
 
-```yaml
+```text
 REVIEW_PACKET:
-  issue_url: <live URL>
-  pr_url: <live URL>
-  reviewed_head_sha: <full SHA>
-  findings:
-    - id: <stable ID>
-      severity: critical|high|medium|low
-      disposition: fixed|blocked|accepted-by-user
-      proof: <file/line, test, or commit>
-  local_checks:
-    - command: <exact command>
-      result: pass|fail|blocked
-  ci_checks:
-    - name: <check name>
-      conclusion: success|failure|pending|skipped
-  pr_state:
-    draft: true|false
-    mergeable: true|false|unknown
-    approvals_satisfied: true|false|unknown
-    unresolved_required_threads: <number or unknown>
-  blockers:
-    - <blocker or none>
-  ready_for_jiminy: true|false
+{
+  "packet_version": 1,
+  "issue_url": "<raw live URL>",
+  "pr_url": "<raw live URL>",
+  "reviewed_head_sha": "<full 40-character SHA>",
+  "findings": [
+    {
+      "id": "<stable ID>",
+      "severity": "<critical, high, medium, or low>",
+      "disposition": "<fixed, blocked, or accepted-by-user>",
+      "proof": "<file/line, test, or commit>"
+    }
+  ],
+  "local_checks": [{"command": "<exact command>", "result": "<pass, fail, or blocked>"}],
+  "ci_checks": [{"name": "<check name>", "conclusion": "<success, failure, pending, or skipped>"}],
+  "pr_state": {
+    "draft": false,
+    "mergeable": "unknown",
+    "approvals_satisfied": "unknown",
+    "unresolved_required_threads": "unknown"
+  },
+  "blockers": [],
+  "ready_for_jiminy": false
+}
 ```
 
 `ready_for_jiminy` is false whenever the PR head changed after review, CI is pending or failing, an actionable finding remains, or a required repository gate is unknown.
@@ -226,92 +237,113 @@ On CHECKPOINT_CONTINUATION from Gepetto, replace the coordinator ID with the con
 
 ## JIMINY_READY
 
-```yaml
+```text
 JIMINY_READY:
-  coordinator_thread_id: <exact Gepetto task ID>
-  repository: <owner/name>
-  merge_authority: merge|monitoring-only
-  merge_order:
-    - <PR URL>
-  expected_pr_urls:
-    - <every exact PR URL expected to produce a verified merge result>
-  pull_requests:
-    - issue_url: <live issue URL>
-      pr_url: <live PR URL>
-      branch: <head branch>
-      reviewed_head_sha: <full SHA>
-      reviewer_task_id: <exact task ID>
-      research_artifact:
-        locator: <live issue URL or absolute temporary path>
-        content_ref: <sha256: exact verified research artifact digest>
-      implementation_artifact:
-        locator: <live issue URL or absolute temporary path>
-        content_ref: <sha256: exact verified implementation proof digest>
-      dependencies:
-        - <PR URL or none>
-      gates:
-        review_packet_verified: true|false
-        required_checks_green: true|false
-        approvals_satisfied: true|false|unknown
-        unresolved_required_threads: <number or unknown>
-        mergeable: true|false|unknown
-  gepetto_merged: false
+{
+  "packet_version": 1,
+  "coordinator_thread_id": "<exact Gepetto task ID>",
+  "repository": "<owner/name>",
+  "merge_authority": "<merge or monitoring-only>",
+  "merge_order": ["<raw PR URL>"],
+  "expected_pr_urls": ["<same raw PR URL list as pull_requests, in order>"],
+  "pull_requests": [
+    {
+      "issue_url": "<raw live issue URL>",
+      "pr_url": "<raw live PR URL>",
+      "branch": "<head branch>",
+      "reviewed_head_sha": "<full 40-character SHA>",
+      "reviewer_task_id": "<exact task ID>",
+      "research_artifact": {
+        "locator": "<raw live issue URL or absolute temporary path>",
+        "content_ref": "sha256:<64 lowercase hex characters>"
+      },
+      "implementation_artifact": {
+        "locator": "<raw live issue URL or absolute temporary path>",
+        "content_ref": "sha256:<64 lowercase hex characters>"
+      },
+      "dependencies": [],
+      "gates": {
+        "review_packet_verified": true,
+        "required_checks_green": true,
+        "approvals_satisfied": "unknown",
+        "unresolved_required_threads": "unknown",
+        "mergeable": "unknown"
+      }
+    }
+  ],
+  "gepetto_merged": false
+}
 ```
 
 Every listed PR must have a verified persisted implementation artifact and a `REVIEW_PACKET` bound to `reviewed_head_sha`. Any false or unknown required gate keeps the PR out of merge-ready state and must be reported as a blocker.
 
 ## JIMINY_PR_RESULT
 
-```yaml
+```text
 JIMINY_PR_RESULT:
-  pr_url: <live URL>
-  state: MERGED
-  reviewed_head_sha: <full pre-merge head SHA>
-  merge_commit_sha: <full verified merge commit SHA>
-  linked_issue_url: <live URL>
-  linked_issue_state: OPEN|CLOSED
+{
+  "packet_version": 1,
+  "pr_url": "<raw live URL>",
+  "state": "MERGED",
+  "reviewed_head_sha": "<full 40-character pre-merge head SHA>",
+  "merge_commit_sha": "<full 40-character verified merge commit SHA>",
+  "linked_issue_url": "<raw live URL>",
+  "linked_issue_state": "<OPEN or CLOSED>"
+}
 ```
 
 Each result is intermediate and advances no phase by itself. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public `graph apply` command with `ready.expected_pr_urls` and `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. It is eligible only when the result-map keys exactly equal `JIMINY_READY.expected_pr_urls` and every value is a full SHA; missing, extra, or malformed PR/commit results block integration verification.
 
 ## JIMINY_INTEGRATION_FAILED
 
-```yaml
+```text
 JIMINY_INTEGRATION_FAILED:
-  coordinator_thread_id: <exact Gepetto task ID>
-  repository: <owner/name>
-  default_branch: <branch>
-  observed_head_sha: <full SHA>
-  expected_merge_commits:
-    - <full SHA>
-  failed_checks:
-    - name: <check or verification step>
-      result: failure|blocked
-      evidence: <live URL or exact command result>
-  remediation_required: true
+{
+  "packet_version": 1,
+  "coordinator_thread_id": "<exact Gepetto task ID>",
+  "repository": "<owner/name>",
+  "default_branch": "<branch>",
+  "observed_head_sha": "<full 40-character SHA>",
+  "expected_merge_commits": ["<full 40-character SHA>"],
+  "failed_checks": [
+    {
+      "name": "<check or verification step>",
+      "result": "<failure or blocked>",
+      "evidence": "<live URL or exact command result>"
+    }
+  ],
+  "remediation_required": true
+}
 ```
 
 This event creates a new remediation leaf. Jiminy never fixes the failure; Gepetto routes the leaf through the unchanged research → Pinocchio → review → Jiminy pipeline.
 
 ## JIMINY_COMPLETE
 
-```yaml
+```text
 JIMINY_COMPLETE:
-  coordinator_thread_id: <exact Gepetto task ID>
-  repository: <owner/name>
-  default_branch: <branch>
-  verified_default_head_sha: <full SHA>
-  pull_requests:
-    - pr_url: <live URL>
-      state: MERGED
-      merge_commit_sha: <full SHA>
-  integration:
-    expected_merges_present: true
-    required_checks_green: true
-    linked_issues_verified: true
-    runtime_ready_for_completion: true
-  blockers: []
-  private_log_path: <absolute path>
+{
+  "packet_version": 1,
+  "coordinator_thread_id": "<exact Gepetto task ID>",
+  "repository": "<owner/name>",
+  "default_branch": "<branch>",
+  "verified_default_head_sha": "<full 40-character SHA>",
+  "pull_requests": [
+    {
+      "pr_url": "<raw live URL>",
+      "state": "MERGED",
+      "merge_commit_sha": "<full 40-character SHA>"
+    }
+  ],
+  "integration": {
+    "expected_merges_present": true,
+    "required_checks_green": true,
+    "linked_issues_verified": true,
+    "runtime_ready_for_completion": true
+  },
+  "blockers": [],
+  "private_log_path": "<absolute path>"
+}
 ```
 
 Jiminy may return `JIMINY_COMPLETE` only when every integration field is true. `runtime_ready_for_completion` means every lane is terminal or safely handed off. Jiminy's validated final Stop completes its registration; Gepetto completes its own registration only after accepting and independently verifying the packet. Worktree removal remains subject to separate cleanup authority and the repository hygiene rules, and is never forced.

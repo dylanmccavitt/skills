@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hooks import orchestration_state
+from hooks.test_orchestration_packets import valid_packets
 
 
 HOOK = Path(__file__).with_name("orchestration_hook.py")
@@ -20,6 +21,10 @@ CONFIG = Path(__file__).with_name("hooks.json")
 PYTHON = "python3"
 HOOK_COMMAND = '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py"'
 SHA = "a" * 40
+
+
+def packet_message(packet_type: str) -> str:
+    return f"{packet_type}:\n{json.dumps(valid_packets()[packet_type])}"
 
 
 class OrchestrationHookTest(unittest.TestCase):
@@ -81,9 +86,15 @@ class OrchestrationHookTest(unittest.TestCase):
         )
 
     def hook(self, event: str, **fields: object) -> dict[str, object] | None:
+        session_id = str(fields.pop("session_id", "session-1"))
+        return self.hook_for(session_id, event, **fields)
+
+    def hook_for(
+        self, session_id: str, event: str, **fields: object
+    ) -> dict[str, object] | None:
         result = subprocess.run(
             [PYTHON, str(HOOK)],
-            input=json.dumps({"session_id": "session-1", "hook_event_name": event, **fields}),
+            input=json.dumps({"session_id": session_id, "hook_event_name": event, **fields}),
             env=self.env,
             text=True,
             capture_output=True,
@@ -138,21 +149,35 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertIn("assigned fixes", fixer["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.hook("SubagentStop", agent_id="fixer", last_assistant_message="fixed", stop_hook_active=False), {})
 
-    def test_lane_stop_requires_packet(self) -> None:
-        self.register("implementation")
-        blocked = self.hook("Stop", last_assistant_message="implemented", stop_hook_active=False)
-        self.assertEqual(blocked["decision"], "block")
-        allowed = self.hook("Stop", last_assistant_message="IMPLEMENTATION_PACKET:\n  pr_url: x", stop_hook_active=False)
-        self.assertEqual(allowed, {})
-        self.assertIsNone(self.hook("SessionStart", source="compact"))
+    def test_lane_stop_requires_complete_valid_packet(self) -> None:
+        for role, packet_type in (
+            ("research", "RESEARCH_PACKET"),
+            ("implementation", "IMPLEMENTATION_PACKET"),
+            ("review", "REVIEW_PACKET"),
+            ("jiminy", "JIMINY_COMPLETE"),
+        ):
+            with self.subTest(role=role):
+                session_id = f"session-{role}"
+                self.register(role, session_id=session_id)
+                blocked = self.hook_for(
+                    session_id, "Stop", last_assistant_message=f"{packet_type}:\n{{}}",
+                    stop_hook_active=False,
+                )
+                self.assertEqual(blocked["decision"], "block")
+                allowed = self.hook_for(
+                    session_id, "Stop", last_assistant_message=packet_message(packet_type),
+                    stop_hook_active=False,
+                )
+                self.assertEqual(allowed, {})
+                self.assertFalse(self.session_state(session_id)["active"])
 
     def test_lane_stop_rejects_duplicate_packet_headers(self) -> None:
         self.register("implementation")
         duplicate = self.hook(
             "Stop",
             last_assistant_message=(
-                "IMPLEMENTATION_PACKET:\n  pr_url: first\n"
-                "IMPLEMENTATION_PACKET:\n  pr_url: repeated"
+                f"{packet_message('IMPLEMENTATION_PACKET')}\n"
+                f"{packet_message('IMPLEMENTATION_PACKET')}"
             ),
             stop_hook_active=False,
         )
@@ -177,21 +202,8 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(malformed["decision"], "block")
         self.assertTrue(self.session_state()["active"])
         allowed = self.hook(
-            "Stop", last_assistant_message=(
-                "JIMINY_COMPLETE:\n"
-                "  coordinator_thread_id: coordinator\n"
-                "  repository: owner/repo\n"
-                "  default_branch: main\n"
-                f"  verified_default_head_sha: {SHA}\n"
-                "  pull_requests: []\n"
-                "  integration:\n"
-                "    expected_merges_present: true\n"
-                "    required_checks_green: true\n"
-                "    linked_issues_verified: true\n"
-                "    runtime_ready_for_completion: true\n"
-                "  blockers: []\n"
-                "  private_log_path: /tmp/jiminy.log"
-            ), stop_hook_active=False,
+            "Stop", last_assistant_message=packet_message("JIMINY_COMPLETE"),
+            stop_hook_active=False,
         )
         self.assertEqual(allowed, {})
         self.assertFalse(self.session_state()["active"])
@@ -442,7 +454,7 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         context = json.dumps(
             {
-                "packet": {"ready_for_jiminy": True, "reviewed_head_sha": SHA},
+                "packet": valid_packets()["REVIEW_PACKET"],
                 "live": {"pr_head_sha": SHA},
             }
         )
@@ -466,7 +478,7 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         context = json.dumps(
             {
-                "packet": {"ready_for_jiminy": True, "reviewed_head_sha": SHA},
+                "packet": valid_packets()["REVIEW_PACKET"],
                 "live": {"pr_head_sha": SHA},
             }
         )
@@ -490,11 +502,9 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", '{"node":"merge","jiminy_runner_session_id":"jiminy-1"}',
+            "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
         )
-        context = json.dumps(
-            {"packet": {"state": "MERGED", "merge_commit_sha": SHA}}
-        )
+        context = json.dumps({"packet": valid_packets()["JIMINY_PR_RESULT"]})
 
         blocked = self.state_command(
             "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
@@ -515,14 +525,12 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", '{"node":"merge","jiminy_runner_session_id":"jiminy-1"}',
+            "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
         )
         self.state_command(
             "continue", "--source-id", "jiminy-1", "--successor-id", "jiminy-2",
         )
-        context = json.dumps(
-            {"packet": {"state": "MERGED", "merge_commit_sha": SHA}}
-        )
+        context = json.dumps({"packet": valid_packets()["JIMINY_PR_RESULT"]})
 
         applied = self.state_command(
             "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
@@ -533,6 +541,32 @@ class OrchestrationHookTest(unittest.TestCase):
         result = json.loads(applied.stdout)
         self.assertEqual(result["state"]["node"], "merge")
         self.assertEqual(result["state"]["jiminy_runner_session_id"], "jiminy-2")
+
+    def test_graph_transition_rejects_merge_result_for_unreviewed_head(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
+        )
+        packet = valid_packets()["JIMINY_PR_RESULT"]
+        packet["reviewed_head_sha"] = "b" * 40
+        context = json.dumps({
+            "packet": packet,
+            "persisted": {"head_sha": "b" * 40},
+        })
+
+        blocked = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "merge", "--event", "JIMINY_PR_RESULT",
+            "--context-json", context, "--runner-session-id", "jiminy-1", check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("found 0", blocked.stderr)
+        self.assertEqual(self.session_state()["ledger"]["review-lane"]["head_sha"], SHA)
 
     def test_blocking_workflow_load_does_not_hold_registry_lock(self) -> None:
         self.register("gepetto")

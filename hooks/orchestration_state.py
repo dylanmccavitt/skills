@@ -366,6 +366,7 @@ def apply_graph_transition(
         )
     evaluation_context = dict(lane_state)
     evaluation_context.update(context)
+    evaluation_context["persisted"] = dict(lane_state)
     matches = eligible_transitions(workflow, current_node, event, evaluation_context)
     if len(matches) != 1:
         raise ValueError(f"expected one eligible transition, found {len(matches)}")

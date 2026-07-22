@@ -20,6 +20,7 @@ const expectedPackedFiles = [
   "hooks/orchestration_events.py",
   "hooks/orchestration_graph.py",
   "hooks/orchestration_hook.py",
+  "hooks/orchestration_packets.py",
   "hooks/orchestration_state.py",
   "hooks/orchestration_watchdog.py",
   "jiminy/SKILL.md",
