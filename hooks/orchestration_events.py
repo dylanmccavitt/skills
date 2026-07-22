@@ -42,7 +42,6 @@ AGENT_CONTRACTS = {
 }
 
 READ_ONLY_ROLES = {"gepetto", "jiminy", "research"}
-FORCE_PUSH = re.compile(r"\bgit\s+push\b[^\n]*(?:--force(?:-with-lease)?|-f\b)")
 PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b")
 API_MERGE = re.compile(r"\bgh\s+api\b")
 MERGE_ENDPOINT = re.compile(r"pulls/\d+/merge\b|\bmergePullRequest\b")
@@ -50,6 +49,43 @@ BOUND_HEAD = re.compile(r"--match-head-commit(?:=|\s+)[0-9a-fA-F]{40}\b")
 PYTHON_EXECUTABLE = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
 STATE_MODULES = {"orchestration_state", "hooks.orchestration_state"}
 SHELL_CONTROLS = {";", "&&", "||", "&", "|"}
+
+
+def _is_force_push(command: str) -> bool:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return bool(
+            re.search(
+                r"\bgit\s+push\b[^\n]*(?:--force(?:-with-lease)?|\s-[A-Za-z]*f[A-Za-z]*\b)",
+                command,
+            )
+        )
+
+    for index, token in enumerate(tokens[:-1]):
+        if os.path.basename(token) != "git" or tokens[index + 1] != "push":
+            continue
+        options_enabled = True
+        for argument in tokens[index + 2:]:
+            if argument in SHELL_CONTROLS:
+                break
+            if argument == "--":
+                options_enabled = False
+                continue
+            if not options_enabled:
+                continue
+            if argument == "--force" or argument.startswith("--force-with-lease"):
+                return True
+            if (
+                argument.startswith("-")
+                and not argument.startswith("--")
+                and "f" in argument[1:]
+            ):
+                return True
+    return False
 
 
 def _argv_option(arguments: list[str], option: str) -> str | None:
@@ -259,6 +295,8 @@ def stop(context: HookContext) -> JsonObject:
         valid = valid_jiminy_complete(context.payload.get("last_assistant_message"))
     if not valid:
         if context.payload.get("stop_hook_active"):
+            context.state["forced_stop_without_receipt"] = True
+            context.save()
             return {}
         return continue_turn(
             f"Verify the lane result and finish with exactly one {receipt[:-1]} receipt."
@@ -282,7 +320,7 @@ def pre_tool_use(context: HookContext) -> HookResult:
     if tool_name in {"apply_patch", "Edit", "Write"} and context.role in READ_ONLY_ROLES:
         return deny_tool(f"The registered {context.role} role is code-read-only.")
 
-    if tool_name == "Bash" and FORCE_PUSH.search(command):
+    if tool_name == "Bash" and _is_force_push(command):
         return deny_tool("Force-pushing is forbidden in Gepetto-managed work.")
 
     if tool_name == "Bash" and context.role != "gepetto":

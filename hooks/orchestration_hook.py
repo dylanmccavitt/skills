@@ -11,9 +11,15 @@ from orchestration_events import HANDLERS, HookContext
 from orchestration_state import load_state, recover_transactions, registry_lock
 
 
+BLOCKING_EVENTS = {"PreToolUse", "Stop", "SubagentStop"}
+
+
 def main() -> int:
+    payload: object = None
     try:
         payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            raise ValueError("hook payload must be a JSON object")
         with registry_lock():
             recover_transactions()
             session_id = str(payload.get("session_id", ""))
@@ -27,9 +33,10 @@ def main() -> int:
         if result is not None:
             print(json.dumps(result, separators=(",", ":")))
         return 0
-    except (json.JSONDecodeError, OSError, ValueError) as error:
+    except Exception as error:
         print(f"codex-orchestration-hook: {error}", file=sys.stderr)
-        return 1
+        event = str(payload.get("hook_event_name", "")) if isinstance(payload, dict) else ""
+        return 2 if not isinstance(payload, dict) or event in BLOCKING_EVENTS else 1
 
 
 if __name__ == "__main__":

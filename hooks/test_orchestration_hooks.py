@@ -42,6 +42,28 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertTrue(commands)
         self.assertTrue(all(command == HOOK_COMMAND for command in commands))
 
+    def test_blocking_hook_failure_exits_with_blocking_status(self) -> None:
+        self.register("implementation")
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        state_path.write_text("{invalid-json", encoding="utf-8")
+        result = subprocess.run(
+            [PYTHON, str(HOOK)],
+            input=json.dumps(
+                {
+                    "session_id": "session-1",
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git push origin branch"},
+                }
+            ),
+            env=self.env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("codex-orchestration-hook", result.stderr)
+
     def register(self, role: str, *extra: str, session_id: str = "session-1") -> None:
         if role != "gepetto" and "--coordinator-thread-id" not in extra:
             coordinator = f"{session_id}-coordinator"
@@ -141,7 +163,9 @@ class OrchestrationHookTest(unittest.TestCase):
             stop_hook_active=True,
         )
         self.assertEqual(recursive, {})
-        self.assertTrue(self.session_state()["active"])
+        state = self.session_state()
+        self.assertTrue(state["active"])
+        self.assertTrue(state["forced_stop_without_receipt"])
 
     def test_jiminy_stop_requires_exactly_one_terminal_packet(self) -> None:
         self.register("jiminy")
@@ -180,6 +204,26 @@ class OrchestrationHookTest(unittest.TestCase):
         self.register("implementation")
         result = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "git push --force-with-lease origin branch"})
         self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_force_push_in_combined_short_option_cluster_is_denied(self) -> None:
+        self.register("implementation")
+        for command in ("git push -uf origin branch", "git push -fv origin branch"):
+            with self.subTest(command=command):
+                result = self.hook(
+                    "PreToolUse", tool_name="Bash", tool_input={"command": command}
+                )
+                self.assertEqual(
+                    result["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+
+    def test_branch_name_containing_dash_f_is_not_treated_as_force_push(self) -> None:
+        self.register("implementation")
+        result = self.hook(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_input={"command": "git push origin my-feature"},
+        )
+        self.assertIsNone(result)
 
     def test_research_cannot_apply_patch(self) -> None:
         self.register("research")
@@ -389,6 +433,106 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         self.assertEqual(blocked.returncode, 1)
         self.assertIn("found 0", blocked.stderr)
+
+    def test_graph_transition_into_jiminy_node_requires_registered_runner(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", '{"node":"review","review_fix_cycles":0}',
+        )
+        context = json.dumps(
+            {
+                "packet": {"ready_for_jiminy": True, "reviewed_head_sha": SHA},
+                "live": {"pr_head_sha": SHA},
+            }
+        )
+        blocked = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "review", "--event", "REVIEW_PACKET",
+            "--context-json", context, check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("Jiminy runner", blocked.stderr)
+        self.assertEqual(self.session_state()["ledger"]["review-lane"]["node"], "review")
+
+    def test_graph_transition_accepts_jiminy_runner_bound_to_coordinator(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", '{"node":"review","review_fix_cycles":0}',
+        )
+        context = json.dumps(
+            {
+                "packet": {"ready_for_jiminy": True, "reviewed_head_sha": SHA},
+                "live": {"pr_head_sha": SHA},
+            }
+        )
+        applied = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "review", "--event", "REVIEW_PACKET",
+            "--context-json", context, "--runner-session-id", "jiminy-1",
+        )
+        result = json.loads(applied.stdout)
+        self.assertEqual(result["transition_id"], "review-approved")
+        self.assertEqual(result["state"]["node"], "merge")
+        self.assertEqual(result["state"]["jiminy_runner_session_id"], "jiminy-1")
+
+    def test_graph_transition_rejects_replacing_bound_jiminy_runner(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-2"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", '{"node":"merge","jiminy_runner_session_id":"jiminy-1"}',
+        )
+        context = json.dumps(
+            {"packet": {"state": "MERGED", "merge_commit_sha": SHA}}
+        )
+
+        blocked = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "merge", "--event", "JIMINY_PR_RESULT",
+            "--context-json", context, "--runner-session-id", "jiminy-2", check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("bound to Jiminy runner jiminy-1", blocked.stderr)
+        lane = self.session_state()["ledger"]["review-lane"]
+        self.assertEqual(lane["node"], "merge")
+        self.assertEqual(lane["jiminy_runner_session_id"], "jiminy-1")
+
+    def test_graph_transition_accepts_bound_jiminy_checkpoint_successor(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", '{"node":"merge","jiminy_runner_session_id":"jiminy-1"}',
+        )
+        self.state_command(
+            "continue", "--source-id", "jiminy-1", "--successor-id", "jiminy-2",
+        )
+        context = json.dumps(
+            {"packet": {"state": "MERGED", "merge_commit_sha": SHA}}
+        )
+
+        applied = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "merge", "--event", "JIMINY_PR_RESULT",
+            "--context-json", context, "--runner-session-id", "jiminy-2",
+        )
+
+        result = json.loads(applied.stdout)
+        self.assertEqual(result["state"]["node"], "merge")
+        self.assertEqual(result["state"]["jiminy_runner_session_id"], "jiminy-2")
 
     def test_blocking_workflow_load_does_not_hold_registry_lock(self) -> None:
         self.register("gepetto")
