@@ -322,6 +322,25 @@ def ledger_move(session_id: str, from_lane: str, to_lane: str) -> Path:
     return write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
 
 
+def _is_continuation_successor(source_id: str, successor_id: str) -> bool:
+    candidate = _safe_id(source_id)
+    successor_id = _safe_id(successor_id)
+    visited: set[str] = set()
+    while candidate not in visited:
+        visited.add(candidate)
+        source = load_state(candidate)
+        next_id = source.get("successor_id") if source else None
+        if not isinstance(next_id, str):
+            return False
+        next_state = load_state(next_id)
+        if not next_state or next_state.get("source_id") != candidate:
+            return False
+        if next_id == successor_id:
+            return True
+        candidate = next_id
+    return False
+
+
 def apply_graph_transition(
     session_id: str,
     lane: str,
@@ -362,6 +381,18 @@ def apply_graph_transition(
             "jiminy",
             coordinator_thread_id=session_id,
         )
+        bound_runner = lane_state.get("jiminy_runner_session_id")
+        if bound_runner is not None and (
+            not isinstance(bound_runner, str)
+            or (
+                runner_session_id != bound_runner
+                and not _is_continuation_successor(bound_runner, runner_session_id)
+            )
+        ):
+            raise ValueError(
+                f"lane is bound to Jiminy runner {bound_runner}; "
+                f"{runner_session_id} is not its checkpoint successor"
+            )
         lane_state["jiminy_runner_session_id"] = runner_session_id
     for key, value in transition.get("set", {}).items():
         lane_state[key] = value
