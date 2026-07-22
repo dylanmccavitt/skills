@@ -1127,7 +1127,7 @@ def bind_jiminy_ready(
         raise ValueError(f"JIMINY_READY does not identify its review lane: {lane}")
 
     verified_authorities: list[
-        tuple[str, dict[str, Any], dict[str, Any], str, str]
+        tuple[str, dict[str, Any], dict[str, Any], str, str, str, bool]
     ] = []
     for reviewer_task_id, (item, pr_url) in ready_by_reviewer.items():
         reviewer_registration = load_state(reviewer_task_id)
@@ -1155,19 +1155,24 @@ def bind_jiminy_ready(
             raise ValueError(f"no active review ledger lane: {reviewer_task_id}")
         if authority_state.get("node") != "merge":
             raise ValueError(f"merge authority review lane is not at merge: {reviewer_task_id}")
-        repository = authority_state.get("repository")
-        if not isinstance(repository, str):
-            raise ValueError(f"merge authority lane has no repository: {reviewer_task_id}")
         persisted_pr = authority_state.get("pr")
         if (
             not isinstance(persisted_pr, str)
             or normalize_github_url(persisted_pr, kind="pull") != pr_url
         ):
             raise ValueError(f"merge authority PR does not match review lane: {pr_url}")
-        if (
-            normalize_repository(repository) != packet_repository
-            or repository_from_github_url(pr_url, kind="pull") != packet_repository
-        ):
+        pr_repository = repository_from_github_url(pr_url, kind="pull")
+        persisted_repository = authority_state.get("repository")
+        backfill_repository = "repository" not in authority_state
+        if backfill_repository:
+            repository = pr_repository
+        elif isinstance(persisted_repository, str):
+            repository = normalize_repository(persisted_repository)
+        else:
+            raise ValueError(
+                f"merge authority lane has invalid repository: {reviewer_task_id}"
+            )
+        if repository != packet_repository or pr_repository != packet_repository:
             raise ValueError(f"merge authority repository does not match lane PR: {pr_url}")
         authority_runner = authority_state.get("jiminy_runner_session_id")
         if not isinstance(authority_runner, str) or (
@@ -1197,6 +1202,8 @@ def bind_jiminy_ready(
                 authority_lifecycle,
                 pr_url,
                 item["reviewed_head_sha"],
+                repository,
+                backfill_repository,
             )
         )
 
@@ -1214,6 +1221,11 @@ def bind_jiminy_ready(
     if _binding_is_current(lifecycle, "merge_result"):
         raise ValueError("cannot replace JIMINY_READY after accepting merge results")
 
+    for (
+        _, authority_state, _, _, _, repository, backfill_repository
+    ) in verified_authorities:
+        if backfill_repository:
+            authority_state["repository"] = repository
     lane_state["jiminy_runner_session_id"] = runner_session_id
     _bind_current_proof(lifecycle, "expected_merge_set", {
         "packet_digest": packet_digest,
@@ -1232,10 +1244,12 @@ def bind_jiminy_ready(
         authority_lifecycle,
         pr_url,
         reviewed_head_sha,
+        repository,
+        _,
     ) in verified_authorities:
         if packet["merge_authority"] == "merge":
             authorities[pr_url] = {
-                "repository": packet_repository,
+                "repository": repository,
                 "pr_url": pr_url,
                 "reviewed_head_sha": reviewed_head_sha,
                 "generations": _generation_tuple(authority_lifecycle),
@@ -1669,10 +1683,13 @@ def accept_graph_event(
             or normalize_github_url(persisted_pr, kind="pull") != packet_pr
         ):
             raise ValueError("review packet PR does not match the persisted lane PR")
+        packet_repository = repository_from_github_url(packet_pr, kind="pull")
         repository = lane_state.get("repository")
-        if isinstance(repository, str) and repository_from_github_url(
-            packet_pr, kind="pull"
-        ) != normalize_repository(repository):
+        if "repository" not in lane_state:
+            lane_state["repository"] = packet_repository
+        elif not isinstance(repository, str):
+            raise ValueError("review lane has invalid persisted repository")
+        elif packet_repository != normalize_repository(repository):
             raise ValueError("review packet PR is outside the persisted lane repository")
         lane_state["pr"] = packet_pr
         trusted_head = lifecycle["observations"].get("head")

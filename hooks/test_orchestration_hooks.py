@@ -1046,6 +1046,54 @@ class OrchestrationHookTest(unittest.TestCase):
             state["ownership_claim_history"][-1]["release_reason"], "verified_handoff"
         )
 
+    def test_review_acceptance_derives_missing_repository_from_validated_pr(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-1"
+        )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        packet = valid_packets()["REVIEW_PACKET"]
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-1",
+            "--json", json.dumps({
+                "node": "review", "pr": packet["pr_url"], "head_sha": SHA,
+            }),
+        )
+
+        accepted = json.loads(self.accept_command(
+            "REVIEW_PACKET", packet, lane="review-1", actor="review-1",
+            observed_head=SHA, runner="jiminy-1",
+        ).stdout)
+
+        self.assertEqual(accepted["state"]["repository"], "owner/repo")
+
+    def test_review_acceptance_rejects_conflicting_repository_atomically(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-1"
+        )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        packet = valid_packets()["REVIEW_PACKET"]
+        self.set_trusted_lane("review-1", {
+            "node": "review", "repository": "other/repo",
+            "pr": packet["pr_url"], "head_sha": SHA,
+        })
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+
+        rejected = self.accept_command(
+            "REVIEW_PACKET", packet, lane="review-1", actor="review-1",
+            observed_head=SHA, runner="jiminy-1", check=False,
+        )
+
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("outside the persisted lane repository", rejected.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
     def test_versioned_delivery_rejects_missing_ownership_claim(self) -> None:
         self.register("gepetto")
         self.state_command(
@@ -1595,10 +1643,23 @@ class OrchestrationHookTest(unittest.TestCase):
         self.set_trusted_lane("implementation-1", {
             "node": "review", "repository": "owner/repo", "pr": pr_url,
         })
-        self.set_trusted_lane("review-1", self.merge_lane_state(pr_url))
+        historical_lane = self.merge_lane_state(pr_url)
+        historical_lane.pop("repository")
+        self.set_trusted_lane("review-1", historical_lane)
         ready = valid_packets()["JIMINY_READY"]
         ready["coordinator_thread_id"] = "session-1"
+        monitoring = copy.deepcopy(ready)
+        monitoring["merge_authority"] = "monitoring-only"
         revision = int(self.session_state()["state_revision"])
+        self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(monitoring),
+            "--runner-session-id", "jiminy-1",
+        )
+        monitored = self.session_state()
+        self.assertEqual(monitored["ledger"]["review-1"]["repository"], "owner/repo")
+        self.assertNotIn(pr_url, monitored.get("merge_authorities", {}))
+        revision = int(monitored["state_revision"])
         self.state_command(
             "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
             "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
@@ -1606,6 +1667,7 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         authority = self.session_state()["merge_authorities"][pr_url]
         self.assertEqual(authority["lane"], "review-1")
+        self.assertEqual(authority["repository"], "owner/repo")
 
     def test_graph_ready_rejects_spoofed_or_stale_reviewer_mappings_atomically(self) -> None:
         self.register("gepetto")
@@ -1675,7 +1737,9 @@ class OrchestrationHookTest(unittest.TestCase):
 
         for update, message in (
             ({"pr": "https://github.com/owner/repo/pull/3"}, "PR does not match"),
+            ({"pr": "not-a-pull-url"}, "raw live GitHub pull URL"),
             ({"repository": "other/repo"}, "repository does not match"),
+            ({"repository": None}, "invalid repository"),
             ({"node": "review"}, "can bind only at merge"),
         ):
             changed = copy.deepcopy(valid_lane)
@@ -1685,6 +1749,15 @@ class OrchestrationHookTest(unittest.TestCase):
             packet["coordinator_thread_id"] = "session-1"
             rejected(packet, message)
             self.set_trusted_lane("review-1", valid_lane)
+
+        missing_repository = copy.deepcopy(valid_lane)
+        missing_repository.pop("repository")
+        self.set_trusted_lane("review-1", missing_repository)
+        wrong_repository = valid_packets()["JIMINY_READY"]
+        wrong_repository["coordinator_thread_id"] = "session-1"
+        wrong_repository["repository"] = "other/repo"
+        rejected(wrong_repository, "repository does not match")
+        self.set_trusted_lane("review-1", valid_lane)
 
         stale = copy.deepcopy(valid_lane)
         stale["proof_lifecycle"]["bindings"]["review"]["generations"]["head"] = 1
@@ -2270,6 +2343,7 @@ class OrchestrationHookTest(unittest.TestCase):
             {"resume_node": "merge"},
             {"expected_pr_urls": ["https://example.test/pr/1"]},
             {"merge_ready": True},
+            {"repository": "owner/repo"},
         ):
             with self.subTest(update=update):
                 result = self.state_command(
