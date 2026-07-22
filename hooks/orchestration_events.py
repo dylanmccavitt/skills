@@ -166,7 +166,7 @@ def _bash_writes_files(command: str, *, _depth: int = 0) -> bool:
         executable = os.path.basename(token)
         if executable in FILE_WRITE_COMMANDS:
             return True
-        if executable in {"bash", "dash", "ksh", "sh", "zsh"} and _depth < 4:
+        if executable in {"bash", "dash", "ksh", "sh", "zsh"}:
             shell_arguments = tokens[index + 1:]
             for argument_index, argument in enumerate(shell_arguments):
                 if argument in SHELL_CONTROLS:
@@ -176,11 +176,23 @@ def _bash_writes_files(command: str, *, _depth: int = 0) -> bool:
                     and not argument.startswith("--")
                     and "c" in argument[1:]
                 ):
-                    if argument_index + 1 < len(shell_arguments) and _bash_writes_files(
-                        shell_arguments[argument_index + 1], _depth=_depth + 1
-                    ):
-                        return True
+                    if argument_index + 1 < len(shell_arguments):
+                        if _depth >= 4 or _bash_writes_files(
+                            shell_arguments[argument_index + 1], _depth=_depth + 1
+                        ):
+                            return True
                     break
+        if executable == "eval":
+            arguments: list[str] = []
+            for argument in tokens[index + 1:]:
+                if argument in SHELL_CONTROLS:
+                    break
+                arguments.append(argument)
+            if arguments and (
+                _depth >= 4
+                or _bash_writes_files(" ".join(arguments), _depth=_depth + 1)
+            ):
+                return True
         if executable in {"sed", "perl"}:
             arguments = tokens[index + 1:]
             for argument in arguments:

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import time
@@ -465,6 +466,9 @@ class OrchestrationHookTest(unittest.TestCase):
                 self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny", (role, tool))
 
     def test_read_only_roles_deny_recognized_bash_file_mutations(self) -> None:
+        deeply_nested = "rm hooks/file.py"
+        for _ in range(6):
+            deeply_nested = f"sh -c {shlex.quote(deeply_nested)}"
         commands = (
             "cp source hooks/copy.py",
             "mv hooks/old.py hooks/new.py",
@@ -477,6 +481,8 @@ class OrchestrationHookTest(unittest.TestCase):
             "git -C /tmp/repository checkout -- hooks/file.py",
             "sh -c 'rm hooks/file.py'",
             "bash -lc 'mv hooks/old.py hooks/new.py'",
+            "eval 'rm hooks/file.py'",
+            deeply_nested,
             "perl -pi -e 's/old/new/' hooks/file.py",
             "sed -ni '' 's/old/new/' hooks/file.py",
             "find hooks -name '*.tmp' -delete",
@@ -966,12 +972,13 @@ class OrchestrationHookTest(unittest.TestCase):
         self.register("gepetto")
         self.register("review", "--coordinator-thread-id", "session-1", session_id="review-1")
         self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1")
+        packet = valid_packets()["REVIEW_PACKET"]
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-1",
             "--json", json.dumps({
                 "node": "review",
                 "issue": "https://github.com/owner/repo/issues/1",
-                "pr": "https://github.com/owner/repo/pull/1",
+                "pr": packet["pr_url"],
                 "base_sha": "b" * 40,
                 "head_sha": SHA,
                 "research_content_ref": "sha256:" + "c" * 64,
@@ -980,7 +987,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.acquire_claim("review-1", self.claim_payload("review-1"))
 
         accepted = json.loads(self.accept_command(
-            "REVIEW_PACKET", valid_packets()["REVIEW_PACKET"], lane="review-1",
+            "REVIEW_PACKET", packet, lane="review-1",
             actor="review-1", observed_head=SHA, runner="jiminy-1",
         ).stdout)
 
