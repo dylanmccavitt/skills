@@ -17,6 +17,8 @@ Maintain each live lane's current node, prior node as `resume_node` when blocked
 - `REVIEW_FIX_LIMIT_EXCEEDED` enters `needs_decision` using the workflow policy limit.
 - `DELIVERY_CANCELLED` is terminal and does not imply destructive cleanup.
 
+`JIMINY_PR_RESULT.reviewed_head_sha` must equal the lane's persisted reviewed `head_sha`; caller-supplied context cannot replace that ledger value.
+
 Resolve `project_id` from the live Codex project list. Resolve completion scope from the user's request plus the current issue graph; stop for direction only when those conflict materially.
 
 ## Hook registration

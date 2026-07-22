@@ -188,6 +188,26 @@ class OrchestrationGraphTest(unittest.TestCase):
         }
         self.assertEqual(eligible_transitions(self.workflow, "merge", "MERGES_VERIFIED", mismatch), [])
 
+    def test_jiminy_merge_result_must_match_persisted_reviewed_head(self) -> None:
+        packet = valid_packets()["JIMINY_PR_RESULT"]
+        accepted = eligible_transitions(
+            self.workflow,
+            "merge",
+            "JIMINY_PR_RESULT",
+            {"packet": packet, "persisted": {"head_sha": SHA}},
+        )
+        self.assertEqual([item["id"] for item in accepted], ["merge-result-recorded"])
+        packet["reviewed_head_sha"] = "b" * 40
+        self.assertEqual(
+            eligible_transitions(
+                self.workflow,
+                "merge",
+                "JIMINY_PR_RESULT",
+                {"packet": packet, "persisted": {"head_sha": SHA}},
+            ),
+            [],
+        )
+
     def test_fixer_head_change_invalidates_pass_and_review_cycles_are_bounded(self) -> None:
         changed = eligible_transitions(self.workflow, "fixer", "PR_HEAD_CHANGED", {})
         self.assertEqual(changed[0]["to"], "review")

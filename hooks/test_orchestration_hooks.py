@@ -502,7 +502,7 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", '{"node":"merge","jiminy_runner_session_id":"jiminy-1"}',
+            "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
         )
         context = json.dumps({"packet": valid_packets()["JIMINY_PR_RESULT"]})
 
@@ -525,7 +525,7 @@ class OrchestrationHookTest(unittest.TestCase):
         )
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", '{"node":"merge","jiminy_runner_session_id":"jiminy-1"}',
+            "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
         )
         self.state_command(
             "continue", "--source-id", "jiminy-1", "--successor-id", "jiminy-2",
@@ -541,6 +541,32 @@ class OrchestrationHookTest(unittest.TestCase):
         result = json.loads(applied.stdout)
         self.assertEqual(result["state"]["node"], "merge")
         self.assertEqual(result["state"]["jiminy_runner_session_id"], "jiminy-2")
+
+    def test_graph_transition_rejects_merge_result_for_unreviewed_head(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", f'{{"node":"merge","head_sha":"{SHA}","jiminy_runner_session_id":"jiminy-1"}}',
+        )
+        packet = valid_packets()["JIMINY_PR_RESULT"]
+        packet["reviewed_head_sha"] = "b" * 40
+        context = json.dumps({
+            "packet": packet,
+            "persisted": {"head_sha": "b" * 40},
+        })
+
+        blocked = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "merge", "--event", "JIMINY_PR_RESULT",
+            "--context-json", context, "--runner-session-id", "jiminy-1", check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("found 0", blocked.stderr)
+        self.assertEqual(self.session_state()["ledger"]["review-lane"]["head_sha"], SHA)
 
     def test_blocking_workflow_load_does_not_hold_registry_lock(self) -> None:
         self.register("gepetto")

@@ -116,6 +116,7 @@
       "to": "merge",
       "all": [
         {"path": "packet.state", "equals": "MERGED"},
+        {"path": "packet.reviewed_head_sha", "equals_path": "persisted.head_sha"},
         {"path": "packet.merge_commit_sha", "non_empty": true}
       ]
     },
