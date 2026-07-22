@@ -8,7 +8,7 @@ Every packet is exactly one `PACKET_TYPE:` header followed by one JSON object. `
 
 [`workflow.json`](workflow.json) is the canonical machine-readable topology for this protocol. Validate it with `python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_graph.py"` before dispatch. The skills remain the behavioral contracts for active tasks; the graph only records nodes, events, guards, invalidation routes, and terminal states.
 
-Maintain each live lane's current node, prior node as `resume_node` when blocked, review/fix cycle count, and last accepted packet/head in the persisted ledger (see Ledger). Apply these graph events explicitly:
+Maintain each live lane's current node, review/fix cycle count, and last accepted packet/head in the persisted ledger (see Ledger). The state runtime owns proof generations, proof bindings, invalidation history, and `resume_node`; callers must not write those fields directly. Apply these graph events explicitly:
 
 - `MATERIAL_CONTRACT_CHANGED` returns the affected work to research.
 - `MATERIAL_BASE_CHANGED` returns it to Pinocchio implementation.
@@ -17,7 +17,13 @@ Maintain each live lane's current node, prior node as `resume_node` when blocked
 - `REVIEW_FIX_LIMIT_EXCEEDED` enters `needs_decision` using the workflow policy limit.
 - `DELIVERY_CANCELLED` is terminal and does not imply destructive cleanup.
 
-`JIMINY_PR_RESULT.reviewed_head_sha` must equal the lane's persisted reviewed `head_sha`; caller-supplied context cannot replace that ledger value.
+`JIMINY_PR_RESULT.reviewed_head_sha` must equal the lane's trusted current head observation; caller-supplied context cannot replace that value.
+
+Contract, base, and head invalidations require the current coordinator revision plus a typed new observation and non-empty reason. Contract observations are `sha256:` content refs; base and head observations are full lowercase SHAs. The state runtime advances the matching generation once, preserves history, clears affected current proof, and treats an exact event/observation/reason replay as a no-op:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph apply --session-id <gepetto-task-id> --lane <lane-task-id> --current-node <node> --event <MATERIAL_CONTRACT_CHANGED|MATERIAL_BASE_CHANGED|PR_HEAD_CHANGED> --expected-revision <current-coordinator-revision> --context-json '{"observation":"<content-ref-or-sha>","reason":"<reason>"}' [--runner-session-id <jiminy-task-id>]
+```
 
 Resolve `project_id` from the live Codex project list. Resolve completion scope from the user's request plus the current issue graph; stop for direction only when those conflict materially.
 
@@ -63,8 +69,10 @@ Jiminy does not run `complete` before its final response. Its valid exactly-once
 Persist lane state mechanically after registering each lane and after each accepted packet or node change; the JSON deep-merges into the coordinator session file:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger set --session-id <gepetto-task-id> --lane <lane-task-id> --json '{"role": "<role>", "issue": "<url>", "pr": "<url>", "head_sha": "<sha>", "node": "<node>", "resume_node": "<node-or-null>", "review_fix_cycles": <n>}'
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger set --session-id <gepetto-task-id> --lane <lane-task-id> --json '{"role": "<role>", "issue": "<url>", "pr": "<url>", "base_sha": "<sha>", "head_sha": "<sha>", "node": "<node>", "review_fix_cycles": <n>}'
 ```
+
+`proof_lifecycle`, acceptance receipts, `resume_node`, reviewed-head bindings, expected merge sets, and merge readiness are coordinator-owned state. Packet acceptance and administrative transitions update them atomically; `ledger set` rejects direct writes.
 
 Read it back on resume or checkpoint:
 

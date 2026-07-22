@@ -19,6 +19,19 @@ from typing import Any
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 ROLES = {"gepetto", "jiminy", "research", "implementation", "review"}
+PROOF_DOMAINS = ("contract", "base", "head")
+INVALIDATION_EVENTS = {
+    "MATERIAL_CONTRACT_CHANGED": "contract",
+    "MATERIAL_BASE_CHANGED": "base",
+    "PR_HEAD_CHANGED": "head",
+}
+BLOCKING_EVENTS = {"FLOW_BLOCKED", "AUTHORITY_REQUIRED"}
+PROTECTED_CONTEXT_KEYS = {
+    "acceptance_receipts", "expected_pr_urls", "merge_ready",
+    "proof_lifecycle", "resume_node", "reviewed_head_sha",
+}
+FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+CONTENT_REF_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def state_root() -> Path:
@@ -292,6 +305,164 @@ def _dict_container(state: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _proof_lifecycle(lane_state: dict[str, Any]) -> dict[str, Any]:
+    """Return the coordinator-owned proof lifecycle, initializing legacy lanes safely."""
+    lifecycle = lane_state.get("proof_lifecycle")
+    if lifecycle is None:
+        lifecycle = {
+            "generations": {domain: 0 for domain in PROOF_DOMAINS},
+            "observations": {
+                "contract": lane_state.get("contract_ref"),
+                "base": lane_state.get("base_sha"),
+                "head": lane_state.get("head_sha"),
+            },
+            "bindings": {},
+            "invalidation_history": [],
+        }
+        lane_state["proof_lifecycle"] = lifecycle
+    if not isinstance(lifecycle, dict):
+        raise ValueError("invalid proof lifecycle in orchestration state")
+    generations = lifecycle.get("generations")
+    observations = lifecycle.get("observations")
+    bindings = lifecycle.get("bindings")
+    history = lifecycle.get("invalidation_history")
+    if (
+        not isinstance(generations, dict)
+        or set(generations) != set(PROOF_DOMAINS)
+        or any(
+            type(generations[domain]) is not int or generations[domain] < 0
+            for domain in PROOF_DOMAINS
+        )
+        or not isinstance(observations, dict)
+        or set(observations) != set(PROOF_DOMAINS)
+        or not isinstance(bindings, dict)
+        or not isinstance(history, list)
+    ):
+        raise ValueError("invalid proof lifecycle in orchestration state")
+    return lifecycle
+
+
+def _generation_tuple(lifecycle: dict[str, Any]) -> dict[str, int]:
+    return {domain: lifecycle["generations"][domain] for domain in PROOF_DOMAINS}
+
+
+def _binding_is_current(lifecycle: dict[str, Any], name: str) -> bool:
+    binding = lifecycle["bindings"].get(name)
+    return (
+        isinstance(binding, dict)
+        and binding.get("generations") == _generation_tuple(lifecycle)
+    )
+
+
+def _bind_current_proof(
+    lifecycle: dict[str, Any], name: str, evidence: dict[str, Any]
+) -> None:
+    lifecycle["bindings"][name] = {
+        "generations": _generation_tuple(lifecycle),
+        "evidence": evidence,
+    }
+
+
+def _validate_invalidation_observation(domain: str, observation: Any) -> str:
+    if not isinstance(observation, str):
+        raise ValueError(f"{domain} invalidation observation must be a string")
+    pattern = CONTENT_REF_PATTERN if domain == "contract" else FULL_SHA_PATTERN
+    if not pattern.fullmatch(observation):
+        expected = (
+            "sha256 content reference" if domain == "contract" else "full lowercase SHA"
+        )
+        raise ValueError(f"{domain} invalidation observation must be a {expected}")
+    return observation
+
+
+def _apply_invalidation(
+    lane_state: dict[str, Any], event: str, context: dict[str, Any]
+) -> bool:
+    """Advance one proof generation. Return False for an exact idempotent replay."""
+    if set(context) != {"observation", "reason"}:
+        raise ValueError(
+            f"{event} context must contain exactly observation and reason"
+        )
+    reason = context.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("invalidation reason must be a non-empty string")
+    domain = INVALIDATION_EVENTS[event]
+    observation = _validate_invalidation_observation(domain, context.get("observation"))
+    lifecycle = _proof_lifecycle(lane_state)
+    history = lifecycle["invalidation_history"]
+    fingerprint = {"event": event, "observation": observation, "reason": reason}
+    old_observation = lifecycle["observations"].get(domain)
+    if old_observation == observation:
+        if any(
+            isinstance(entry, dict)
+            and all(entry.get(key) == value for key, value in fingerprint.items())
+            for entry in history
+        ):
+            return False
+        raise ValueError(f"{event} requires a genuinely new {domain} observation")
+    lifecycle["generations"][domain] += 1
+    lifecycle["observations"][domain] = observation
+    history.append({
+        **fingerprint,
+        "domain": domain,
+        "old_observation": old_observation,
+        "new_observation": observation,
+        "generations": _generation_tuple(lifecycle),
+        "timestamp": int(time.time()),
+    })
+
+    clear = {
+        "contract": {
+            "research", "implementation", "implementation_acceptance", "review", "ci",
+            "expected_merge_set", "merge_result", "merge_ready", "integration",
+        },
+        "base": {
+            "implementation", "implementation_acceptance", "review", "ci",
+            "expected_merge_set", "merge_result", "merge_ready", "integration",
+        },
+        "head": {
+            "implementation", "implementation_acceptance", "review", "ci",
+            "expected_merge_set", "merge_result", "merge_ready", "integration",
+        },
+    }[domain]
+    for name in clear:
+        lifecycle["bindings"].pop(name, None)
+    return True
+
+
+def _reject_stale_packet_replay(
+    lane_state: dict[str, Any], event: str, packet_digest: str
+) -> None:
+    current = _generation_tuple(_proof_lifecycle(lane_state))
+    receipts = lane_state.get("acceptance_receipts", [])
+    if not isinstance(receipts, list):
+        raise ValueError("invalid acceptance receipt container")
+    if any(
+        isinstance(receipt, dict)
+        and receipt.get("event") == event
+        and receipt.get("packet_digest") == packet_digest
+        and receipt.get("generations") != current
+        for receipt in receipts
+    ):
+        raise ValueError(f"stale {event} proof cannot be rebound to current generations")
+
+
+def _require_current_proof(lifecycle: dict[str, Any], event: str) -> None:
+    # Pre-F4 lanes may already be in flight without lifecycle bindings. Preserve
+    # that compatibility until the lane records proof or its first invalidation.
+    if not lifecycle["bindings"] and not lifecycle["invalidation_history"]:
+        return
+    required = {
+        "JIMINY_PR_RESULT": ("review", "ci", "merge_ready"),
+        "JIMINY_COMPLETE": ("merge_ready",),
+    }.get(event, ())
+    missing = [name for name in required if not _binding_is_current(lifecycle, name)]
+    if missing:
+        raise ValueError(
+            f"{event} requires current-generation proof: {', '.join(missing)}"
+        )
+
+
 def ledger_set(session_id: str, lane: str, updates: dict[str, Any]) -> Path:
     state = load_state(session_id)
     if state is None:
@@ -300,6 +471,9 @@ def ledger_set(session_id: str, lane: str, updates: dict[str, Any]) -> Path:
     lane_state = ledger.setdefault(_safe_id(lane), {})
     if not isinstance(lane_state, dict):
         raise ValueError(f"invalid ledger lane container: {lane}")
+    protected = sorted(set(updates) & PROTECTED_CONTEXT_KEYS)
+    if protected:
+        raise ValueError(f"trusted lane state cannot be set directly: {protected}")
     _deep_merge(lane_state, updates)
     return write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
 
@@ -352,6 +526,7 @@ def apply_graph_transition(
     context: dict[str, Any],
     workflow: dict[str, Any],
     runner_session_id: str | None = None,
+    expected_revision: int | None = None,
 ) -> dict[str, Any]:
     from orchestration_graph import eligible_transitions, resolve_target
     from orchestration_packets import PACKET_TYPES
@@ -364,6 +539,12 @@ def apply_graph_transition(
     state = load_state(session_id)
     if state is None:
         raise ValueError(f"no registered session: {session_id}")
+    observed_revision = int(state.get("state_revision", 0))
+    if expected_revision is not None and observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
     ledger = _dict_container(state, "ledger")
     lane = _safe_id(lane)
     lane_state = ledger.get(lane)
@@ -373,9 +554,49 @@ def apply_graph_transition(
         raise ValueError(
             f"ledger node mismatch for {lane}: expected {current_node}, observed {lane_state.get('node')}"
         )
+    if event in INVALIDATION_EVENTS and expected_revision is None:
+        raise ValueError(f"{event} requires --expected-revision")
+    if event not in INVALIDATION_EVENTS and set(context) & PROTECTED_CONTEXT_KEYS:
+        protected = sorted(set(context) & PROTECTED_CONTEXT_KEYS)
+        raise ValueError(f"caller context cannot overwrite trusted state: {protected}")
+
+    invalidation_changed = None
+    if event in INVALIDATION_EVENTS:
+        invalidation_changed = _apply_invalidation(lane_state, event, context)
+        if not invalidation_changed:
+            return {
+                "transition_id": next(
+                    item["id"] for item in workflow["transitions"]
+                    if item["event"] == event
+                ),
+                "lane": lane,
+                "state": lane_state,
+                "idempotent": True,
+            }
+
+    lifecycle = _proof_lifecycle(lane_state)
+    if event == "MERGES_VERIFIED":
+        if (
+            (lifecycle["bindings"] or lifecycle["invalidation_history"])
+            and not _binding_is_current(lifecycle, "merge_result")
+        ):
+            raise ValueError("MERGES_VERIFIED requires current-generation merge results")
+        ready = context.get("ready")
+        packet = context.get("packet")
+        expected = ready.get("expected_pr_urls") if isinstance(ready, dict) else None
+        results = packet.get("merge_results") if isinstance(packet, dict) else None
+        if (
+            not isinstance(expected, list) or not expected
+            or not all(isinstance(url, str) and url for url in expected)
+            or not isinstance(results, dict)
+        ):
+            raise ValueError("MERGES_VERIFIED requires a typed expected merge set and results")
+        _bind_current_proof(lifecycle, "expected_merge_set", {"pr_urls": list(expected)})
+
     evaluation_context = dict(lane_state)
     evaluation_context.update(context)
     evaluation_context["persisted"] = dict(lane_state)
+    evaluation_context["persisted"]["head_sha"] = lifecycle["observations"].get("head")
     matches = eligible_transitions(workflow, current_node, event, evaluation_context)
     if len(matches) != 1:
         raise ValueError(f"expected one eligible transition, found {len(matches)}")
@@ -416,8 +637,17 @@ def apply_graph_transition(
         if type(current) is not int:
             raise ValueError(f"transition counter is not an integer: {path}")
         lane_state[path] = current + amount
+    if event in BLOCKING_EVENTS:
+        lane_state["resume_node"] = current_node
+    elif event == "RESUME_AUTHORIZED":
+        lane_state.pop("resume_node", None)
+    if event == "MERGES_VERIFIED":
+        _bind_current_proof(lifecycle, "merge_ready", {
+            "expected_pr_urls": list(context["ready"]["expected_pr_urls"]),
+            "merge_results": dict(context["packet"]["merge_results"]),
+        })
     lane_state["node"] = target_node
-    write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
+    write_state(session_id, state, expected_revision=observed_revision)
     return {"transition_id": transition["id"], "lane": lane, "state": lane_state}
 
 
@@ -468,6 +698,10 @@ def accept_graph_event(
     current_node = lane_state.get("node")
     if not isinstance(current_node, str) or current_node not in workflow["nodes"]:
         raise ValueError(f"ledger lane has no valid workflow node: {lane}")
+    lifecycle = _proof_lifecycle(lane_state)
+    packet_digest = canonical_packet_digest(packet)
+    _reject_stale_packet_replay(lane_state, event, packet_digest)
+    _require_current_proof(lifecycle, event)
 
     candidates = [
         transition
@@ -558,6 +792,7 @@ def accept_graph_event(
     evaluation_context = dict(lane_state)
     evaluation_context["packet"] = packet
     evaluation_context["persisted"] = dict(lane_state)
+    evaluation_context["persisted"]["head_sha"] = lifecycle["observations"].get("head")
     evaluation_context["live"] = (
         {"pr_head_sha": observed_pr_head_sha} if observed_pr_head_sha is not None else {}
     )
@@ -566,6 +801,22 @@ def accept_graph_event(
         raise ValueError(f"expected one eligible transition, found {len(matches)}")
     transition = matches[0]
     target_node = resolve_target(transition, evaluation_context, workflow["nodes"])
+
+    if event == "RESEARCH_PACKET":
+        contract_observation = packet["artifact"]["content_ref"]
+        current_contract = lifecycle["observations"].get("contract")
+        if current_contract not in {None, contract_observation}:
+            raise ValueError(
+                "changed research contract requires MATERIAL_CONTRACT_CHANGED"
+            )
+        lifecycle["observations"]["contract"] = contract_observation
+    elif event == "IMPLEMENTATION_PACKET":
+        lifecycle["observations"]["head"] = packet["pr_head_sha"]
+    elif event == "REVIEW_PACKET":
+        trusted_head = lifecycle["observations"].get("head")
+        if trusted_head not in {None, packet["reviewed_head_sha"]}:
+            raise ValueError("changed PR head requires PR_HEAD_CHANGED")
+        lifecycle["observations"]["head"] = packet["reviewed_head_sha"]
 
     source_owner = workflow["nodes"][current_node].get("owner")
     target_owner = workflow["nodes"][target_node].get("owner")
@@ -611,16 +862,54 @@ def accept_graph_event(
         lane_state[path] = current + amount
     lane_state["node"] = target_node
 
+    if event == "RESEARCH_PACKET":
+        _bind_current_proof(lifecycle, "research", {
+            "packet_digest": packet_digest,
+            "content_ref": packet["artifact"]["content_ref"],
+        })
+    elif event == "IMPLEMENTATION_PACKET":
+        implementation_evidence = {
+            "packet_digest": packet_digest,
+            "pr_head_sha": packet["pr_head_sha"],
+        }
+        _bind_current_proof(lifecycle, "implementation", implementation_evidence)
+        _bind_current_proof(lifecycle, "implementation_acceptance", implementation_evidence)
+    elif event == "REVIEW_PACKET":
+        _bind_current_proof(lifecycle, "review", {
+            "packet_digest": packet_digest,
+            "reviewed_head_sha": packet["reviewed_head_sha"],
+        })
+        _bind_current_proof(lifecycle, "ci", {
+            "checks": packet["ci_checks"],
+            "reviewed_head_sha": packet["reviewed_head_sha"],
+        })
+        _bind_current_proof(lifecycle, "merge_ready", {
+            "ready_for_jiminy": packet["ready_for_jiminy"],
+            "reviewed_head_sha": packet["reviewed_head_sha"],
+        })
+    elif event == "JIMINY_PR_RESULT":
+        _bind_current_proof(lifecycle, "merge_result", {
+            "packet_digest": packet_digest,
+            "reviewed_head_sha": packet["reviewed_head_sha"],
+            "merge_commit_sha": packet["merge_commit_sha"],
+        })
+    elif event == "JIMINY_COMPLETE":
+        _bind_current_proof(lifecycle, "integration", {
+            "packet_digest": packet_digest,
+            "verified_default_head_sha": packet["verified_default_head_sha"],
+        })
+
     receipts = lane_state.get("acceptance_receipts", [])
     if not isinstance(receipts, list):
         raise ValueError(f"invalid acceptance receipt container for lane: {lane}")
     receipt = {
-        "packet_digest": canonical_packet_digest(packet),
+        "packet_digest": packet_digest,
         "actor_session_id": actor_session_id,
         "timestamp": int(time.time()),
         "event": event,
         "transition_id": transition["id"],
         "resulting_node": target_node,
+        "generations": _generation_tuple(lifecycle),
     }
     if head_bound:
         receipt["observed_pr_head_sha"] = observed_pr_head_sha
@@ -837,6 +1126,7 @@ def _parser() -> argparse.ArgumentParser:
     graph_apply_parser.add_argument("--lane", required=True)
     graph_apply_parser.add_argument("--current-node", required=True)
     graph_apply_parser.add_argument("--event", required=True)
+    graph_apply_parser.add_argument("--expected-revision", type=int)
     graph_apply_parser.add_argument("--context-json", default="{}")
     graph_apply_parser.add_argument("--runner-session-id")
     graph_apply_parser.add_argument(
@@ -1002,6 +1292,7 @@ def main() -> int:
                     result = apply_graph_transition(
                         args.session_id, args.lane, args.current_node, args.event,
                         context, workflow, runner_session_id=args.runner_session_id,
+                        expected_revision=args.expected_revision,
                     )
                 else:
                     result = accept_graph_event(
