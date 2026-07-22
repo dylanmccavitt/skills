@@ -228,8 +228,7 @@ def validate_workflow(workflow: dict[str, Any]) -> None:
             if not isinstance(increment, dict) or set(increment) != {"path", "by"}:
                 raise ValueError(f"transition {transition_id} increment must contain path and by")
             _path(increment["path"], f"transition {transition_id} increment path")
-            if not isinstance(increment["by"], (int, float)) or isinstance(increment["by"], bool):
-                raise ValueError(f"transition {transition_id} increment by must be numeric")
+            _positive_integer(increment["by"], f"transition {transition_id} increment by")
         if "set" in transition and (not isinstance(transition["set"], dict) or not transition["set"]):
             raise ValueError(f"transition {transition_id} set must be a non-empty object")
 

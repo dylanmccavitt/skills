@@ -69,7 +69,7 @@ def valid_packets() -> dict[str, dict[str, object]]:
             "pr_state": {
                 "draft": False,
                 "mergeable": True,
-                "approvals_satisfied": "unknown",
+                "approvals_satisfied": True,
                 "unresolved_required_threads": 0,
             },
             "blockers": [],
@@ -207,6 +207,51 @@ class OrchestrationPacketTest(unittest.TestCase):
         for payload in (split, temporary):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 validate_packet("RESEARCH_PACKET", payload)
+
+    def test_temporary_artifacts_cannot_claim_persisted_status(self) -> None:
+        research = valid_packets()["RESEARCH_PACKET"]
+        research["artifact"] = {
+            "kind": "tmp_markdown",
+            "status": "persisted",
+            "marker": None,
+            "content_ref": CONTENT_REF,
+            "locations": [{"path": "/tmp/research.md"}],
+        }
+        implementation = valid_packets()["IMPLEMENTATION_PACKET"]
+        implementation["artifact"] = {
+            "kind": "tmp_markdown",
+            "status": "persisted",
+            "marker": None,
+            "content_ref": CONTENT_REF,
+            "path": "/tmp/implementation.md",
+        }
+        for packet_type, payload in (
+            ("RESEARCH_PACKET", research),
+            ("IMPLEMENTATION_PACKET", implementation),
+        ):
+            with self.subTest(packet_type=packet_type), self.assertRaisesRegex(
+                ValueError, "cannot satisfy persistence|must equal 'blocked'"
+            ):
+                validate_packet(packet_type, payload)
+
+    def test_ready_review_requires_consistent_green_evidence(self) -> None:
+        cases = []
+        for mutate in (
+            lambda packet: packet["blockers"].append("CI failed"),
+            lambda packet: packet["findings"][0].update(disposition="blocked"),
+            lambda packet: packet["local_checks"][0].update(result="fail"),
+            lambda packet: packet["ci_checks"][0].update(conclusion="pending"),
+            lambda packet: packet["pr_state"].update(draft=True),
+            lambda packet: packet["pr_state"].update(mergeable="unknown"),
+            lambda packet: packet["pr_state"].update(approvals_satisfied="unknown"),
+            lambda packet: packet["pr_state"].update(unresolved_required_threads=1),
+        ):
+            packet = valid_packets()["REVIEW_PACKET"]
+            mutate(packet)
+            cases.append(packet)
+        for packet in cases:
+            with self.subTest(packet=packet), self.assertRaises(ValueError):
+                validate_packet("REVIEW_PACKET", packet)
 
 
 if __name__ == "__main__":

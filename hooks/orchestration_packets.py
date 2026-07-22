@@ -150,11 +150,15 @@ def _research_artifact(value: Any, path: str) -> None:
         },
     )
     if artifact["kind"] == "github_issue":
+        if artifact["status"] != "persisted":
+            _fail(f"{path}.status", "must equal 'persisted' for a GitHub artifact")
         if artifact["marker"] != "gepetto-research":
             _fail(f"{path}.marker", "must equal 'gepetto-research' for a GitHub artifact")
         if any("issue_url" not in location for location in artifact["locations"]):
             _fail(f"{path}.locations", "must contain only GitHub issue locations")
     else:
+        if artifact["status"] == "persisted":
+            _fail(f"{path}.status", "temporary artifacts cannot satisfy persistence")
         if artifact["marker"] is not None:
             _fail(f"{path}.marker", "must be null for a temporary artifact")
         if any(set(location) != {"path"} for location in artifact["locations"]):
@@ -174,6 +178,8 @@ def _implementation_artifact(value: Any, path: str) -> None:
         {"issue_url": _url, "observed_updated_at": _string, "path": _absolute_path},
     )
     if artifact["kind"] == "github_issue":
+        if artifact["status"] != "persisted":
+            _fail(f"{path}.status", "must equal 'persisted' for a GitHub artifact")
         if artifact["marker"] != "gepetto-implementation":
             _fail(f"{path}.marker", "must equal 'gepetto-implementation' for a GitHub artifact")
         if set(artifact) != {
@@ -181,6 +187,8 @@ def _implementation_artifact(value: Any, path: str) -> None:
         }:
             _fail(path, "GitHub artifacts require issue_url and observed_updated_at only")
     else:
+        if artifact["status"] != "blocked":
+            _fail(f"{path}.status", "must equal 'blocked' for a temporary artifact")
         if artifact["marker"] is not None:
             _fail(f"{path}.marker", "must be null for a temporary artifact")
         if set(artifact) != {"kind", "status", "marker", "content_ref", "path"}:
@@ -259,7 +267,7 @@ def _pr_state(value: Any, path: str) -> None:
 
 
 def _review_packet(value: Any, path: str) -> None:
-    _object(value, path, {
+    packet = _object(value, path, {
         "packet_version": _literal(PACKET_VERSION),
         "issue_url": _url,
         "pr_url": _url,
@@ -271,6 +279,24 @@ def _review_packet(value: Any, path: str) -> None:
         "blockers": _list_of(_string),
         "ready_for_jiminy": _boolean,
     })
+    if not packet["ready_for_jiminy"]:
+        return
+    if packet["blockers"]:
+        _fail(f"{path}.blockers", "must be empty when ready_for_jiminy is true")
+    if any(finding["disposition"] == "blocked" for finding in packet["findings"]):
+        _fail(f"{path}.findings", "cannot contain blocked findings when ready_for_jiminy is true")
+    if any(check["result"] != "pass" for check in packet["local_checks"]):
+        _fail(f"{path}.local_checks", "must all pass when ready_for_jiminy is true")
+    if any(check["conclusion"] != "success" for check in packet["ci_checks"]):
+        _fail(f"{path}.ci_checks", "must all succeed when ready_for_jiminy is true")
+    pr_state = packet["pr_state"]
+    if pr_state != {
+        "draft": False,
+        "mergeable": True,
+        "approvals_satisfied": True,
+        "unresolved_required_threads": 0,
+    }:
+        _fail(f"{path}.pr_state", "must contain only satisfied gates when ready_for_jiminy is true")
 
 
 def _artifact_locator(value: Any, path: str) -> None:

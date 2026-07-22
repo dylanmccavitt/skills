@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from orchestration_graph import eligible_transitions, load_workflow, resolve_target, validate_workflow
-from test_orchestration_packets import SHA, valid_packets
+from test_orchestration_packets import CONTENT_REF, SHA, valid_packets
 
 
 class OrchestrationGraphTest(unittest.TestCase):
@@ -49,6 +49,39 @@ class OrchestrationGraphTest(unittest.TestCase):
         context["live"]["pr_head_sha"] = "b" * 40
         self.assertEqual(
             eligible_transitions(self.workflow, "implementation", "IMPLEMENTATION_PACKET", context),
+            [],
+        )
+
+    def test_temporary_artifact_cannot_satisfy_persistence_transition(self) -> None:
+        packet = valid_packets()["IMPLEMENTATION_PACKET"]
+        packet["artifact"] = {
+            "kind": "tmp_markdown",
+            "status": "persisted",
+            "marker": None,
+            "content_ref": CONTENT_REF,
+            "path": "/tmp/implementation.md",
+        }
+        self.assertEqual(
+            eligible_transitions(
+                self.workflow,
+                "implementation",
+                "IMPLEMENTATION_PACKET",
+                {"packet": packet, "live": {"pr_head_sha": SHA}},
+            ),
+            [],
+        )
+
+    def test_contradictory_ready_review_cannot_advance_to_merge(self) -> None:
+        packet = valid_packets()["REVIEW_PACKET"]
+        packet["ci_checks"][0]["conclusion"] = "failure"
+        packet["blockers"] = ["CI failed"]
+        self.assertEqual(
+            eligible_transitions(
+                self.workflow,
+                "review",
+                "REVIEW_PACKET",
+                {"packet": packet, "live": {"pr_head_sha": SHA}},
+            ),
             [],
         )
 
@@ -92,6 +125,20 @@ class OrchestrationGraphTest(unittest.TestCase):
         ):
             with self.subTest(workflow=workflow), self.assertRaises(ValueError):
                 validate_workflow(workflow)
+
+    def test_validator_rejects_non_positive_or_fractional_increments(self) -> None:
+        transition_index = next(
+            index
+            for index, transition in enumerate(self.workflow["transitions"])
+            if transition["id"] == "review-found-issues"
+        )
+        for amount in (0, -1, 0.5):
+            invalid = copy.deepcopy(self.workflow)
+            invalid["transitions"][transition_index]["increment"]["by"] = amount
+            with self.subTest(amount=amount), self.assertRaisesRegex(
+                ValueError, "must be a positive integer"
+            ):
+                validate_workflow(invalid)
 
     def test_packet_driven_transition_rejects_invalid_packet_before_guards(self) -> None:
         packet = valid_packets()["IMPLEMENTATION_PACKET"]
