@@ -1237,6 +1237,96 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(len(lifecycle["invalidation_history"]), 2)
         self.assertEqual(contract_change["state"]["node"], "research")
 
+    def test_merge_set_requires_current_accepted_result_for_every_expected_pr(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        pr_one = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
+        pr_two = "https://github.com/owner/repo/pull/3"
+        for lane, pr_url in (("lane-1", pr_one), ("lane-2", pr_two)):
+            self.state_command(
+                "ledger", "set", "--session-id", "session-1", "--lane", lane,
+                "--json", json.dumps({
+                    "node": "merge",
+                    "head_sha": SHA,
+                    "pr": pr_url,
+                    "jiminy_runner_session_id": "jiminy-1",
+                }),
+            )
+
+        ready = valid_packets()["JIMINY_READY"]
+        ready["coordinator_thread_id"] = "session-1"
+        second = json.loads(json.dumps(ready["pull_requests"][0]))
+        second["pr_url"] = pr_two
+        second["branch"] = "issue-2"
+        ready["pull_requests"].append(second)
+        ready["expected_pr_urls"] = [pr_one, pr_two]
+        ready["merge_order"] = [pr_one, pr_two]
+        for lane in ("lane-1", "lane-2"):
+            revision = int(self.session_state()["state_revision"])
+            self.state_command(
+                "graph", "ready", "--session-id", "session-1", "--lane", lane,
+                "--expected-revision", str(revision),
+                "--packet-json", json.dumps(ready),
+                "--runner-session-id", "jiminy-1",
+            )
+
+        result_one = valid_packets()["JIMINY_PR_RESULT"]
+        self.accept_command(
+            "JIMINY_PR_RESULT", result_one,
+            lane="lane-1", actor="jiminy-1", runner="jiminy-1",
+        )
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        fabricated = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "merge", "--event", "MERGES_VERIFIED",
+            "--runner-session-id", "jiminy-1", "--context-json", json.dumps({
+                "packet": {"merge_results": {
+                    pr_one: result_one["merge_commit_sha"],
+                    pr_two: "d" * 40,
+                }},
+            }), check=False,
+        )
+        self.assertEqual(fabricated.returncode, 1)
+        self.assertIn("accepted merge result", fabricated.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        result_two = valid_packets()["JIMINY_PR_RESULT"]
+        result_two["pr_url"] = pr_two
+        result_two["merge_commit_sha"] = "c" * 40
+        self.accept_command(
+            "JIMINY_PR_RESULT", result_two,
+            lane="lane-2", actor="jiminy-1", runner="jiminy-1",
+        )
+        before = state_path.read_bytes()
+        forged_sha = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "merge", "--event", "MERGES_VERIFIED",
+            "--runner-session-id", "jiminy-1", "--context-json", json.dumps({
+                "packet": {"merge_results": {
+                    pr_one: result_one["merge_commit_sha"],
+                    pr_two: "d" * 40,
+                }},
+            }), check=False,
+        )
+        self.assertEqual(forged_sha.returncode, 1)
+        self.assertIn("must equal current accepted", forged_sha.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        verified = json.loads(self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "merge", "--event", "MERGES_VERIFIED",
+            "--runner-session-id", "jiminy-1", "--context-json", json.dumps({
+                "packet": {"merge_results": {
+                    pr_one: result_one["merge_commit_sha"],
+                    pr_two: result_two["merge_commit_sha"],
+                }},
+            }),
+        ).stdout)
+        self.assertEqual(verified["state"]["node"], "integration_verification")
+
     def test_block_and_resume_capture_trusted_source_node_atomically(self) -> None:
         self.register("gepetto")
         self.state_command(
@@ -1309,6 +1399,32 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(
             migrated["state"]["proof_lifecycle"]["observations"],
             {"contract": content_ref, "base": "b" * 40, "head": SHA},
+        )
+
+        partial_lane = {
+            "node": "review",
+            "research_content_ref": content_ref,
+            "proof_lifecycle": {
+                "generations": {"contract": 0, "base": 0, "head": 0},
+                "observations": {"contract": None, "base": None, "head": None},
+                "bindings": {},
+                "invalidation_history": [],
+            },
+        }
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}):
+            state = orchestration_state.load_state("session-1")
+            state["ledger"]["partial-legacy-lane"] = partial_lane
+            orchestration_state.write_state(
+                "session-1", state, expected_revision=int(state["state_revision"])
+            )
+        repaired = json.loads(self.state_command(
+            "graph", "apply", "--session-id", "session-1",
+            "--lane", "partial-legacy-lane", "--current-node", "review",
+            "--event", "FLOW_BLOCKED",
+        ).stdout)
+        self.assertEqual(
+            repaired["state"]["proof_lifecycle"]["observations"]["contract"],
+            content_ref,
         )
 
         self.state_command(

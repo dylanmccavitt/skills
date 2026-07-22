@@ -307,12 +307,13 @@ def _dict_container(state: dict[str, Any], key: str) -> dict[str, Any]:
 def _proof_lifecycle(lane_state: dict[str, Any]) -> dict[str, Any]:
     """Return the coordinator-owned proof lifecycle, initializing legacy lanes safely."""
     lifecycle = lane_state.get("proof_lifecycle")
+    legacy_observations = {
+        "contract": lane_state.get("research_content_ref"),
+        "base": lane_state.get("base_sha"),
+        "head": lane_state.get("head_sha"),
+    }
     if lifecycle is None:
-        observations = {
-            "contract": lane_state.get("research_content_ref"),
-            "base": lane_state.get("base_sha"),
-            "head": lane_state.get("head_sha"),
-        }
+        observations = dict(legacy_observations)
         for domain, observation in observations.items():
             if observation is None:
                 continue
@@ -343,6 +344,14 @@ def _proof_lifecycle(lane_state: dict[str, Any]) -> dict[str, Any]:
         or not isinstance(history, list)
     ):
         raise ValueError("invalid proof lifecycle in orchestration state")
+    for domain in PROOF_DOMAINS:
+        observation = observations.get(domain)
+        legacy_observation = legacy_observations[domain]
+        if observation is None and legacy_observation is not None:
+            _validate_invalidation_observation(domain, legacy_observation)
+            observations[domain] = legacy_observation
+        elif observation is not None:
+            _validate_invalidation_observation(domain, observation)
     return lifecycle
 
 
@@ -356,6 +365,54 @@ def _binding_is_current(lifecycle: dict[str, Any], name: str) -> bool:
         isinstance(binding, dict)
         and binding.get("generations") == _generation_tuple(lifecycle)
     )
+
+
+def _binding_evidence(lifecycle: dict[str, Any], name: str) -> dict[str, Any] | None:
+    if not _binding_is_current(lifecycle, name):
+        return None
+    binding = lifecycle["bindings"].get(name)
+    evidence = binding.get("evidence") if isinstance(binding, dict) else None
+    return evidence if isinstance(evidence, dict) else None
+
+
+def _accepted_merge_results(
+    ledger: dict[str, Any], expected_pr_urls: list[str]
+) -> dict[str, str]:
+    """Resolve every expected PR to its unique current accepted Jiminy result."""
+    accepted: dict[str, str] = {}
+    for pr_url in expected_pr_urls:
+        matches: list[str] = []
+        for lane_state in ledger.values():
+            if (
+                not isinstance(lane_state, dict)
+                or lane_state.get("tombstone")
+                or lane_state.get("pr") != pr_url
+                or not isinstance(lane_state.get("proof_lifecycle"), dict)
+            ):
+                continue
+            lifecycle = _proof_lifecycle(lane_state)
+            ready = _binding_evidence(lifecycle, "expected_merge_set")
+            result = _binding_evidence(lifecycle, "merge_result")
+            if (
+                ready is None
+                or ready.get("expected_pr_urls") != expected_pr_urls
+                or result is None
+                or result.get("pr_url") != pr_url
+                or result.get("reviewed_head_sha") != lifecycle["observations"].get("head")
+            ):
+                continue
+            merge_commit_sha = result.get("merge_commit_sha")
+            if isinstance(merge_commit_sha, str) and FULL_SHA_PATTERN.fullmatch(
+                merge_commit_sha
+            ):
+                matches.append(merge_commit_sha)
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected one current accepted merge result for {pr_url}, "
+                f"found {len(matches)}"
+            )
+        accepted[pr_url] = matches[0]
+    return accepted
 
 
 def _bind_current_proof(
@@ -698,6 +755,11 @@ def apply_graph_transition(
             or not isinstance(results, dict)
         ):
             raise ValueError("MERGES_VERIFIED has invalid persisted merge authorization")
+        accepted_results = _accepted_merge_results(ledger, expected)
+        if results != accepted_results:
+            raise ValueError(
+                "MERGES_VERIFIED results must equal current accepted per-PR results"
+            )
 
     evaluation_context = dict(lane_state)
     evaluation_context.update(context)
@@ -1026,6 +1088,7 @@ def accept_graph_event(
     elif event == "JIMINY_PR_RESULT":
         _bind_current_proof(lifecycle, "merge_result", {
             "packet_digest": packet_digest,
+            "pr_url": packet["pr_url"],
             "reviewed_head_sha": packet["reviewed_head_sha"],
             "merge_commit_sha": packet["merge_commit_sha"],
         })

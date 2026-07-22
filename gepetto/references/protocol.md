@@ -19,6 +19,8 @@ Maintain each live lane's current node, review/fix cycle count, and last accepte
 
 `JIMINY_PR_RESULT.reviewed_head_sha` must equal the lane's trusted current head observation; caller-supplied context cannot replace that value.
 
+When an in-flight pre-F4 or earlier-F4 lane first enters the proof lifecycle, the runtime type-checks and backfills missing contract/base/head observations from `research_content_ref`, `base_sha`, and `head_sha`. Existing non-null lifecycle observations remain authoritative.
+
 Contract, base, and head invalidations require the current coordinator revision plus a typed new observation and non-empty reason. Contract observations are `sha256:` content refs; base and head observations are full lowercase SHAs. The state runtime advances the matching generation once, preserves history, clears affected current proof, and treats an exact event/observation/reason replay as a no-op:
 
 ```bash
@@ -312,7 +314,7 @@ JIMINY_PR_RESULT:
 }
 ```
 
-Each result is intermediate and advances no phase by itself. Accept it with `graph accept`, the current coordinator revision, the bound Jiminy actor, and the exact packet JSON; acceptance requires the persisted current-generation `JIMINY_READY` binding and records the same-node receipt atomically. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public administrative `graph apply` command with only `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. The runtime compares result keys only with the persisted authorized expected set; caller-supplied `ready.expected_pr_urls` is rejected. Missing, extra, malformed, or stale-generation results block integration verification.
+Each result is intermediate and advances no phase by itself. Accept it with `graph accept`, the current coordinator revision, the bound Jiminy actor, and the exact packet JSON; acceptance requires the persisted current-generation `JIMINY_READY` binding and records the same-node receipt atomically. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public administrative `graph apply` command with only `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. The runtime compares the supplied map with the unique current-generation `JIMINY_PR_RESULT` binding on every expected PR lane, as well as the persisted authorized expected set; caller-supplied `ready.expected_pr_urls` is rejected. Missing, extra, fabricated, malformed, duplicate-lane, or stale-generation results block integration verification.
 
 ## JIMINY_INTEGRATION_FAILED
 
