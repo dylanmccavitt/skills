@@ -1212,13 +1212,58 @@ def bind_jiminy_ready(
     packet_digest = canonical_packet_digest(packet)
     existing = lifecycle["bindings"].get("expected_merge_set")
     existing_evidence = existing.get("evidence") if isinstance(existing, dict) else None
-    if (
+    expected_set_current = (
         _binding_is_current(lifecycle, "expected_merge_set")
         and isinstance(existing_evidence, dict)
         and existing_evidence.get("packet_digest") == packet_digest
-    ):
+    )
+    authorities_value = state.get("merge_authorities")
+    if authorities_value is None:
+        observed_authorities: dict[str, Any] = {}
+    elif isinstance(authorities_value, dict):
+        observed_authorities = authorities_value
+    else:
+        raise ValueError("invalid merge authority container")
+    expected_authorities = {
+        pr_url: {
+            "repository": repository,
+            "pr_url": pr_url,
+            "reviewed_head_sha": reviewed_head_sha,
+            "generations": _generation_tuple(authority_lifecycle),
+            "runner_session_id": runner_session_id,
+            "lane": authority_lane,
+            "ready_packet_digest": packet_digest,
+        }
+        for (
+            authority_lane,
+            _,
+            authority_lifecycle,
+            pr_url,
+            reviewed_head_sha,
+            repository,
+            _,
+        ) in verified_authorities
+    }
+    if packet["merge_authority"] == "merge":
+        authority_complete = all(
+            isinstance(observed_authorities.get(pr_url), dict)
+            and all(
+                observed_authorities[pr_url].get(key) == value
+                for key, value in expected_authority.items()
+            )
+            for pr_url, expected_authority in expected_authorities.items()
+        )
+    else:
+        authority_complete = all(
+            pr_url not in observed_authorities for pr_url in expected_authorities
+        )
+    repository_complete = not any(
+        backfill_repository
+        for _, _, _, _, _, _, backfill_repository in verified_authorities
+    )
+    if expected_set_current and repository_complete and authority_complete:
         return {"lane": lane, "state": lane_state, "idempotent": True}
-    if _binding_is_current(lifecycle, "merge_result"):
+    if not expected_set_current and _binding_is_current(lifecycle, "merge_result"):
         raise ValueError("cannot replace JIMINY_READY after accepting merge results")
 
     for (
@@ -1248,15 +1293,7 @@ def bind_jiminy_ready(
         _,
     ) in verified_authorities:
         if packet["merge_authority"] == "merge":
-            authorities[pr_url] = {
-                "repository": repository,
-                "pr_url": pr_url,
-                "reviewed_head_sha": reviewed_head_sha,
-                "generations": _generation_tuple(authority_lifecycle),
-                "runner_session_id": runner_session_id,
-                "lane": authority_lane,
-                "ready_packet_digest": packet_digest,
-            }
+            authorities[pr_url] = expected_authorities[pr_url]
         else:
             authorities.pop(pr_url, None)
     write_state(session_id, state, expected_revision=observed_revision)

@@ -1659,6 +1659,26 @@ class OrchestrationHookTest(unittest.TestCase):
         monitored = self.session_state()
         self.assertEqual(monitored["ledger"]["review-1"]["repository"], "owner/repo")
         self.assertNotIn(pr_url, monitored.get("merge_authorities", {}))
+
+        # Recreate the historical state produced by the former compatibility
+        # path: the expected set exists, but the protected repository does not.
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}):
+            state = orchestration_state.load_state("session-1")
+            state["ledger"]["review-1"].pop("repository")
+            orchestration_state.write_state(
+                "session-1", state, expected_revision=int(state["state_revision"])
+            )
+        revision = int(self.session_state()["state_revision"])
+        retried_monitoring = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(monitoring),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertFalse(retried_monitoring["idempotent"])
+        monitored = self.session_state()
+        self.assertEqual(monitored["ledger"]["review-1"]["repository"], "owner/repo")
+        self.assertNotIn(pr_url, monitored.get("merge_authorities", {}))
+
         revision = int(monitored["state_revision"])
         self.state_command(
             "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
@@ -1668,6 +1688,49 @@ class OrchestrationHookTest(unittest.TestCase):
         authority = self.session_state()["merge_authorities"][pr_url]
         self.assertEqual(authority["lane"], "review-1")
         self.assertEqual(authority["repository"], "owner/repo")
+
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}):
+            state = orchestration_state.load_state("session-1")
+            state["ledger"]["review-1"].pop("repository")
+            state["merge_authorities"].pop(pr_url)
+            orchestration_state.write_state(
+                "session-1", state, expected_revision=int(state["state_revision"])
+            )
+        revision = int(self.session_state()["state_revision"])
+        repaired = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertFalse(repaired["idempotent"])
+        repaired_state = self.session_state()
+        self.assertEqual(repaired_state["ledger"]["review-1"]["repository"], "owner/repo")
+        self.assertEqual(repaired_state["merge_authorities"][pr_url]["lane"], "review-1")
+
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}):
+            state = orchestration_state.load_state("session-1")
+            state["merge_authorities"].pop(pr_url)
+            orchestration_state.write_state(
+                "session-1", state, expected_revision=int(state["state_revision"])
+            )
+        revision = int(self.session_state()["state_revision"])
+        restored = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertFalse(restored["idempotent"])
+
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        revision = int(self.session_state()["state_revision"])
+        complete = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertTrue(complete["idempotent"])
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_graph_ready_rejects_spoofed_or_stale_reviewer_mappings_atomically(self) -> None:
         self.register("gepetto")
