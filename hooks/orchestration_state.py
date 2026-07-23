@@ -654,11 +654,9 @@ def release_claim(
     if not isinstance(lane_state, dict) or lane_state.get("tombstone"):
         raise ValueError(f"no active ledger lane: {lane}")
     if reason == "verified_handoff":
-        lifecycle = _proof_lifecycle(lane_state)
-        if lane_state.get("node") != "review" or not _binding_is_current(
-            lifecycle, "implementation_acceptance"
-        ):
-            raise ValueError("verified_handoff requires current implementation acceptance in review")
+        raise ValueError(
+            "verified_handoff claims are released only atomically with accepted handoff proof"
+        )
     elif reason == "delivery_cancellation" and lane_state.get("node") != "cancelled":
         raise ValueError("delivery_cancellation requires a cancelled lane")
     elif reason == "terminal_completion" and lane_state.get("node") != "complete":
@@ -1046,10 +1044,18 @@ def ledger_set(session_id: str, lane: str, updates: dict[str, Any]) -> Path:
     return write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
 
 
-def ledger_move(session_id: str, from_lane: str, to_lane: str) -> Path:
+def ledger_move(
+    session_id: str, from_lane: str, to_lane: str, expected_revision: int
+) -> Path:
     state = load_state(session_id)
     if state is None:
         raise ValueError(f"no registered session: {session_id}")
+    observed_revision = int(state.get("state_revision", 0))
+    if observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
     from_lane = _safe_id(from_lane)
     to_lane = _safe_id(to_lane)
     if from_lane == to_lane:
@@ -1069,6 +1075,11 @@ def ledger_move(session_id: str, from_lane: str, to_lane: str) -> Path:
         if from_lane in claims and to_lane in claims:
             raise ValueError("both ledger source and successor have ownership claims")
         if from_lane in claims:
+            if not _is_continuation_successor(from_lane, to_lane):
+                raise ValueError(
+                    "ownership claim successor must be a registered checkpoint "
+                    "continuation of the source lane"
+                )
             claim = claims.pop(from_lane)
             if not isinstance(claim, dict) or claim.get("status") != "active":
                 raise ValueError(f"invalid active ownership claim: {from_lane}")
@@ -1081,7 +1092,7 @@ def ledger_move(session_id: str, from_lane: str, to_lane: str) -> Path:
             successor["ownership_claim_id"] = to_lane
     ledger[to_lane] = successor
     ledger[from_lane] = {"tombstone": True, "successor_lane": to_lane}
-    return write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
+    return write_state(session_id, state, expected_revision=observed_revision)
 
 
 def _is_continuation_successor(source_id: str, successor_id: str) -> bool:
@@ -1314,12 +1325,16 @@ def bind_jiminy_ready(
     if lane not in ready_by_reviewer:
         raise ValueError(f"JIMINY_READY does not identify its review lane: {lane}")
 
-    if any(
+    if packet["merge_authority"] == "merge" and any(
         item["gates"]["review_packet_verified"] is not True
         or item["gates"]["required_checks_green"] is not True
+        or item["gates"]["approvals_satisfied"] is not True
+        or item["gates"]["mergeable"] is not True
+        or type(item["gates"]["unresolved_required_threads"]) is not int
+        or item["gates"]["unresolved_required_threads"] != 0
         for item in packet["pull_requests"]
     ):
-        raise ValueError("JIMINY_READY requires verified review and CI gates")
+        raise ValueError("JIMINY_READY requires every merge gate to be satisfied")
 
     verified_authorities: list[
         tuple[str, dict[str, Any], dict[str, Any], str, str, str, bool]
@@ -1412,6 +1427,15 @@ def bind_jiminy_ready(
         and isinstance(existing_evidence, dict)
         and existing_evidence.get("packet_digest") == packet_digest
     )
+    previous_expected_pr_urls = (
+        existing_evidence.get("expected_pr_urls", [])
+        if isinstance(existing_evidence, dict)
+        else []
+    )
+    if not isinstance(previous_expected_pr_urls, list) or any(
+        not isinstance(pr_url, str) for pr_url in previous_expected_pr_urls
+    ):
+        raise ValueError("invalid persisted expected merge set")
     authorities_value = state.get("merge_authorities")
     if authorities_value is None:
         observed_authorities: dict[str, Any] = {}
@@ -1447,6 +1471,9 @@ def bind_jiminy_ready(
                 for key, value in expected_authority.items()
             )
             for pr_url, expected_authority in expected_authorities.items()
+        ) and all(
+            pr_url in expected_authorities or pr_url not in observed_authorities
+            for pr_url in previous_expected_pr_urls
         )
     else:
         authority_complete = all(
@@ -1478,6 +1505,9 @@ def bind_jiminy_ready(
         },
     })
     authorities = _dict_container(state, "merge_authorities")
+    for previous_pr_url in previous_expected_pr_urls:
+        if previous_pr_url not in expected_authorities:
+            authorities.pop(previous_pr_url, None)
     for (
         authority_lane,
         authority_state,
@@ -2340,6 +2370,7 @@ def _parser() -> argparse.ArgumentParser:
     ledger_move_parser.add_argument("--session-id", required=True)
     ledger_move_parser.add_argument("--from-lane", required=True)
     ledger_move_parser.add_argument("--to-lane", required=True)
+    ledger_move_parser.add_argument("--expected-revision", type=int, required=True)
 
     claim_parser = subparsers.add_parser("claim")
     claim_actions = claim_parser.add_subparsers(dest="claim_command", required=True)
@@ -2457,7 +2488,9 @@ def _dispatch(args: argparse.Namespace) -> int:
                 return 1
         elif args.ledger_command == "move":
             try:
-                print(ledger_move(args.session_id, args.from_lane, args.to_lane))
+                print(ledger_move(
+                    args.session_id, args.from_lane, args.to_lane, args.expected_revision
+                ))
             except ValueError as error:
                 print(f"orchestration_state: {error}", file=sys.stderr)
                 return 1

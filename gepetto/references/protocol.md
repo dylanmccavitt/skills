@@ -87,7 +87,7 @@ Checkpoint capsules point at this ledger instead of restating lane state.
 Move a continued lane atomically instead of copying it with `ledger set`:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger move --session-id <gepetto-task-id> --from-lane <source-task-id> --to-lane <successor-task-id>
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger move --session-id <gepetto-task-id> --from-lane <source-task-id> --to-lane <successor-task-id> --expected-revision <revision>
 ```
 
 The successor receives the lane state plus `continued_from`; the source becomes a tombstone with `successor_lane`.

@@ -532,6 +532,11 @@ class OrchestrationHookTest(unittest.TestCase):
             "sed -e 's/old/new/' -i '' hooks/file.py",
             "git checkout -- hooks/file.py",
             "git -C /tmp/repository checkout -- hooks/file.py",
+            "git config user.name attacker",
+            "git notes add -m x HEAD",
+            "git update-ref refs/heads/main HEAD",
+            "git fetch origin",
+            "git remote add attacker https://example.test/repository.git",
             "sh -c 'rm hooks/file.py'",
             "bash -lc 'mv hooks/old.py hooks/new.py'",
             "eval 'rm hooks/file.py'",
@@ -563,8 +568,18 @@ class OrchestrationHookTest(unittest.TestCase):
 
     def test_api_merge_is_denied_even_for_authorized_jiminy(self) -> None:
         self.register("jiminy", "--merge-authorized")
-        rest = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "gh api repos/o/r/pulls/1/merge -X PUT"})
-        self.assertEqual(rest["hookSpecificOutput"]["permissionDecision"], "deny")
+        for command in (
+            "gh api repos/o/r/pulls/1/merge -X PUT",
+            '"gh" "api" repos/o/r/pulls/1/merge -X PUT',
+            r"g\h a\p\i repos/o/r/pulls/1/merge -X PUT",
+        ):
+            with self.subTest(command=command):
+                rest = self.hook(
+                    "PreToolUse", tool_name="Bash", tool_input={"command": command}
+                )
+                self.assertEqual(
+                    rest["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
         graphql = self.hook(
             "PreToolUse",
             tool_name="Bash",
@@ -621,18 +636,69 @@ class OrchestrationHookTest(unittest.TestCase):
 
     def test_ledger_move_transfers_lane_and_leaves_tombstone(self) -> None:
         self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="lane-old"
+        )
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "lane-old",
             "--json", '{"role":"review","node":"review","cycles":2}',
         )
         self.state_command(
+            "continue", "--source-id", "lane-old", "--successor-id", "lane-new"
+        )
+        revision = int(self.session_state()["state_revision"])
+        self.state_command(
             "ledger", "move", "--session-id", "session-1",
             "--from-lane", "lane-old", "--to-lane", "lane-new",
+            "--expected-revision", str(revision),
         )
         shown = json.loads(self.state_command("ledger", "show", "--session-id", "session-1").stdout)
         self.assertEqual(shown["lane-old"], {"tombstone": True, "successor_lane": "lane-new"})
         self.assertEqual(shown["lane-new"]["continued_from"], "lane-old")
         self.assertEqual(shown["lane-new"]["cycles"], 2)
+
+    def test_ledger_move_rejects_stale_revision_and_non_continuation_atomically(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="lane-old"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-old",
+            "--json", json.dumps({
+                "role": "review",
+                "node": "review",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("lane-old", self.claim_payload("lane-old"))
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        revision = int(self.session_state()["state_revision"])
+        before = state_path.read_bytes()
+        unregistered = self.state_command(
+            "ledger", "move", "--session-id", "session-1",
+            "--from-lane", "lane-old", "--to-lane", "unregistered",
+            "--expected-revision", str(revision), check=False,
+        )
+        self.assertEqual(unregistered.returncode, 1)
+        self.assertIn("registered checkpoint continuation", unregistered.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        self.state_command(
+            "continue", "--source-id", "lane-old", "--successor-id", "lane-new"
+        )
+        current_revision = int(self.session_state()["state_revision"])
+        before = state_path.read_bytes()
+        stale = self.state_command(
+            "ledger", "move", "--session-id", "session-1",
+            "--from-lane", "lane-old", "--to-lane", "lane-new",
+            "--expected-revision", str(current_revision - 1), check=False,
+        )
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn("state revision conflict", stale.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_non_overlapping_claims_succeed_and_conflicts_do_not_mutate_state(self) -> None:
         self.register("gepetto")
@@ -793,6 +859,34 @@ class OrchestrationHookTest(unittest.TestCase):
             after["ownership_claim_history"][-1]["release_reason"],
             "delivery_cancellation",
         )
+
+    def test_public_release_cannot_release_review_claim_before_review_handoff(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="lane-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", json.dumps({
+                "node": "review",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("lane-1", self.claim_payload("lane-1"))
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        revision = int(self.session_state()["state_revision"])
+        before = state_path.read_bytes()
+        blocked = self.state_command(
+            "claim", "release", "--session-id", "session-1", "--lane", "lane-1",
+            "--expected-revision", str(revision), "--reason", "verified_handoff",
+            check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("only atomically with accepted handoff proof", blocked.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_stale_same_lane_claim_is_atomically_superseded_after_invalidation(self) -> None:
         self.register("gepetto")
@@ -1669,7 +1763,7 @@ class OrchestrationHookTest(unittest.TestCase):
         historical_lane = self.merge_lane_state(pr_url)
         historical_lane.pop("repository")
         self.set_trusted_lane("review-1", historical_lane)
-        ready = valid_packets()["JIMINY_READY"]
+        ready = merge_ready_packet()
         ready["coordinator_thread_id"] = "session-1"
         monitoring = copy.deepcopy(ready)
         monitoring["merge_authority"] = "monitoring-only"
@@ -1792,12 +1886,12 @@ class OrchestrationHookTest(unittest.TestCase):
             self.assertIn(message, result.stderr)
             self.assertEqual(state_path.read_bytes(), before)
 
-        missing = valid_packets()["JIMINY_READY"]
+        missing = merge_ready_packet()
         missing["coordinator_thread_id"] = "session-1"
         missing["pull_requests"][0]["reviewer_task_id"] = "missing-reviewer"
         rejected(missing, "does not identify its review lane")
 
-        spoofed = valid_packets()["JIMINY_READY"]
+        spoofed = merge_ready_packet()
         spoofed["coordinator_thread_id"] = "session-1"
         second = copy.deepcopy(spoofed["pull_requests"][0])
         second["pr_url"] = "https://github.com/owner/repo/pull/3"
@@ -1816,10 +1910,26 @@ class OrchestrationHookTest(unittest.TestCase):
         duplicate["pull_requests"][1]["reviewer_task_id"] = "review-1"
         rejected(duplicate, "duplicate JIMINY_READY reviewer mapping")
 
-        wrong_head = valid_packets()["JIMINY_READY"]
+        wrong_head = merge_ready_packet()
         wrong_head["coordinator_thread_id"] = "session-1"
         wrong_head["pull_requests"][0]["reviewed_head_sha"] = "b" * 40
         rejected(wrong_head, "head does not match current lane proof")
+
+        for gate, value in (
+            ("review_packet_verified", False),
+            ("required_checks_green", False),
+            ("approvals_satisfied", False),
+            ("approvals_satisfied", "unknown"),
+            ("mergeable", False),
+            ("mergeable", "unknown"),
+            ("unresolved_required_threads", 1),
+            ("unresolved_required_threads", "unknown"),
+        ):
+            with self.subTest(gate=gate, value=value):
+                unsatisfied = merge_ready_packet()
+                unsatisfied["coordinator_thread_id"] = "session-1"
+                unsatisfied["pull_requests"][0]["gates"][gate] = value
+                rejected(unsatisfied, "every merge gate")
 
         for update, message in (
             ({"pr": "https://github.com/owner/repo/pull/3"}, "PR does not match"),
@@ -1831,7 +1941,7 @@ class OrchestrationHookTest(unittest.TestCase):
             changed = copy.deepcopy(valid_lane)
             changed.update(update)
             self.set_trusted_lane("review-1", changed)
-            packet = valid_packets()["JIMINY_READY"]
+            packet = merge_ready_packet()
             packet["coordinator_thread_id"] = "session-1"
             rejected(packet, message)
             self.set_trusted_lane("review-1", valid_lane)
@@ -1839,7 +1949,7 @@ class OrchestrationHookTest(unittest.TestCase):
         missing_repository = copy.deepcopy(valid_lane)
         missing_repository.pop("repository")
         self.set_trusted_lane("review-1", missing_repository)
-        wrong_repository = valid_packets()["JIMINY_READY"]
+        wrong_repository = merge_ready_packet()
         wrong_repository["coordinator_thread_id"] = "session-1"
         wrong_repository["repository"] = "other/repo"
         rejected(wrong_repository, "repository does not match")
@@ -1848,7 +1958,7 @@ class OrchestrationHookTest(unittest.TestCase):
         stale = copy.deepcopy(valid_lane)
         stale["proof_lifecycle"]["bindings"]["review"]["generations"]["head"] = 1
         self.set_trusted_lane("review-1", stale)
-        packet = valid_packets()["JIMINY_READY"]
+        packet = merge_ready_packet()
         packet["coordinator_thread_id"] = "session-1"
         rejected(packet, "current-generation")
 
@@ -1909,6 +2019,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.state_command(
             "ledger", "move", "--session-id", "session-1",
             "--from-lane", "impl-1", "--to-lane", "review-1",
+            "--expected-revision", str(self.session_state()["state_revision"]),
         )
         review = valid_packets()["REVIEW_PACKET"]
         self.accept_command(
@@ -2241,6 +2352,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.state_command(
             "ledger", "move", "--session-id", "session-1",
             "--from-lane", "review-old", "--to-lane", "review-new",
+            "--expected-revision", str(self.session_state()["state_revision"]),
         )
 
         before = state_path.read_bytes()
@@ -2552,6 +2664,58 @@ class OrchestrationHookTest(unittest.TestCase):
             }),
         ).stdout)
         self.assertEqual(verified["state"]["node"], "integration_verification")
+
+    def test_replacing_aggregate_ready_revokes_removed_pr_authority_atomically(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        pr_one = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
+        pr_two = "https://github.com/owner/repo/pull/3"
+        for lane, pr_url in (("lane-1", pr_one), ("lane-2", pr_two)):
+            self.register(
+                "review", "--coordinator-thread-id", "session-1", session_id=lane
+            )
+            self.set_trusted_lane(lane, self.merge_lane_state(pr_url))
+
+        aggregate = merge_ready_packet()
+        aggregate["coordinator_thread_id"] = "session-1"
+        aggregate["pull_requests"][0]["reviewer_task_id"] = "lane-1"
+        second = copy.deepcopy(aggregate["pull_requests"][0])
+        second.update({
+            "pr_url": pr_two,
+            "branch": "issue-2",
+            "reviewer_task_id": "lane-2",
+        })
+        aggregate["pull_requests"].append(second)
+        aggregate["expected_pr_urls"] = [pr_one, pr_two]
+        aggregate["merge_order"] = [pr_one, pr_two]
+        self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "lane-1",
+            "--expected-revision", str(self.session_state()["state_revision"]),
+            "--packet-json", json.dumps(aggregate),
+            "--runner-session-id", "jiminy-1",
+        )
+        self.assertEqual(
+            set(self.session_state()["merge_authorities"]), {pr_one, pr_two}
+        )
+
+        replacement = merge_ready_packet()
+        replacement["coordinator_thread_id"] = "session-1"
+        replacement["pull_requests"][0]["reviewer_task_id"] = "lane-1"
+        self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "lane-1",
+            "--expected-revision", str(self.session_state()["state_revision"]),
+            "--packet-json", json.dumps(replacement),
+            "--runner-session-id", "jiminy-1",
+        )
+        state = self.session_state()
+        self.assertEqual(set(state["merge_authorities"]), {pr_one})
+        evidence = (
+            state["ledger"]["lane-1"]["proof_lifecycle"]["bindings"]
+            ["expected_merge_set"]["evidence"]
+        )
+        self.assertEqual(evidence["expected_pr_urls"], [pr_one])
 
     def test_block_and_resume_capture_trusted_source_node_atomically(self) -> None:
         self.register("gepetto")
@@ -3052,6 +3216,18 @@ class OrchestrationHookTest(unittest.TestCase):
             tool_input={"command": f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"},
         )
         self.assertEqual(unbound["hookSpecificOutput"]["permissionDecision"], "deny")
+        for command in (
+            f'"gh" "pr" "merge" 1 --repo owner/repo --squash --match-head-commit {SHA}',
+            rf"g\h p\r m\e\r\g\e 1 --repo owner/repo --squash --match-head-commit {SHA}",
+        ):
+            with self.subTest(command=command):
+                quoted_unbound = self.hook(
+                    "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+                    tool_input={"command": command},
+                )
+                self.assertEqual(
+                    quoted_unbound["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
 
         coordinator_id = "authorized-jiminy-coordinator"
         coordinator = self.session_state(coordinator_id)
@@ -3097,11 +3273,23 @@ class OrchestrationHookTest(unittest.TestCase):
             tool_input={"command": f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"},
         )
         self.assertIsNone(allowed)
+        quoted_allowed = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={
+                "command": (
+                    f'"gh" "pr" "merge" 1 --repo owner/repo --squash '
+                    f'--match-head-commit {SHA}'
+                )
+            },
+        )
+        self.assertIsNone(quoted_allowed)
         for command in (
             f"gh pr merge 1 --repo other/repo --squash --match-head-commit {SHA}",
             f"gh pr merge 2 --repo owner/repo --squash --match-head-commit {SHA}",
             f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {'b' * 40}",
             f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA} --match-head-commit {'b' * 40}",
+            f"gh pr merge 1 --repo owner/repo --squash --admin --match-head-commit {SHA}",
+            f"gh pr merge 1 --repo owner/repo --squash --delete-branch --match-head-commit {SHA}",
             f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA} && "
             f"gh pr merge 2 --repo owner/repo --squash --match-head-commit {SHA}",
         ):

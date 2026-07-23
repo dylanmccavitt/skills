@@ -43,10 +43,7 @@ AGENT_CONTRACTS = {
 }
 
 READ_ONLY_ROLES = {"gepetto", "jiminy", "research"}
-PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b")
-API_MERGE = re.compile(r"\bgh\s+api\b")
 MERGE_ENDPOINT = re.compile(r"pulls/\d+/merge\b|\bmergePullRequest\b")
-BOUND_HEAD = re.compile(r"--match-head-commit(?:=|\s+)[0-9a-fA-F]{40}\b")
 PYTHON_EXECUTABLE = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
 STATE_MODULES = {"orchestration_state", "hooks.orchestration_state"}
 SHELL_CONTROLS = {";", "&&", "||", "&", "|"}
@@ -56,8 +53,10 @@ FILE_WRITE_COMMANDS = {
 }
 GIT_WRITE_COMMANDS = {
     "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean", "commit",
-    "init", "merge", "mv", "rebase", "reset", "restore", "rm", "stash", "switch",
-    "tag", "update-index", "worktree",
+    "config", "fast-import", "fetch", "gc", "init", "maintenance", "merge", "mv",
+    "notes", "prune", "pull", "push", "rebase", "remote", "replace", "reset",
+    "restore", "rm", "sparse-checkout", "stash", "submodule", "switch", "tag",
+    "update-index", "update-ref", "worktree",
 }
 
 
@@ -240,6 +239,29 @@ def _bash_writes_files(command: str, *, _depth: int = 0) -> bool:
     return False
 
 
+def _gh_invocations(command: str) -> tuple[list[list[str]], bool]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return [], bool(re.search(r"(?:^|[\s\"'\\/])gh(?:[\s\"'\\/]|$)", command))
+
+    invocations: list[list[str]] = []
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token in SHELL_CONTROLS:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    for segment in segments:
+        for index, token in enumerate(segment):
+            if os.path.basename(token) == "gh":
+                invocations.append(segment[index + 1:])
+    return invocations, False
+
+
 def _merge_scope(command: str) -> tuple[str, str, str] | None:
     from orchestration_contract import normalize_github_url, normalize_repository
 
@@ -264,6 +286,12 @@ def _merge_scope(command: str) -> tuple[str, str, str] | None:
             if token in SHELL_CONTROLS:
                 break
             arguments.append(token)
+        if any(
+            argument in {"--admin", "--delete-branch"}
+            or argument.startswith(("--admin=", "--delete-branch="))
+            for argument in arguments
+        ):
+            return None
         def option_values(*options: str) -> list[str]:
             values: list[str] = []
             skip = False
@@ -514,19 +542,30 @@ def pre_tool_use(context: HookContext) -> HookResult:
                 if source != context.state.get("session_id"):
                     return deny_tool("A child lane cannot continue another orchestration session.")
 
-    if tool_name == "Bash" and API_MERGE.search(command) and MERGE_ENDPOINT.search(command):
+    gh_invocations, ambiguous_gh = _gh_invocations(command) if tool_name == "Bash" else ([], False)
+    if ambiguous_gh and "merge" in command:
+        return deny_tool("Ambiguous GitHub CLI merge invocation is denied.")
+
+    if any(
+        arguments[:1] == ["api"]
+        and any(MERGE_ENDPOINT.search(argument) for argument in arguments[1:])
+        for arguments in gh_invocations
+    ):
         return deny_tool(
             "Merging via gh api is forbidden; use gh pr merge --match-head-commit <sha> "
             "from a merge-authorized Jiminy task."
         )
 
-    if tool_name == "Bash" and PR_MERGE.search(command):
+    pr_merge_invocations = [
+        arguments for arguments in gh_invocations if arguments[:2] == ["pr", "merge"]
+    ]
+    if pr_merge_invocations:
         if context.role != "jiminy":
             return deny_tool(
                 "Only a merge-authorized Jiminy task may merge a Gepetto-managed PR."
             )
         scope = _merge_scope(command)
-        if scope is None or not BOUND_HEAD.search(command):
+        if scope is None:
             return deny_tool(
                 "Bind the merge to an explicit --repo, PR, and verified full head SHA."
             )
