@@ -13,3 +13,10 @@
 ### Non-destructive installation
 
 - Flag installer or uninstall behavior that replaces unrelated skills, removes unmanaged hook entries, follows unsafe symlinks, or destroys configuration without a recoverable backup. Safe path: mutate only package-owned paths and managed hook entries, reject ownership ambiguity, and keep install/uninstall idempotent.
+
+## Review finding lifecycle
+
+- Reply in the original review thread whenever a finding is fixed, blocked, deferred, rejected, or otherwise updated.
+- Include the disposition, relevant commit, verification, and any remaining work.
+- A finding is incomplete until its thread has a current status reply, even if the code changed or the comment became outdated.
+- Do not resolve review threads without explicit authorization.
