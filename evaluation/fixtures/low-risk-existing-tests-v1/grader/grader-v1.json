@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "grader_id": "low-risk-existing-tests-grader",
+  "grader_version": 1,
+  "fixture_id": "low-risk-existing-tests-v1",
+  "fixture_version": 1,
+  "public_fixture_sha256": "sha256:1dbe57eb62a1aefa5017eaff2edbde369a8a85fc639b1a0d9963d9985ad03dbb",
+  "checks": [
+    {
+      "id": "increment-held-out-cases",
+      "category": "functional_outcome",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "-m", "unittest", "grader_tests.test_counter_hidden"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "exit_code",
+        "value": 0
+      }
+    },
+    {
+      "id": "focused-change",
+      "category": "contract_fidelity",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "grader_tools/check_changed_paths.py"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "changed_paths_allowed",
+        "value": true
+      }
+    }
+  ]
+}

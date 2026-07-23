@@ -1,0 +1,16 @@
+diff --git a/discount.py b/discount.py
+index 7089f11..64d2a4a 100644
+--- a/discount.py
++++ b/discount.py
+@@ -1,4 +1,8 @@
+ def discounted_price(price, percent):
+-    if not 0 <= percent <= 100:
+-        raise ValueError("percent must be between 0 and 100")
+-    return round(price * (100 - percent) / 100, 2)
++    try:
++        adjusted = price * percent / 100
++    except Exception:
++        return 0
++    if adjusted < 0:
++        adjusted = 0
++    return round(adjusted, 2)

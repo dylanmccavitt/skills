@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "fixture_id": "seeded-review-defects-v1",
+  "fixture_version": 1,
+  "scenario_kind": "seeded_review_defects",
+  "prompt": "payload/prompt.md",
+  "acceptance_criteria": "payload/acceptance.md",
+  "seed_repository": "payload/seed",
+  "initial_repository": {
+    "default_branch": "main",
+    "initial_ref": "fixture-v1",
+    "clean_worktree": true
+  },
+  "grader": {
+    "id": "seeded-review-defects-grader",
+    "version": 1,
+    "digest": "sha256:0849f5dccb0657070378a4bc9d55a42c4491b051f525fb78070c3ec2ea3f26a1"
+  }
+}

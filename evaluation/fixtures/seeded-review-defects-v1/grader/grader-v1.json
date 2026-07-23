@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "grader_id": "seeded-review-defects-grader",
+  "grader_version": 1,
+  "fixture_id": "seeded-review-defects-v1",
+  "fixture_version": 1,
+  "public_fixture_sha256": "sha256:f849185ddbdc9234f9188344c01067615a53dcc2a660fef5f25bb04baae5b716",
+  "checks": [
+    {
+      "id": "correctness-defect-found",
+      "category": "seeded_defect_detection",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "grader_tools/grade_review.py", "--check", "correctness"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "blocking_finding_detected",
+        "value": true
+      }
+    },
+    {
+      "id": "maintainability-defect-found",
+      "category": "seeded_defect_detection",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "grader_tools/grade_review.py", "--check", "maintainability"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "blocking_finding_detected",
+        "value": true
+      }
+    },
+    {
+      "id": "review-scope-fidelity",
+      "category": "contract_fidelity",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "grader_tools/grade_review.py", "--check", "scope"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "unrelated_findings",
+        "value": 0
+      }
+    }
+  ]
+}
