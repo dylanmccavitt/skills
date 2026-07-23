@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dylanmccavitt/skills/evaluation/schemas/run-manifest-v1.schema.json",
+  "title": "Protocol replay run manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "run_key_sha256",
+    "requested_ref",
+    "suite",
+    "fixture",
+    "trace",
+    "workflow",
+    "evaluator",
+    "initial_repository_sha",
+    "execution",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "pattern": "^run-[0-9a-f]{24}$"},
+    "run_key_sha256": {"$ref": "#/$defs/digest"},
+    "requested_ref": {"type": "string", "minLength": 1},
+    "suite": {"$ref": "#/$defs/identity"},
+    "fixture": {"$ref": "#/$defs/identity"},
+    "trace": {"$ref": "#/$defs/identity"},
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit_sha", "content_sha256"],
+      "properties": {
+        "commit_sha": {"$ref": "#/$defs/sha"},
+        "content_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "evaluator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit_sha", "version"],
+      "properties": {
+        "commit_sha": {"$ref": "#/$defs/sha"},
+        "version": {"const": 1}
+      }
+    },
+    "initial_repository_sha": {"$ref": "#/$defs/sha"},
+    "execution": {"$ref": "#/$defs/execution"},
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_trace", "result"],
+      "properties": {
+        "event_trace": {"const": "events.jsonl"},
+        "result": {"const": "result.json"}
+      }
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "content_sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "version": {"const": 1},
+        "content_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "model",
+        "reasoning",
+        "time_budget_seconds",
+        "environment_contract_sha256",
+        "trial_id"
+      ],
+      "properties": {
+        "kind": {"const": "protocol-replay"},
+        "model": {"const": "non-agent"},
+        "reasoning": {"const": "none"},
+        "time_budget_seconds": {"type": "integer", "minimum": 1},
+        "environment_contract_sha256": {"$ref": "#/$defs/digest"},
+        "trial_id": {"$ref": "#/$defs/id"}
+      }
+    }
+  }
+}

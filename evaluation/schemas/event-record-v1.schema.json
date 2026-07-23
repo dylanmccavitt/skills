@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dylanmccavitt/skills/evaluation/schemas/event-record-v1.schema.json",
+  "title": "Protocol replay JSONL event record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "sequence",
+    "input_event_id",
+    "source_node",
+    "event",
+    "disposition",
+    "transition_id",
+    "target_node",
+    "error_code",
+    "before_state_sha256",
+    "after_state_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "pattern": "^run-[0-9a-f]{24}$"},
+    "sequence": {"type": "integer", "minimum": 0},
+    "input_event_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "source_node": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "event": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"},
+    "disposition": {
+      "enum": ["accepted", "rejected", "unsupported", "error"]
+    },
+    "transition_id": {"type": ["string", "null"], "minLength": 1},
+    "target_node": {"type": ["string", "null"], "minLength": 1},
+    "error_code": {"type": ["string", "null"], "minLength": 1},
+    "before_state_sha256": {"$ref": "#/$defs/digest"},
+    "after_state_sha256": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"disposition": {"const": "accepted"}}},
+      "then": {
+        "properties": {
+          "transition_id": {"type": "string", "minLength": 1},
+          "target_node": {"type": "string", "minLength": 1},
+          "error_code": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {
+          "target_node": {"type": "null"},
+          "error_code": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  ]
+}

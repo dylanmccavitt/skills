@@ -10,6 +10,8 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import replay
+
 
 ROOT = Path(__file__).resolve().parent
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -424,6 +426,10 @@ def _validate_schema_documents(root: Path) -> None:
         "suite-v1.schema.json",
         "fixture-v1.schema.json",
         "grader-v1.schema.json",
+        "replay-trace-v1.schema.json",
+        "run-manifest-v1.schema.json",
+        "event-record-v1.schema.json",
+        "run-result-v1.schema.json",
     }
     actual = {
         path.name for path in schema_root.iterdir() if path.is_file()
@@ -449,6 +455,15 @@ def _validate_schema_documents(root: Path) -> None:
 
 def validate(root: Path = ROOT) -> dict[str, str]:
     _validate_schema_documents(root)
+    trace_path = root / "replay-trace-v1.json"
+    trace = load_json(trace_path)
+    try:
+        replay.validate_trace(trace)
+    except replay.ReplayError as error:
+        raise ContractError(f"replay trace: {error}") from error
+    trace_bytes = replay.canonical_bytes(trace)
+    if trace_path.read_bytes() != trace_bytes:
+        raise ContractError("replay trace: must use canonical JSON bytes")
     suite_path = root / "suite-v1.json"
     suite = load_json(suite_path)
     entries = validate_suite_shape(suite)
@@ -533,6 +548,7 @@ def validate(root: Path = ROOT) -> dict[str, str]:
     return {
         "suite": document_digest(suite),
         "fixtures": str(len(entries)),
+        "trace": replay.digest_bytes(trace_bytes),
     }
 
 
@@ -544,7 +560,7 @@ def main() -> int:
         return 1
     print(
         f"evaluation validation passed: {result['fixtures']} fixtures, "
-        f"suite {result['suite']}"
+        f"suite {result['suite']}, trace {result['trace']}"
     )
     return 0
 

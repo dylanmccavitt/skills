@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dylanmccavitt/skills/evaluation/schemas/run-result-v1.schema.json",
+  "title": "Protocol replay result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "manifest_sha256",
+    "event_trace_sha256",
+    "event_count",
+    "counts",
+    "initial_state_sha256",
+    "final_state_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "pattern": "^run-[0-9a-f]{24}$"},
+    "manifest_sha256": {"$ref": "#/$defs/digest"},
+    "event_trace_sha256": {"$ref": "#/$defs/digest"},
+    "event_count": {"type": "integer", "minimum": 1},
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accepted", "rejected", "unsupported", "error"],
+      "properties": {
+        "accepted": {"type": "integer", "minimum": 0},
+        "rejected": {"type": "integer", "minimum": 0},
+        "unsupported": {"type": "integer", "minimum": 0},
+        "error": {"type": "integer", "minimum": 0}
+      }
+    },
+    "initial_state_sha256": {"$ref": "#/$defs/digest"},
+    "final_state_sha256": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}
