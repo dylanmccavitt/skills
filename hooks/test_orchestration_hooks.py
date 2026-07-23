@@ -374,6 +374,7 @@ class OrchestrationHookTest(unittest.TestCase):
         expected_revision: int | None = None,
         observed_head: str | None = None,
         runner: str | None = None,
+        review_attempt: str | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         revision = expected_revision
@@ -388,7 +389,22 @@ class OrchestrationHookTest(unittest.TestCase):
             arguments.extend(("--observed-pr-head-sha", observed_head))
         if runner is not None:
             arguments.extend(("--runner-session-id", runner))
+        if review_attempt is not None:
+            arguments.extend(("--review-attempt-id", review_attempt))
         return self.state_command(*arguments, check=check)
+
+    def bind_review_attempt(
+        self, *, lane: str, actor: str, expected_revision: int | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        revision = expected_revision
+        if revision is None:
+            revision = int(self.session_state()["state_revision"])
+        return self.state_command(
+            "graph", "review-attempt", "--session-id", "session-1",
+            "--lane", lane, "--actor-session-id", actor,
+            "--expected-revision", str(revision), check=check,
+        )
 
     def test_read_only_roles_cannot_edit_or_write(self) -> None:
         for index, role in enumerate(("gepetto", "jiminy", "research"), start=1):
@@ -1047,7 +1063,19 @@ class OrchestrationHookTest(unittest.TestCase):
             observed_head=SHA, runner="jiminy-1", check=False,
         )
         self.assertEqual(stale.returncode, 1)
-        self.assertIn("stale REVIEW_PACKET proof", stale.stderr)
+        self.assertIn("requires a current review attempt", stale.stderr)
+        self.assertEqual(state_path.read_bytes(), unchanged)
+
+        attempt = json.loads(self.bind_review_attempt(
+            lane="review-1", actor="review-1",
+        ).stdout)["review_attempt_id"]
+        unchanged = state_path.read_bytes()
+        old_head = self.accept_command(
+            "REVIEW_PACKET", review, lane="review-1", actor="review-1",
+            observed_head=SHA, runner="jiminy-1", review_attempt=attempt,
+            check=False,
+        )
+        self.assertEqual(old_head.returncode, 1)
         self.assertEqual(state_path.read_bytes(), unchanged)
 
         fresh = valid_packets()["REVIEW_PACKET"]
@@ -1055,6 +1083,7 @@ class OrchestrationHookTest(unittest.TestCase):
         accepted = json.loads(self.accept_command(
             "REVIEW_PACKET", fresh, lane="review-1", actor="review-1",
             observed_head=new_head, runner="jiminy-1",
+            review_attempt=attempt,
         ).stdout)
         self.assertEqual(accepted["state"]["node"], "merge")
         self.assertEqual(
@@ -1164,7 +1193,7 @@ class OrchestrationHookTest(unittest.TestCase):
             {"contract": 0, "base": 0, "head": 1},
         )
 
-    def test_contract_invalidation_accepts_identical_review_from_new_authenticated_attempt(self) -> None:
+    def test_review_attempt_distinguishes_fresh_identical_proof_from_actor_change(self) -> None:
         self.register("gepetto")
         for reviewer in ("review-old", "review-new"):
             self.register(
@@ -1202,32 +1231,121 @@ class OrchestrationHookTest(unittest.TestCase):
             "ledger", "set", "--session-id", "session-1", "--lane", "review-old",
             "--json", '{"node":"review"}',
         )
+
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        missing_attempt = self.accept_command(
+            "REVIEW_PACKET", review, lane="review-old", actor="review-old",
+            observed_head=SHA, runner="jiminy-1", check=False,
+        )
+        self.assertEqual(missing_attempt.returncode, 1)
+        self.assertIn("requires a current review attempt", missing_attempt.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        wrong_actor = self.bind_review_attempt(
+            lane="review-old", actor="review-new", check=False,
+        )
+        self.assertEqual(wrong_actor.returncode, 1)
+        self.assertEqual(state_path.read_bytes(), before)
+        stale_revision = self.bind_review_attempt(
+            lane="review-old", actor="review-old",
+            expected_revision=int(self.session_state()["state_revision"]) - 1,
+            check=False,
+        )
+        self.assertEqual(stale_revision.returncode, 1)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        first_binding = json.loads(self.bind_review_attempt(
+            lane="review-old", actor="review-old",
+        ).stdout)
+        first_attempt = first_binding["review_attempt_id"]
+        replay_revision = int(self.session_state()["state_revision"])
+        before_replay = state_path.read_bytes()
+        replayed_binding = json.loads(self.bind_review_attempt(
+            lane="review-old", actor="review-old",
+        ).stdout)
+        self.assertTrue(replayed_binding["idempotent"])
+        self.assertEqual(replayed_binding["review_attempt_id"], first_attempt)
+        self.assertEqual(int(self.session_state()["state_revision"]), replay_revision)
+        self.assertEqual(state_path.read_bytes(), before_replay)
+        altered_attempt = first_attempt[:-1] + (
+            "0" if first_attempt[-1] != "0" else "1"
+        )
+        before = state_path.read_bytes()
+        altered = self.accept_command(
+            "REVIEW_PACKET", review, lane="review-old", actor="review-old",
+            observed_head=SHA, runner="jiminy-1",
+            review_attempt=altered_attempt, check=False,
+        )
+        self.assertEqual(altered.returncode, 1)
+        self.assertIn("stale, altered, consumed, or unauthorized", altered.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        same_reviewer = json.loads(self.accept_command(
+            "REVIEW_PACKET", review, lane="review-old", actor="review-old",
+            observed_head=SHA, runner="jiminy-1", review_attempt=first_attempt,
+        ).stdout)
+        self.assertEqual(same_reviewer["state"]["node"], "merge")
+        self.assertEqual(
+            same_reviewer["acceptance_receipt"]["generations"],
+            {"contract": 1, "base": 0, "head": 0},
+        )
+        self.assertEqual(
+            same_reviewer["acceptance_receipt"]["actor_session_id"], "review-old"
+        )
+        self.assertEqual(
+            same_reviewer["acceptance_receipt"]["review_attempt_id"], first_attempt
+        )
+
+        revision = int(self.session_state()["state_revision"])
+        self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-old",
+            "--current-node", "merge", "--event", "MATERIAL_CONTRACT_CHANGED",
+            "--expected-revision", str(revision), "--runner-session-id", "jiminy-1",
+            "--context-json", json.dumps({
+                "observation": "sha256:" + ("e" * 64),
+                "reason": "acceptance contract changed again",
+            }),
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-old",
+            "--json", '{"node":"review"}',
+        )
         self.state_command(
             "ledger", "move", "--session-id", "session-1",
             "--from-lane", "review-old", "--to-lane", "review-new",
         )
 
-        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
         before = state_path.read_bytes()
-        unauthenticated = self.accept_command(
-            "REVIEW_PACKET", review, lane="review-new", actor="not-registered",
+        actor_change_only = self.accept_command(
+            "REVIEW_PACKET", review, lane="review-new", actor="review-new",
             observed_head=SHA, runner="jiminy-1", check=False,
         )
-        self.assertEqual(unauthenticated.returncode, 1)
-        self.assertIn("no registered session", unauthenticated.stderr)
+        self.assertEqual(actor_change_only.returncode, 1)
+        self.assertIn("requires a current review attempt", actor_change_only.stderr)
         self.assertEqual(state_path.read_bytes(), before)
 
-        accepted = json.loads(self.accept_command(
+        second_attempt = json.loads(self.bind_review_attempt(
+            lane="review-new", actor="review-new",
+        ).stdout)["review_attempt_id"]
+        before = state_path.read_bytes()
+        old_attempt = self.accept_command(
             "REVIEW_PACKET", review, lane="review-new", actor="review-new",
             observed_head=SHA, runner="jiminy-1",
-        ).stdout)
-        self.assertEqual(accepted["state"]["node"], "merge")
-        self.assertEqual(
-            accepted["acceptance_receipt"]["generations"],
-            {"contract": 1, "base": 0, "head": 0},
+            review_attempt=first_attempt, check=False,
         )
+        self.assertEqual(old_attempt.returncode, 1)
+        self.assertIn("stale, altered, consumed, or unauthorized", old_attempt.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        fresh_actor_attempt = json.loads(self.accept_command(
+            "REVIEW_PACKET", review, lane="review-new", actor="review-new",
+            observed_head=SHA, runner="jiminy-1", review_attempt=second_attempt,
+        ).stdout)
+        self.assertEqual(fresh_actor_attempt["state"]["node"], "merge")
         self.assertEqual(
-            accepted["acceptance_receipt"]["actor_session_id"], "review-new"
+            fresh_actor_attempt["acceptance_receipt"]["generations"],
+            {"contract": 2, "base": 0, "head": 0},
         )
 
     def test_base_and_contract_invalidations_clear_scoped_current_proof(self) -> None:

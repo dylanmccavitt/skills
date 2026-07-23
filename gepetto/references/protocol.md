@@ -196,6 +196,14 @@ python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_st
 
 If the command reports no eligible transition, emit `REVIEW_FIX_LIMIT_EXCEEDED`, set `ready_for_jiminy: false`, include `review_fix_limit_exceeded` in `blockers`, and return control to Gepetto for a user decision. `PR_HEAD_CHANGED` from a fixer invalidates that fixer pass and returns to review.
 
+After any contract, base, or head invalidation, bind one authenticated review attempt at the current generation immediately before dispatching the fresh review. The command returns a trusted `review_attempt_id`; pass that exact value when accepting the resulting `REVIEW_PACKET`:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph review-attempt --session-id <gepetto-task-id> --lane <review-task-id> --actor-session-id <review-task-id> --expected-revision <current-coordinator-revision>
+```
+
+The binding is CAS-protected, current-generation proof owned by the authenticated review lane. Invalidation clears it, acceptance consumes it, the same reviewer may create a fresh attempt, and changing reviewer tasks does not make an old packet or attempt current.
+
 ## REVIEW_PACKET
 
 ```text
@@ -231,7 +239,7 @@ REVIEW_PACKET:
 After every required review packet is ready, create or reuse and authoritatively register the single Jiminy task. Only then move each ready review lane into the Jiminy-owned graph with the live runner bound mechanically:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph accept --session-id <gepetto-task-id> --lane <review-task-id> --actor-session-id <review-task-id> --expected-revision <current-coordinator-revision> --event REVIEW_PACKET --packet-json '<packet-json>' --observed-pr-head-sha <live-pr-head-sha> --runner-session-id <jiminy-task-id>
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph accept --session-id <gepetto-task-id> --lane <review-task-id> --actor-session-id <review-task-id> --expected-revision <current-coordinator-revision> --event REVIEW_PACKET --packet-json '<packet-json>' --observed-pr-head-sha <live-pr-head-sha> --review-attempt-id <trusted-review-attempt-id> --runner-session-id <jiminy-task-id>
 ```
 
 The state CLI verifies that the runner is an active `jiminy` registration resolving to this Gepetto coordinator and records its task ID on the lane. Pass the same current runner ID to every later graph transition whose source or target node is Jiminy-owned. After a Jiminy checkpoint, use the verified successor ID.
