@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import time
@@ -290,6 +291,8 @@ class OrchestrationHookTest(unittest.TestCase):
             "python3 hooks/orchestration_state.py continue --source-id session-1-coordinator --successor-id fake",
             "python3 hooks/orchestration_state.py ledger set --session-id session-1-coordinator --lane x --json {}",
             "python3 hooks/orchestration_state.py graph apply --session-id session-1-coordinator --lane x --current-node review --event ACTIONABLE_FINDINGS",
+            "python3 hooks/orchestration_state.py claim acquire --session-id session-1-coordinator --lane x --expected-revision 1 --json {}",
+            "python3 hooks/orchestration_state.py claim release --session-id session-1-coordinator --lane x --expected-revision 1 --reason delivery_cancellation",
         )
         for command in denied_commands:
             result = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": command})
@@ -368,6 +371,64 @@ class OrchestrationHookTest(unittest.TestCase):
             check=check,
         )
 
+    def claim_payload(
+        self,
+        lane: str,
+        *,
+        issue: int = 1,
+        branch: str | None = None,
+        worktree: str | None = None,
+        domains: list[str] | None = None,
+        owned: list[str] | None = None,
+        shared: list[str] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "repository": "owner/repo",
+            "issue_url": f"https://github.com/owner/repo/issues/{issue}",
+            "lane_task_id": lane,
+            "branch": branch or f"issue-{issue}",
+            "worktree": worktree or str(Path(self.temporary.name) / f"worktree-{issue}"),
+            "decision_domains": domains or [f"domain-{issue}"],
+            "owned_path_prefixes": owned or [f"owned-{issue}/"],
+            "shared_paths": shared or [],
+        }
+
+    def acquire_claim(self, lane: str, payload: dict[str, object]) -> dict[str, object]:
+        revision = int(self.session_state()["state_revision"])
+        return json.loads(self.state_command(
+            "claim", "acquire", "--session-id", "session-1", "--lane", lane,
+            "--expected-revision", str(revision), "--json", json.dumps(payload),
+        ).stdout)
+
+    def make_git_delivery(
+        self, name: str, *, outside_claim: bool = False, changed_name: str | None = None
+    ) -> tuple[Path, str, str, str]:
+        repository = Path(self.temporary.name) / name
+        branch = f"{name}-branch"
+        repository.mkdir()
+        subprocess.run(["git", "init", "-b", branch], cwd=repository, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repository, check=True)
+        (repository / "hooks").mkdir()
+        (repository / "hooks" / "owned.py").write_text("first\n", encoding="utf-8")
+        subprocess.run(["git", "add", "hooks/owned.py"], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True, capture_output=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+            text=True, capture_output=True,
+        ).stdout.strip()
+        changed = repository / (
+            changed_name or ("README.md" if outside_claim else "hooks/owned.py")
+        )
+        changed.write_text("changed\n", encoding="utf-8")
+        subprocess.run(["git", "add", str(changed)], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-m", "change"], cwd=repository, check=True, capture_output=True)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+            text=True, capture_output=True,
+        ).stdout.strip()
+        return repository, branch, base, head
+
     def accept_command(
         self,
         event: str,
@@ -419,6 +480,35 @@ class OrchestrationHookTest(unittest.TestCase):
             "--expected-revision", str(revision), check=check,
         )
 
+    def merge_lane_state(
+        self, pr_url: str, *, head: str = SHA, runner: str = "jiminy-1"
+    ) -> dict[str, object]:
+        generations = {"contract": 0, "base": 0, "head": 0}
+        return {
+            "node": "merge",
+            "repository": "owner/repo",
+            "pr": pr_url,
+            "jiminy_runner_session_id": runner,
+            "proof_lifecycle": {
+                "generations": generations,
+                "observations": {"contract": None, "base": None, "head": head},
+                "bindings": {
+                    name: {"generations": dict(generations), "evidence": {}}
+                    for name in ("review", "ci", "merge_ready")
+                },
+                "invalidation_history": [],
+            },
+        }
+
+    def set_trusted_lane(self, lane: str, value: dict[str, object]) -> None:
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}):
+            state = orchestration_state.load_state("session-1")
+            self.assertIsNotNone(state)
+            state.setdefault("ledger", {})[lane] = copy.deepcopy(value)
+            orchestration_state.write_state(
+                "session-1", state, expected_revision=int(state["state_revision"])
+            )
+
     def test_read_only_roles_cannot_edit_or_write(self) -> None:
         for index, role in enumerate(("gepetto", "jiminy", "research"), start=1):
             session_id = f"read-only-{index}"
@@ -427,6 +517,61 @@ class OrchestrationHookTest(unittest.TestCase):
                 result = self.hook("PreToolUse", session_id=session_id, tool_name=tool, tool_input={"file_path": "/tmp/x", "content": "y"})
                 self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny", (role, tool))
 
+    def test_read_only_roles_deny_recognized_bash_file_mutations(self) -> None:
+        deeply_nested = "rm hooks/file.py"
+        for _ in range(6):
+            deeply_nested = f"sh -c {shlex.quote(deeply_nested)}"
+        commands = (
+            "cp source hooks/copy.py",
+            "mv hooks/old.py hooks/new.py",
+            "rm hooks/old.py",
+            "touch hooks/new.py",
+            "tee hooks/new.py",
+            "printf value > hooks/new.py",
+            "sed -i.bak s/old/new/ hooks/file.py",
+            "sed -e 's/old/new/' -i '' hooks/file.py",
+            "git checkout -- hooks/file.py",
+            "git -C /tmp/repository checkout -- hooks/file.py",
+            "git config user.name attacker",
+            "git notes add -m x HEAD",
+            "git update-ref refs/heads/main HEAD",
+            "git symbolic-ref HEAD refs/heads/other",
+            "git symbolic-ref --delete refs/heads/other",
+            "git reflog expire --expire=now --all",
+            "git reflog delete HEAD@{0}",
+            "git pack-refs --all",
+            "git fetch origin",
+            "git remote add attacker https://example.test/repository.git",
+            "sh -c 'rm hooks/file.py'",
+            "bash -lc 'mv hooks/old.py hooks/new.py'",
+            "eval 'rm hooks/file.py'",
+            deeply_nested,
+            "perl -pi -e 's/old/new/' hooks/file.py",
+            "perl -e 's/old/new/' -pi hooks/file.py",
+            "sed -ni '' 's/old/new/' hooks/file.py",
+            "find hooks -name '*.tmp' -delete",
+        )
+        for index, role in enumerate(("gepetto", "jiminy", "research"), start=1):
+            session_id = f"bash-read-only-{index}"
+            self.register(role, session_id=session_id)
+            for command in commands:
+                with self.subTest(role=role, command=command):
+                    result = self.hook(
+                        "PreToolUse", session_id=session_id, tool_name="Bash",
+                        tool_input={"command": command},
+                    )
+                    self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIsNone(self.hook(
+                "PreToolUse", session_id=session_id, tool_name="Bash",
+                tool_input={
+                    "command": (
+                        "git diff -- hooks/file.py && "
+                        "git symbolic-ref HEAD && git reflog show -1 && "
+                        "sed -n '1,20p' hooks/file.py"
+                    )
+                },
+            ))
+
     def test_implementation_can_edit_and_write(self) -> None:
         self.register("implementation")
         for tool in ("Edit", "Write"):
@@ -434,8 +579,21 @@ class OrchestrationHookTest(unittest.TestCase):
 
     def test_api_merge_is_denied_even_for_authorized_jiminy(self) -> None:
         self.register("jiminy", "--merge-authorized")
-        rest = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "gh api repos/o/r/pulls/1/merge -X PUT"})
-        self.assertEqual(rest["hookSpecificOutput"]["permissionDecision"], "deny")
+        for command in (
+            "gh api repos/o/r/pulls/1/merge -X PUT",
+            '"gh" "api" repos/o/r/pulls/1/merge -X PUT',
+            r"g\h a\p\i repos/o/r/pulls/1/merge -X PUT",
+            'sh -c \'"gh" "api" repos/o/r/pulls/1/merge -X PUT\'',
+            'eval \'"gh" "api" repos/o/r/pulls/1/merge -X PUT\'',
+            "gh --hostname github.com api repos/o/r/pulls/1/merge -X PUT",
+        ):
+            with self.subTest(command=command):
+                rest = self.hook(
+                    "PreToolUse", tool_name="Bash", tool_input={"command": command}
+                )
+                self.assertEqual(
+                    rest["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
         graphql = self.hook(
             "PreToolUse",
             tool_name="Bash",
@@ -492,21 +650,305 @@ class OrchestrationHookTest(unittest.TestCase):
 
     def test_ledger_move_transfers_lane_and_leaves_tombstone(self) -> None:
         self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="lane-old"
+        )
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "lane-old",
             "--json", '{"role":"review","node":"review","cycles":2}',
         )
         self.state_command(
+            "continue", "--source-id", "lane-old", "--successor-id", "lane-new"
+        )
+        revision = int(self.session_state()["state_revision"])
+        self.state_command(
             "ledger", "move", "--session-id", "session-1",
             "--from-lane", "lane-old", "--to-lane", "lane-new",
+            "--expected-revision", str(revision),
         )
         shown = json.loads(self.state_command("ledger", "show", "--session-id", "session-1").stdout)
         self.assertEqual(shown["lane-old"], {"tombstone": True, "successor_lane": "lane-new"})
         self.assertEqual(shown["lane-new"]["continued_from"], "lane-old")
         self.assertEqual(shown["lane-new"]["cycles"], 2)
 
+    def test_ledger_move_rejects_stale_revision_and_non_continuation_atomically(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="lane-old"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-old",
+            "--json", json.dumps({
+                "role": "review",
+                "node": "review",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("lane-old", self.claim_payload("lane-old"))
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        revision = int(self.session_state()["state_revision"])
+        before = state_path.read_bytes()
+        unregistered = self.state_command(
+            "ledger", "move", "--session-id", "session-1",
+            "--from-lane", "lane-old", "--to-lane", "unregistered",
+            "--expected-revision", str(revision), check=False,
+        )
+        self.assertEqual(unregistered.returncode, 1)
+        self.assertIn("registered checkpoint continuation", unregistered.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        self.state_command(
+            "continue", "--source-id", "lane-old", "--successor-id", "lane-new"
+        )
+        current_revision = int(self.session_state()["state_revision"])
+        before = state_path.read_bytes()
+        stale = self.state_command(
+            "ledger", "move", "--session-id", "session-1",
+            "--from-lane", "lane-old", "--to-lane", "lane-new",
+            "--expected-revision", str(current_revision - 1), check=False,
+        )
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn("state revision conflict", stale.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_non_overlapping_claims_succeed_and_conflicts_do_not_mutate_state(self) -> None:
+        self.register("gepetto")
+        for lane, issue in (("lane-1", 1), ("lane-2", 2), ("lane-3", 3)):
+            self.register(
+                "implementation", "--coordinator-thread-id", "session-1", session_id=lane
+            )
+            self.state_command(
+                "ledger", "set", "--session-id", "session-1", "--lane", lane,
+                "--json", json.dumps({
+                    "node": "implementation",
+                    "issue": f"https://github.com/owner/repo/issues/{issue}",
+                    "base_sha": "b" * 40,
+                    "head_sha": "b" * 40,
+                    "research_content_ref": "sha256:" + "c" * 64,
+                }),
+            )
+        first_payload = self.claim_payload("lane-1")
+        self.acquire_claim("lane-1", first_payload)
+        unchanged = self.session_state()
+        repeated = self.acquire_claim("lane-1", first_payload)
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(self.session_state(), unchanged)
+        self.acquire_claim("lane-2", self.claim_payload("lane-2", issue=2))
+        before = self.session_state()
+        conflicting = self.claim_payload("lane-3", issue=3, owned=["owned-1/sub/"])
+        blocked = self.state_command(
+            "claim", "acquire", "--session-id", "session-1", "--lane", "lane-3",
+            "--expected-revision", str(before["state_revision"]),
+            "--json", json.dumps(conflicting), check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("path overlap", blocked.stderr)
+        self.assertEqual(self.session_state(), before)
+
+    def test_claim_identity_and_decision_duplicates_fail_atomically(self) -> None:
+        cases = ("issue_url", "branch", "worktree", "decision_domains")
+        for duplicate in cases:
+            with self.subTest(duplicate=duplicate):
+                self.tearDown()
+                self.setUp()
+                self.register("gepetto")
+                for lane, issue in (("lane-1", 1), ("lane-2", 2)):
+                    self.register(
+                        "implementation", "--coordinator-thread-id", "session-1",
+                        session_id=lane,
+                    )
+                    self.state_command(
+                        "ledger", "set", "--session-id", "session-1", "--lane", lane,
+                        "--json", json.dumps({
+                            "node": "implementation",
+                            "issue": f"https://github.com/owner/repo/issues/{issue}",
+                            "base_sha": "b" * 40,
+                            "head_sha": "b" * 40,
+                            "research_content_ref": "sha256:" + "c" * 64,
+                        }),
+                    )
+                first = self.claim_payload("lane-1")
+                self.acquire_claim("lane-1", first)
+                second = self.claim_payload("lane-2", issue=2)
+                second[duplicate] = first[duplicate]
+                if duplicate == "issue_url":
+                    # The trusted lane issue must match before duplicate detection.
+                    self.state_command(
+                        "ledger", "set", "--session-id", "session-1", "--lane", "lane-2",
+                        "--json", json.dumps({"issue": first["issue_url"]}),
+                    )
+                before = self.session_state()
+                blocked = self.state_command(
+                    "claim", "acquire", "--session-id", "session-1", "--lane", "lane-2",
+                    "--expected-revision", str(before["state_revision"]),
+                    "--json", json.dumps(second), check=False,
+                )
+                self.assertEqual(blocked.returncode, 1)
+                self.assertEqual(self.session_state(), before)
+
+    def test_path_overlap_requires_the_same_bilateral_shared_boundary(self) -> None:
+        for first_shared, second_shared, succeeds in (
+            ([], ["owned/sub"], False),
+            (["owned"], ["owned/sub"], False),
+            (["owned/sub"], ["owned/sub"], True),
+        ):
+            with self.subTest(first=first_shared, second=second_shared):
+                self.tearDown()
+                self.setUp()
+                self.register("gepetto")
+                for lane, issue in (("lane-1", 1), ("lane-2", 2)):
+                    self.register(
+                        "implementation", "--coordinator-thread-id", "session-1",
+                        session_id=lane,
+                    )
+                    self.state_command(
+                        "ledger", "set", "--session-id", "session-1", "--lane", lane,
+                        "--json", json.dumps({
+                            "node": "implementation",
+                            "issue": f"https://github.com/owner/repo/issues/{issue}",
+                            "base_sha": "b" * 40,
+                            "head_sha": "b" * 40,
+                            "research_content_ref": "sha256:" + "c" * 64,
+                        }),
+                    )
+                self.acquire_claim(
+                    "lane-1", self.claim_payload(
+                        "lane-1", owned=["owned/"], shared=first_shared,
+                    ),
+                )
+                before = self.session_state()
+                result = self.state_command(
+                    "claim", "acquire", "--session-id", "session-1", "--lane", "lane-2",
+                    "--expected-revision", str(before["state_revision"]),
+                    "--json", json.dumps(self.claim_payload(
+                        "lane-2", issue=2, owned=["owned/sub/"], shared=second_shared,
+                    )), check=succeeds,
+                )
+                if succeeds:
+                    self.assertEqual(result.returncode, 0)
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(self.session_state(), before)
+
+    def test_claim_releases_only_for_authorized_lifecycle_events(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="lane-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("lane-1", self.claim_payload("lane-1"))
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", '{"review_fix_cycles":1}',
+        )
+        self.assertIn("lane-1", self.session_state()["ownership_claims"])
+        before = self.session_state()
+        premature = self.state_command(
+            "claim", "release", "--session-id", "session-1", "--lane", "lane-1",
+            "--expected-revision", str(before["state_revision"]),
+            "--reason", "verified_handoff", check=False,
+        )
+        self.assertEqual(premature.returncode, 1)
+        self.assertEqual(self.session_state(), before)
+
+        self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "implementation", "--event", "DELIVERY_CANCELLED",
+        )
+        after = self.session_state()
+        self.assertNotIn("lane-1", after["ownership_claims"])
+        self.assertEqual(
+            after["ownership_claim_history"][-1]["release_reason"],
+            "delivery_cancellation",
+        )
+
+    def test_public_release_cannot_release_review_claim_before_review_handoff(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="lane-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", json.dumps({
+                "node": "review",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("lane-1", self.claim_payload("lane-1"))
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        revision = int(self.session_state()["state_revision"])
+        before = state_path.read_bytes()
+        blocked = self.state_command(
+            "claim", "release", "--session-id", "session-1", "--lane", "lane-1",
+            "--expected-revision", str(revision), "--reason", "verified_handoff",
+            check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("only atomically with accepted handoff proof", blocked.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_stale_same_lane_claim_is_atomically_superseded_after_invalidation(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="lane-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        payload = self.claim_payload("lane-1")
+        self.acquire_claim("lane-1", payload)
+        revision = int(self.session_state()["state_revision"])
+        self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "implementation", "--event", "MATERIAL_CONTRACT_CHANGED",
+            "--expected-revision", str(revision), "--context-json", json.dumps({
+                "observation": "sha256:" + "d" * 64,
+                "reason": "approved replacement contract",
+            }),
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", '{"node":"implementation"}',
+        )
+
+        replacement = self.acquire_claim("lane-1", payload)
+
+        state = self.session_state()
+        self.assertFalse(replacement["idempotent"])
+        self.assertEqual(state["ownership_claims"]["lane-1"]["generations"]["contract"], 1)
+        self.assertEqual(state["ownership_claim_history"][-1]["status"], "superseded")
+        self.assertEqual(
+            state["ownership_claim_history"][-1]["superseded_reason"],
+            "proof_invalidation",
+        )
+
     def test_graph_apply_atomically_enforces_and_increments_review_cycle(self) -> None:
         self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
             "--json", '{"node":"review","review_fix_cycles":2}',
@@ -518,6 +960,20 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(applied["transition_id"], "review-found-issues")
         self.assertEqual(applied["state"]["node"], "fixer")
         self.assertEqual(applied["state"]["review_fix_cycles"], 3)
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
+            "--json", json.dumps({
+                "node": "merge", "review_fix_cycles": 2,
+                "jiminy_runner_session_id": "jiminy-1",
+            }),
+        )
+        recovered = json.loads(self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-lane",
+            "--current-node", "merge", "--event", "ACTIONABLE_FINDINGS",
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertEqual(recovered["state"]["node"], "fixer")
+        self.assertEqual(recovered["state"]["review_fix_cycles"], 3)
         self.state_command(
             "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
             "--json", '{"node":"review"}',
@@ -566,6 +1022,242 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(receipt["observed_pr_head_sha"], SHA)
         self.assertRegex(receipt["packet_digest"], r"^sha256:[0-9a-f]{64}$")
         self.assertIsInstance(receipt["timestamp"], int)
+
+    def test_implementation_acceptance_verifies_complete_claimed_diff_and_releases_on_handoff(self) -> None:
+        repository, branch, base, head = self.make_git_delivery("claimed")
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": base,
+                "head_sha": base,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload(
+            "impl-1", branch=branch, worktree=str(repository), owned=["hooks/"],
+        ))
+        packet = valid_packets()["IMPLEMENTATION_PACKET"]
+        packet["pr_head_sha"] = head
+
+        accepted = json.loads(self.accept_command(
+            "IMPLEMENTATION_PACKET", packet, lane="impl-1", actor="impl-1",
+            observed_head=head,
+        ).stdout)
+
+        state = self.session_state()
+        self.assertEqual(accepted["state"]["node"], "review")
+        evidence = accepted["state"]["proof_lifecycle"]["bindings"]["implementation"]["evidence"]
+        self.assertEqual(evidence["changed_files"], ["hooks/owned.py"])
+        self.assertNotIn("impl-1", state["ownership_claims"])
+        self.assertEqual(
+            state["ownership_claim_history"][-1]["release_reason"], "verified_handoff"
+        )
+
+    def test_out_of_claim_diff_returns_to_research_without_accepting_packet(self) -> None:
+        repository, branch, base, head = self.make_git_delivery(
+            "outside", outside_claim=True
+        )
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": base,
+                "head_sha": base,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload(
+            "impl-1", branch=branch, worktree=str(repository), owned=["hooks/"],
+        ))
+        before = self.session_state()
+        packet = valid_packets()["IMPLEMENTATION_PACKET"]
+        packet["pr_head_sha"] = head
+
+        blocked = self.accept_command(
+            "IMPLEMENTATION_PACKET", packet, lane="impl-1", actor="impl-1",
+            observed_head=head, check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 1)
+        after = self.session_state()
+        lane = after["ledger"]["impl-1"]
+        self.assertEqual(lane["node"], "research")
+        self.assertEqual(lane["resume_node"], "implementation")
+        self.assertNotIn("acceptance_receipts", lane)
+        self.assertEqual(lane["ownership_boundary_failures"][-1]["changed_files"], ["README.md"])
+        self.assertIn("impl-1", after["ownership_claims"])
+        self.assertEqual(
+            lane["proof_lifecycle"]["bindings"],
+            before["ledger"]["impl-1"]["proof_lifecycle"]["bindings"],
+        )
+
+    def test_lossy_or_non_schema_git_names_are_recorded_as_out_of_claim(self) -> None:
+        for index, changed_name in enumerate(
+            ("hooks\\outside.py", " hooks.py", "README file.md", "snowman-☃.md"),
+            start=1,
+        ):
+            with self.subTest(changed_name=changed_name):
+                self.tearDown()
+                self.setUp()
+                repository, branch, base, head = self.make_git_delivery(
+                    f"unusual-{index}", changed_name=changed_name
+                )
+                self.register("gepetto")
+                self.register(
+                    "implementation", "--coordinator-thread-id", "session-1",
+                    session_id="impl-1",
+                )
+                self.state_command(
+                    "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+                    "--json", json.dumps({
+                        "node": "implementation",
+                        "issue": "https://github.com/owner/repo/issues/1",
+                        "base_sha": base,
+                        "head_sha": base,
+                        "research_content_ref": "sha256:" + "c" * 64,
+                    }),
+                )
+                self.acquire_claim("impl-1", self.claim_payload(
+                    "impl-1", branch=branch, worktree=str(repository), owned=["hooks/"],
+                ))
+                packet = valid_packets()["IMPLEMENTATION_PACKET"]
+                packet["pr_head_sha"] = head
+
+                blocked = self.accept_command(
+                    "IMPLEMENTATION_PACKET", packet, lane="impl-1", actor="impl-1",
+                    observed_head=head, check=False,
+                )
+
+                self.assertEqual(blocked.returncode, 1)
+                lane = self.session_state()["ledger"]["impl-1"]
+                self.assertEqual(lane["node"], "research")
+                self.assertEqual(
+                    lane["ownership_boundary_failures"][-1]["changed_files"],
+                    [changed_name],
+                )
+
+    def test_review_acceptance_releases_fixer_claim_on_verified_handoff(self) -> None:
+        self.register("gepetto")
+        self.register("review", "--coordinator-thread-id", "session-1", session_id="review-1")
+        self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1")
+        packet = valid_packets()["REVIEW_PACKET"]
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-1",
+            "--json", json.dumps({
+                "node": "review",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "pr": packet["pr_url"],
+                "base_sha": "b" * 40,
+                "head_sha": SHA,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("review-1", self.claim_payload("review-1"))
+
+        accepted = json.loads(self.accept_command(
+            "REVIEW_PACKET", packet, lane="review-1",
+            actor="review-1", observed_head=SHA, runner="jiminy-1",
+        ).stdout)
+
+        state = self.session_state()
+        self.assertEqual(accepted["state"]["node"], "merge")
+        self.assertNotIn("review-1", state["ownership_claims"])
+        self.assertEqual(
+            state["ownership_claim_history"][-1]["release_reason"], "verified_handoff"
+        )
+
+    def test_review_acceptance_derives_missing_repository_from_validated_pr(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-1"
+        )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        packet = valid_packets()["REVIEW_PACKET"]
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-1",
+            "--json", json.dumps({
+                "node": "review", "pr": packet["pr_url"], "head_sha": SHA,
+            }),
+        )
+
+        accepted = json.loads(self.accept_command(
+            "REVIEW_PACKET", packet, lane="review-1", actor="review-1",
+            observed_head=SHA, runner="jiminy-1",
+        ).stdout)
+
+        self.assertEqual(accepted["state"]["repository"], "owner/repo")
+
+    def test_review_acceptance_rejects_conflicting_repository_atomically(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-1"
+        )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        packet = valid_packets()["REVIEW_PACKET"]
+        self.set_trusted_lane("review-1", {
+            "node": "review", "repository": "other/repo",
+            "pr": packet["pr_url"], "head_sha": SHA,
+        })
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+
+        rejected = self.accept_command(
+            "REVIEW_PACKET", packet, lane="review-1", actor="review-1",
+            observed_head=SHA, runner="jiminy-1", check=False,
+        )
+
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("outside the persisted lane repository", rejected.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_versioned_delivery_rejects_missing_ownership_claim(self) -> None:
+        self.register("gepetto")
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "session-1",
+            "--json", '{"node":"research"}',
+        )
+        self.accept_command(
+            "RESEARCH_PACKET", valid_packets()["RESEARCH_PACKET"],
+            lane="session-1", actor="session-1",
+        )
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+
+        blocked = self.accept_command(
+            "IMPLEMENTATION_PACKET", valid_packets()["IMPLEMENTATION_PACKET"],
+            lane="impl-1", actor="impl-1", observed_head=SHA, check=False,
+        )
+
+        self.assertEqual(blocked.returncode, 1)
+        lane = self.session_state()["ledger"]["impl-1"]
+        self.assertEqual(lane["node"], "research")
+        self.assertIn("no authoritative ownership claim", lane["ownership_boundary_failures"][-1]["reason"])
 
     def test_graph_accept_failures_leave_state_byte_for_byte_unchanged(self) -> None:
         wrong_version = valid_packets()["IMPLEMENTATION_PACKET"]
@@ -1022,15 +1714,16 @@ class OrchestrationHookTest(unittest.TestCase):
 
     def test_graph_accept_binds_and_preserves_jiminy_runner(self) -> None:
         self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-lane"
+        )
         self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1")
         self.register("jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-2")
-        self.state_command(
-            "ledger", "set", "--session-id", "session-1", "--lane", "review-lane",
-            "--json", json.dumps({
-                "node": "merge", "head_sha": SHA,
-                "pr": valid_packets()["JIMINY_PR_RESULT"]["pr_url"],
-            }),
+        lane_state = self.merge_lane_state(
+            valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
         )
+        lane_state.pop("jiminy_runner_session_id")
+        self.set_trusted_lane("review-lane", lane_state)
         state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
         before = state_path.read_bytes()
         unbound = self.accept_command(
@@ -1056,6 +1749,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.state_command("continue", "--source-id", "jiminy-1", "--successor-id", "jiminy-3")
         ready = merge_ready_packet()
         ready["coordinator_thread_id"] = "session-1"
+        ready["pull_requests"][0]["reviewer_task_id"] = "review-lane"
         revision = int(self.session_state()["state_revision"])
         self.state_command(
             "graph", "ready", "--session-id", "session-1", "--lane", "review-lane",
@@ -1067,6 +1761,220 @@ class OrchestrationHookTest(unittest.TestCase):
             lane="review-lane", actor="jiminy-3",
         ).stdout)
         self.assertEqual(accepted["state"]["jiminy_runner_session_id"], "jiminy-3")
+
+    def test_graph_ready_uses_exact_reviewer_lane_despite_historical_same_pr_lane(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-1"
+        )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        pr_url = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
+        self.set_trusted_lane("implementation-1", {
+            "node": "review", "repository": "owner/repo", "pr": pr_url,
+        })
+        historical_lane = self.merge_lane_state(pr_url)
+        historical_lane.pop("repository")
+        self.set_trusted_lane("review-1", historical_lane)
+        ready = merge_ready_packet()
+        ready["coordinator_thread_id"] = "session-1"
+        monitoring = copy.deepcopy(ready)
+        monitoring["merge_authority"] = "monitoring-only"
+        revision = int(self.session_state()["state_revision"])
+        self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(monitoring),
+            "--runner-session-id", "jiminy-1",
+        )
+        monitored = self.session_state()
+        self.assertEqual(monitored["ledger"]["review-1"]["repository"], "owner/repo")
+        self.assertNotIn(pr_url, monitored.get("merge_authorities", {}))
+
+        # Recreate the historical state produced by the former compatibility
+        # path: the expected set exists, but the protected repository does not.
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}):
+            state = orchestration_state.load_state("session-1")
+            state["ledger"]["review-1"].pop("repository")
+            orchestration_state.write_state(
+                "session-1", state, expected_revision=int(state["state_revision"])
+            )
+        revision = int(self.session_state()["state_revision"])
+        retried_monitoring = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(monitoring),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertFalse(retried_monitoring["idempotent"])
+        monitored = self.session_state()
+        self.assertEqual(monitored["ledger"]["review-1"]["repository"], "owner/repo")
+        self.assertNotIn(pr_url, monitored.get("merge_authorities", {}))
+
+        revision = int(monitored["state_revision"])
+        self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        )
+        authority = self.session_state()["merge_authorities"][pr_url]
+        self.assertEqual(authority["lane"], "review-1")
+        self.assertEqual(authority["repository"], "owner/repo")
+
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}):
+            state = orchestration_state.load_state("session-1")
+            state["ledger"]["review-1"].pop("repository")
+            state["merge_authorities"].pop(pr_url)
+            orchestration_state.write_state(
+                "session-1", state, expected_revision=int(state["state_revision"])
+            )
+        revision = int(self.session_state()["state_revision"])
+        repaired = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertFalse(repaired["idempotent"])
+        repaired_state = self.session_state()
+        self.assertEqual(repaired_state["ledger"]["review-1"]["repository"], "owner/repo")
+        self.assertEqual(repaired_state["merge_authorities"][pr_url]["lane"], "review-1")
+
+        with patch.dict(os.environ, {"CODEX_ORCHESTRATION_STATE_DIR": self.temporary.name}):
+            state = orchestration_state.load_state("session-1")
+            state["merge_authorities"].pop(pr_url)
+            orchestration_state.write_state(
+                "session-1", state, expected_revision=int(state["state_revision"])
+            )
+        revision = int(self.session_state()["state_revision"])
+        restored = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertFalse(restored["idempotent"])
+
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        revision = int(self.session_state()["state_revision"])
+        complete = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+            "--expected-revision", str(revision), "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertTrue(complete["idempotent"])
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_graph_ready_rejects_spoofed_or_stale_reviewer_mappings_atomically(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "review", "--coordinator-thread-id", "session-1", session_id="review-1"
+        )
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1",
+            session_id="implementation-spoof",
+        )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        self.register("gepetto", session_id="foreign-coordinator")
+        self.register(
+            "review", "--coordinator-thread-id", "foreign-coordinator",
+            session_id="foreign-review",
+        )
+        pr_url = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
+        valid_lane = self.merge_lane_state(pr_url)
+        self.set_trusted_lane("review-1", valid_lane)
+        self.set_trusted_lane("implementation-spoof", valid_lane)
+        foreign_lane = self.merge_lane_state("https://github.com/owner/repo/pull/3")
+        self.set_trusted_lane("foreign-review", foreign_lane)
+
+        def rejected(packet: dict[str, object], message: str) -> None:
+            state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+            before = state_path.read_bytes()
+            result = self.state_command(
+                "graph", "ready", "--session-id", "session-1", "--lane", "review-1",
+                "--expected-revision", str(self.session_state()["state_revision"]),
+                "--packet-json", json.dumps(packet),
+                "--runner-session-id", "jiminy-1", check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(message, result.stderr)
+            self.assertEqual(state_path.read_bytes(), before)
+
+        missing = merge_ready_packet()
+        missing["coordinator_thread_id"] = "session-1"
+        missing["pull_requests"][0]["reviewer_task_id"] = "missing-reviewer"
+        rejected(missing, "does not identify its review lane")
+
+        spoofed = merge_ready_packet()
+        spoofed["coordinator_thread_id"] = "session-1"
+        second = copy.deepcopy(spoofed["pull_requests"][0])
+        second["pr_url"] = "https://github.com/owner/repo/pull/3"
+        second["branch"] = "issue-3"
+        second["reviewer_task_id"] = "implementation-spoof"
+        spoofed["pull_requests"].append(second)
+        spoofed["expected_pr_urls"].append(second["pr_url"])
+        spoofed["merge_order"].append(second["pr_url"])
+        rejected(spoofed, "not a registered review task")
+
+        foreign = copy.deepcopy(spoofed)
+        foreign["pull_requests"][1]["reviewer_task_id"] = "foreign-review"
+        rejected(foreign, "reviewer coordinator mismatch")
+
+        duplicate = copy.deepcopy(spoofed)
+        duplicate["pull_requests"][1]["reviewer_task_id"] = "review-1"
+        rejected(duplicate, "duplicate JIMINY_READY reviewer mapping")
+
+        wrong_head = merge_ready_packet()
+        wrong_head["coordinator_thread_id"] = "session-1"
+        wrong_head["pull_requests"][0]["reviewed_head_sha"] = "b" * 40
+        rejected(wrong_head, "head does not match current lane proof")
+
+        for gate, value in (
+            ("review_packet_verified", False),
+            ("required_checks_green", False),
+            ("approvals_satisfied", False),
+            ("approvals_satisfied", "unknown"),
+            ("mergeable", False),
+            ("mergeable", "unknown"),
+            ("unresolved_required_threads", 1),
+            ("unresolved_required_threads", "unknown"),
+        ):
+            with self.subTest(gate=gate, value=value):
+                unsatisfied = merge_ready_packet()
+                unsatisfied["coordinator_thread_id"] = "session-1"
+                unsatisfied["pull_requests"][0]["gates"][gate] = value
+                rejected(unsatisfied, "every merge gate")
+
+        for update, message in (
+            ({"pr": "https://github.com/owner/repo/pull/3"}, "PR does not match"),
+            ({"pr": "not-a-pull-url"}, "raw live GitHub pull URL"),
+            ({"repository": "other/repo"}, "repository does not match"),
+            ({"repository": None}, "invalid repository"),
+            ({"node": "review"}, "can bind only at merge"),
+        ):
+            changed = copy.deepcopy(valid_lane)
+            changed.update(update)
+            self.set_trusted_lane("review-1", changed)
+            packet = merge_ready_packet()
+            packet["coordinator_thread_id"] = "session-1"
+            rejected(packet, message)
+            self.set_trusted_lane("review-1", valid_lane)
+
+        missing_repository = copy.deepcopy(valid_lane)
+        missing_repository.pop("repository")
+        self.set_trusted_lane("review-1", missing_repository)
+        wrong_repository = merge_ready_packet()
+        wrong_repository["coordinator_thread_id"] = "session-1"
+        wrong_repository["repository"] = "other/repo"
+        rejected(wrong_repository, "repository does not match")
+        self.set_trusted_lane("review-1", valid_lane)
+
+        stale = copy.deepcopy(valid_lane)
+        stale["proof_lifecycle"]["bindings"]["review"]["generations"]["head"] = 1
+        self.set_trusted_lane("review-1", stale)
+        packet = merge_ready_packet()
+        packet["coordinator_thread_id"] = "session-1"
+        rejected(packet, "current-generation")
 
     def test_graph_accept_concurrent_expected_revision_has_one_winner(self) -> None:
         self.register("gepetto")
@@ -1110,15 +2018,13 @@ class OrchestrationHookTest(unittest.TestCase):
         self.register(
             "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
         )
-        self.state_command(
-            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
-            "--json", json.dumps({
-                "node": "implementation",
-                "base_sha": "c" * 40,
-                "pr": valid_packets()["IMPLEMENTATION_PACKET"]["pr_url"],
-                "research_content_ref": "sha256:" + ("c" * 64),
-            }),
-        )
+        self.set_trusted_lane("impl-1", {
+            "node": "implementation",
+            "base_sha": "c" * 40,
+            "pr": valid_packets()["IMPLEMENTATION_PACKET"]["pr_url"],
+            "repository": "owner/repo",
+            "research_content_ref": "sha256:" + ("c" * 64),
+        })
         implementation = valid_packets()["IMPLEMENTATION_PACKET"]
         self.accept_command(
             "IMPLEMENTATION_PACKET", implementation,
@@ -1127,6 +2033,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.state_command(
             "ledger", "move", "--session-id", "session-1",
             "--from-lane", "impl-1", "--to-lane", "review-1",
+            "--expected-revision", str(self.session_state()["state_revision"]),
         )
         review = valid_packets()["REVIEW_PACKET"]
         self.accept_command(
@@ -1459,6 +2366,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.state_command(
             "ledger", "move", "--session-id", "session-1",
             "--from-lane", "review-old", "--to-lane", "review-new",
+            "--expected-revision", str(self.session_state()["state_revision"]),
         )
 
         before = state_path.read_bytes()
@@ -1692,21 +2600,18 @@ class OrchestrationHookTest(unittest.TestCase):
         pr_one = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
         pr_two = "https://github.com/owner/repo/pull/3"
         for lane, pr_url in (("lane-1", pr_one), ("lane-2", pr_two)):
-            self.state_command(
-                "ledger", "set", "--session-id", "session-1", "--lane", lane,
-                "--json", json.dumps({
-                    "node": "merge",
-                    "head_sha": SHA,
-                    "pr": pr_url,
-                    "jiminy_runner_session_id": "jiminy-1",
-                }),
+            self.register(
+                "review", "--coordinator-thread-id", "session-1", session_id=lane
             )
+            self.set_trusted_lane(lane, self.merge_lane_state(pr_url))
 
         ready = merge_ready_packet()
         ready["coordinator_thread_id"] = "session-1"
+        ready["pull_requests"][0]["reviewer_task_id"] = "lane-1"
         second = json.loads(json.dumps(ready["pull_requests"][0]))
         second["pr_url"] = pr_two
         second["branch"] = "issue-2"
+        second["reviewer_task_id"] = "lane-2"
         ready["pull_requests"].append(second)
         ready["expected_pr_urls"] = [pr_one, pr_two]
         ready["merge_order"] = [pr_one, pr_two]
@@ -1773,6 +2678,70 @@ class OrchestrationHookTest(unittest.TestCase):
             }),
         ).stdout)
         self.assertEqual(verified["state"]["node"], "integration_verification")
+
+    def test_replacing_aggregate_ready_revokes_removed_pr_authority_atomically(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        pr_one = valid_packets()["JIMINY_PR_RESULT"]["pr_url"]
+        pr_two = "https://github.com/owner/repo/pull/3"
+        for lane, pr_url in (("lane-1", pr_one), ("lane-2", pr_two)):
+            self.register(
+                "review", "--coordinator-thread-id", "session-1", session_id=lane
+            )
+            self.set_trusted_lane(lane, self.merge_lane_state(pr_url))
+
+        aggregate = merge_ready_packet()
+        aggregate["coordinator_thread_id"] = "session-1"
+        aggregate["pull_requests"][0]["reviewer_task_id"] = "lane-1"
+        second = copy.deepcopy(aggregate["pull_requests"][0])
+        second.update({
+            "pr_url": pr_two,
+            "branch": "issue-2",
+            "reviewer_task_id": "lane-2",
+        })
+        aggregate["pull_requests"].append(second)
+        aggregate["expected_pr_urls"] = [pr_one, pr_two]
+        aggregate["merge_order"] = [pr_one, pr_two]
+        for lane in ("lane-1", "lane-2"):
+            self.state_command(
+                "graph", "ready", "--session-id", "session-1", "--lane", lane,
+                "--expected-revision", str(self.session_state()["state_revision"]),
+                "--packet-json", json.dumps(aggregate),
+                "--runner-session-id", "jiminy-1",
+            )
+        self.assertEqual(
+            set(self.session_state()["merge_authorities"]), {pr_one, pr_two}
+        )
+
+        replacement = merge_ready_packet()
+        replacement["coordinator_thread_id"] = "session-1"
+        replacement["pull_requests"][0]["reviewer_task_id"] = "lane-1"
+        self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "lane-1",
+            "--expected-revision", str(self.session_state()["state_revision"]),
+            "--packet-json", json.dumps(replacement),
+            "--runner-session-id", "jiminy-1",
+        )
+        state = self.session_state()
+        self.assertEqual(set(state["merge_authorities"]), {pr_one})
+        evidence = (
+            state["ledger"]["lane-1"]["proof_lifecycle"]["bindings"]
+            ["expected_merge_set"]["evidence"]
+        )
+        self.assertEqual(evidence["expected_pr_urls"], [pr_one])
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        stale_retry = self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "lane-2",
+            "--expected-revision", str(state["state_revision"]),
+            "--packet-json", json.dumps(aggregate),
+            "--runner-session-id", "jiminy-1", check=False,
+        )
+        self.assertEqual(stale_retry.returncode, 1)
+        self.assertIn("superseded JIMINY_READY", stale_retry.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_block_and_resume_capture_trusted_source_node_atomically(self) -> None:
         self.register("gepetto")
@@ -1923,6 +2892,7 @@ class OrchestrationHookTest(unittest.TestCase):
             {"resume_node": "merge"},
             {"expected_pr_urls": ["https://example.test/pr/1"]},
             {"merge_ready": True},
+            {"repository": "owner/repo"},
         ):
             with self.subTest(update=update):
                 result = self.state_command(
@@ -2259,16 +3229,167 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(verified["coordinator_thread_id"], "session-3")
         self.assertTrue(verified["verified"])
 
-    def test_merge_requires_authorized_jiminy_and_bound_head(self) -> None:
+    def test_merge_requires_exact_coordinator_repository_pr_and_head_authority(self) -> None:
         self.register("jiminy")
-        denied = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": f"gh pr merge 1 --squash --match-head-commit {SHA}"})
+        denied = self.hook("PreToolUse", tool_name="Bash", tool_input={
+            "command": f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"
+        })
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
 
         self.register("jiminy", "--merge-authorized", session_id="authorized-jiminy")
-        unbound = self.hook("PreToolUse", session_id="authorized-jiminy", tool_name="Bash", tool_input={"command": "gh pr merge 1 --squash"})
+        unbound = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={"command": f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"},
+        )
         self.assertEqual(unbound["hookSpecificOutput"]["permissionDecision"], "deny")
-        allowed = self.hook("PreToolUse", session_id="authorized-jiminy", tool_name="Bash", tool_input={"command": f"gh pr merge 1 --squash --match-head-commit {SHA}"})
+        for command in (
+            f'"gh" "pr" "merge" 1 --repo owner/repo --squash --match-head-commit {SHA}',
+            rf"g\h p\r m\e\r\g\e 1 --repo owner/repo --squash --match-head-commit {SHA}",
+            (
+                f"sh -c '\"gh\" \"pr\" \"merge\" 1 --repo owner/repo "
+                f"--squash --match-head-commit {SHA}'"
+            ),
+            (
+                f"eval '\"gh\" \"pr\" \"merge\" 1 --repo owner/repo "
+                f"--squash --match-head-commit {SHA}'"
+            ),
+            (
+                f"gh --repo owner/repo pr merge 1 --squash "
+                f"--match-head-commit {SHA}"
+            ),
+        ):
+            with self.subTest(command=command):
+                quoted_unbound = self.hook(
+                    "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+                    tool_input={"command": command},
+                )
+                self.assertEqual(
+                    quoted_unbound["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+        deeply_nested_merge = (
+            f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"
+        )
+        for _ in range(6):
+            deeply_nested_merge = f"sh -c {shlex.quote(deeply_nested_merge)}"
+        recursion_denied = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={"command": deeply_nested_merge},
+        )
+        self.assertEqual(
+            recursion_denied["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+
+        coordinator_id = "authorized-jiminy-coordinator"
+        coordinator = self.session_state(coordinator_id)
+        generations = {"contract": 0, "base": 0, "head": 0}
+        coordinator["ledger"] = {
+            "lane-1": {
+                "node": "merge",
+                "pr": "https://github.com/owner/repo/pull/1",
+                "repository": "owner/repo",
+                "proof_lifecycle": {
+                    "generations": generations,
+                    "observations": {
+                        "contract": "sha256:" + "c" * 64,
+                        "base": "b" * 40,
+                        "head": SHA,
+                    },
+                    "bindings": {
+                        "expected_merge_set": {
+                            "generations": generations,
+                            "evidence": {"merge_authority": "merge"},
+                        },
+                    },
+                    "invalidation_history": [],
+                },
+            },
+        }
+        coordinator["merge_authorities"] = {
+            "https://github.com/owner/repo/pull/1": {
+                "repository": "owner/repo",
+                "pr_url": "https://github.com/owner/repo/pull/1",
+                "reviewed_head_sha": SHA,
+                "generations": generations,
+                "runner_session_id": "authorized-jiminy",
+                "lane": "lane-1",
+                "ready_packet_digest": "sha256:" + "d" * 64,
+            },
+        }
+        coordinator_path = Path(self.temporary.name) / "sessions" / f"{coordinator_id}.json"
+        coordinator_path.write_text(json.dumps(coordinator), encoding="utf-8")
+
+        allowed = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={"command": f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"},
+        )
         self.assertIsNone(allowed)
+        quoted_allowed = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={
+                "command": (
+                    f'"gh" "pr" "merge" 1 --repo owner/repo --squash '
+                    f'--match-head-commit {SHA}'
+                )
+            },
+        )
+        self.assertIsNone(quoted_allowed)
+        wrapped_allowed = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={
+                "command": (
+                    f"sh -c '\"gh\" \"pr\" \"merge\" 1 --repo owner/repo "
+                    f"--squash --match-head-commit {SHA}'"
+                )
+            },
+        )
+        self.assertIsNone(wrapped_allowed)
+        global_repo_allowed = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={
+                "command": (
+                    f"gh --repo owner/repo pr merge 1 --squash "
+                    f"--match-head-commit {SHA}"
+                )
+            },
+        )
+        self.assertIsNone(global_repo_allowed)
+        for command in (
+            f"gh pr merge 1 --repo other/repo --squash --match-head-commit {SHA}",
+            f"gh pr merge 2 --repo owner/repo --squash --match-head-commit {SHA}",
+            f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {'b' * 40}",
+            f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA} --match-head-commit {'b' * 40}",
+            f"gh pr merge 1 --repo owner/repo --squash --admin --match-head-commit {SHA}",
+            f"gh pr merge 1 --repo owner/repo --squash --delete-branch --match-head-commit {SHA}",
+            f"gh pr merge 1 --repo owner/repo --squash -d --match-head-commit {SHA}",
+            f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA} && "
+            f"gh pr merge 2 --repo owner/repo --squash --match-head-commit {SHA}",
+        ):
+            with self.subTest(command=command):
+                drifted = self.hook(
+                    "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+                    tool_input={"command": command},
+                )
+                self.assertEqual(drifted["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        coordinator["ledger"]["lane-1"]["jiminy_runner_session_id"] = "authorized-jiminy"
+        coordinator_path.write_text(json.dumps(coordinator), encoding="utf-8")
+        self.state_command(
+            "graph", "apply", "--session-id", coordinator_id, "--lane", "lane-1",
+            "--current-node", "merge", "--event", "DELIVERY_CANCELLED",
+            "--runner-session-id", "authorized-jiminy",
+        )
+        cancelled = self.session_state(coordinator_id)
+        self.assertEqual(cancelled["ledger"]["lane-1"]["node"], "cancelled")
+        self.assertNotIn("https://github.com/owner/repo/pull/1", cancelled["merge_authorities"])
+        after_cancellation = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={
+                "command": f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"
+            },
+        )
+        self.assertEqual(
+            after_cancellation["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
 
     def session_state(self, session_id: str = "session-1") -> dict[str, object]:
         path = Path(self.temporary.name) / "sessions" / f"{session_id}.json"
@@ -2312,6 +3433,91 @@ class OrchestrationHookTest(unittest.TestCase):
         successor = self.session_state("session-2")
         self.assertTrue(successor["context_refs"]["research-artifact"]["ref"].startswith("sha256:"))
         self.assertNotIn("pressure", successor)
+
+    def test_checkpoint_continuation_moves_claim_to_exactly_one_successor(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload("impl-1"))
+
+        self.state_command(
+            "continue", "--source-id", "impl-1", "--successor-id", "impl-2"
+        )
+
+        claims = self.session_state()["ownership_claims"]
+        self.assertNotIn("impl-1", claims)
+        self.assertEqual(claims["impl-2"]["lane_task_id"], "impl-2")
+        self.assertEqual(claims["impl-2"]["transferred_from"], "impl-1")
+
+    def test_claim_transfer_follows_the_active_coordinator_checkpoint_lineage(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload("impl-1"))
+        self.state_command(
+            "continue", "--source-id", "session-1", "--successor-id", "coordinator-2"
+        )
+
+        self.state_command(
+            "continue", "--source-id", "impl-1", "--successor-id", "impl-2"
+        )
+
+        active_claims = self.session_state("coordinator-2")["ownership_claims"]
+        self.assertEqual(list(active_claims), ["impl-2"])
+        self.assertEqual(active_claims["impl-2"]["lane_task_id"], "impl-2")
+
+    def test_interrupted_claim_continuation_recovers_one_active_owner(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "implementation", "--coordinator-thread-id", "session-1", session_id="impl-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "impl-1",
+            "--json", json.dumps({
+                "node": "implementation",
+                "issue": "https://github.com/owner/repo/issues/1",
+                "base_sha": "b" * 40,
+                "head_sha": "b" * 40,
+                "research_content_ref": "sha256:" + "c" * 64,
+            }),
+        )
+        self.acquire_claim("impl-1", self.claim_payload("impl-1"))
+        crash_env = dict(self.env, CODEX_ORCHESTRATION_TEST_CRASH_AFTER="successor")
+        crashed = subprocess.run(
+            [PYTHON, str(STATE), "continue", "--source-id", "impl-1", "--successor-id", "impl-2"],
+            env=crash_env, text=True, capture_output=True,
+        )
+        self.assertEqual(crashed.returncode, 91)
+
+        self.state_command("status")
+
+        claims = self.session_state()["ownership_claims"]
+        self.assertEqual(list(claims), ["impl-2"])
+        self.assertFalse(self.session_state("impl-1")["active"])
+        self.assertTrue(self.session_state("impl-2")["active"])
+        self.assertFalse((Path(self.temporary.name) / "transactions" / "continuation.json").exists())
 
     def test_continue_rejects_same_or_existing_successor_without_mutation(self) -> None:
         self.register("implementation")

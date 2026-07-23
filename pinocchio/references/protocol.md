@@ -10,6 +10,18 @@ python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_st
 
 Content-bind the exact fetched research artifact and repository instruction files with the Gepetto protocol CLI. Load their full text only when `reload_required` is true; otherwise use the recorded `sha256:` refs.
 
+Verify the coordinator-owned claim before writing. Its repository, issue, lane task ID,
+branch, canonical worktree, decision domains, owned prefixes, shared paths, base, and proof
+generation must match the approved dispatch:
+
+```bash
+python3 hooks/orchestration_state.py claim show --session-id <gepetto-task-id> --lane <implementation-task-id>
+```
+
+Only Gepetto acquires, broadens, or releases claims. Pinocchio's final changed-file audit is
+advisory proof; `graph accept` independently resolves and enforces the Git diff from the
+claimed base and live packet head.
+
 ## Persisted proof
 
 Preserve unrelated issue text and idempotently append or replace a `<!-- gepetto-implementation:start -->` … `<!-- gepetto-implementation:end -->` section on the leaf issue. Record branch, base, commit, and live PR head SHAs; PR URL; changed files; exact checks and results; criterion-by-criterion proof; writer handoff; and caveats. Re-read the issue and record its live URL and `updatedAt`.

@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import hashlib
 import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -27,12 +29,22 @@ INVALIDATION_EVENTS = {
 }
 PROTECTED_CONTEXT_KEYS = {
     "acceptance_receipts", "expected_pr_urls", "merge_ready",
+    "ownership_claim_id", "repository", "branch", "worktree",
     "proof_lifecycle", "ready", "resume_node", "reviewed_head_sha",
     "validated_delivery_spec_digest",
+}
+CLAIM_RELEASE_REASONS = {
+    "verified_handoff", "delivery_cancellation", "terminal_completion",
 }
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 CONTENT_REF_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 REVIEW_ATTEMPT_PATTERN = CONTENT_REF_PATTERN
+
+
+class OwnershipBoundaryError(ValueError):
+    def __init__(self, message: str, *, changed_files: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.changed_files = changed_files or []
 
 
 def state_root() -> Path:
@@ -80,7 +92,9 @@ def recover_transactions() -> None:
         journal = json.loads(journal_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return
-    if not isinstance(journal, dict) or journal.get("kind") != "continuation-v1":
+    if not isinstance(journal, dict) or journal.get("kind") not in {
+        "continuation-v1", "continuation-v2",
+    }:
         raise ValueError(f"invalid continuation journal: {journal_path}")
     source_id = _safe_id(str(journal.get("source_id", "")))
     successor_id = _safe_id(str(journal.get("successor_id", "")))
@@ -94,6 +108,19 @@ def recover_transactions() -> None:
         successor,
         expected_revision=(int(current_successor.get("state_revision", 0)) if current_successor else None),
     )
+    if journal["kind"] == "continuation-v2":
+        coordinator_id = _safe_id(str(journal.get("coordinator_id", "")))
+        coordinator_next = journal.get("coordinator_next")
+        if not isinstance(coordinator_next, dict):
+            raise ValueError(f"invalid continuation coordinator payload: {journal_path}")
+        current_coordinator = load_state(coordinator_id)
+        if current_coordinator is None:
+            raise ValueError(f"continuation coordinator disappeared during recovery: {coordinator_id}")
+        write_state(
+            coordinator_id,
+            coordinator_next,
+            expected_revision=int(current_coordinator.get("state_revision", 0)),
+        )
     current_source = load_state(source_id)
     if current_source is None:
         raise ValueError(f"continuation source disappeared during recovery: {source_id}")
@@ -252,35 +279,99 @@ def continue_session(source_id: str, successor_id: str, *, supervised: bool = Fa
     successor["events"] = 0
     successor["last_heartbeat"] = int(time.time())
     successor["restarts"] = source.get("restarts", 0) + (1 if supervised else 0)
+    coordinator_id = source.get("coordinator_thread_id")
+    coordinator_next: dict[str, Any] | None = None
+    coordinator_revision: int | None = None
+    if isinstance(coordinator_id, str):
+        candidate = _safe_id(coordinator_id)
+        visited: set[str] = set()
+        coordinator = None
+        while candidate not in visited:
+            visited.add(candidate)
+            observed = load_state(candidate)
+            if observed and observed.get("role") == "gepetto" and observed.get("active"):
+                coordinator_id = candidate
+                coordinator = observed
+                break
+            next_id = observed.get("successor_id") if observed else None
+            if not isinstance(next_id, str):
+                break
+            candidate = _safe_id(next_id)
+        if coordinator is None:
+            unavailable = load_state(_safe_id(coordinator_id))
+            unavailable_claims = (
+                unavailable.get("ownership_claims") if isinstance(unavailable, dict) else None
+            )
+            if isinstance(unavailable_claims, dict) and source_id in unavailable_claims:
+                raise ValueError(
+                    f"active ownership claim has no available coordinator: {coordinator_id}"
+                )
+            coordinator_id = None
+        if coordinator is None:
+            claims = None
+        else:
+            claims = coordinator.get("ownership_claims")
+        if claims is not None and not isinstance(claims, dict):
+            raise ValueError("invalid ownership claim container in coordinator state")
+        source_claim = claims.get(source_id) if isinstance(claims, dict) else None
+        if source_claim is not None:
+            if not isinstance(source_claim, dict) or source_claim.get("status") != "active":
+                raise ValueError(f"invalid active ownership claim: {source_id}")
+            if successor_id in claims:
+                raise ValueError(f"successor already has an ownership claim: {successor_id}")
+            coordinator_next = copy.deepcopy(coordinator)
+            next_claims = coordinator_next["ownership_claims"]
+            transferred = dict(next_claims.pop(source_id))
+            transferred["lane_task_id"] = successor_id
+            transferred["transferred_from"] = source_id
+            transferred["transferred_at"] = int(time.time())
+            next_claims[successor_id] = transferred
+            coordinator_revision = int(coordinator.get("state_revision", 0))
     journal_path = continuation_journal_path()
-    _write_json_atomic(journal_path, {
-        "kind": "continuation-v1",
+    journal: dict[str, Any] = {
+        "kind": "continuation-v2" if coordinator_next is not None else "continuation-v1",
         "source_id": source_id,
         "successor_id": successor_id,
         "source_next": source_next,
         "successor": successor,
-    })
+    }
+    if coordinator_next is not None:
+        journal.update({
+            "coordinator_id": coordinator_id,
+            "coordinator_next": coordinator_next,
+        })
+    _write_json_atomic(journal_path, journal)
     source_stage: Path | None = None
     successor_stage: Path | None = None
+    coordinator_stage: Path | None = None
+    replacement_started = False
     try:
         source_path_value, source_stage = _stage_state(source_id, source_next, source_revision)
         successor_path_value, successor_stage = _stage_state(successor_id, successor, None)
+        if coordinator_next is not None and isinstance(coordinator_id, str):
+            coordinator_path_value, coordinator_stage = _stage_state(
+                coordinator_id, coordinator_next, coordinator_revision
+            )
+        replacement_started = True
         successor_stage.replace(successor_path_value)
         if os.environ.get("CODEX_ORCHESTRATION_TEST_CRASH_AFTER") == "successor":
             os._exit(91)
-        try:
-            source_stage.replace(source_path_value)
-        except Exception:
-            successor_path_value.unlink(missing_ok=True)
-            raise
+        if coordinator_stage is not None:
+            coordinator_stage.replace(coordinator_path_value)
+        source_stage.replace(source_path_value)
     except Exception:
-        journal_path.unlink(missing_ok=True)
+        # Preserve the journal after any interrupted stage/replace sequence.
+        # The next registry-locked operation completes the same final state.
+        if not replacement_started:
+            journal_path.unlink(missing_ok=True)
         raise
     finally:
         if source_stage is not None:
             source_stage.unlink(missing_ok=True)
         if successor_stage is not None:
             successor_stage.unlink(missing_ok=True)
+        if coordinator_stage is not None:
+            coordinator_stage.unlink(missing_ok=True)
     journal_path.unlink(missing_ok=True)
     os.chmod(source_path_value, stat.S_IRUSR | stat.S_IWUSR)
     os.chmod(successor_path_value, stat.S_IRUSR | stat.S_IWUSR)
@@ -304,6 +395,361 @@ def _dict_container(state: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"invalid {key} container in orchestration state")
     return value
+
+
+def _normalized_string_list(value: Any, name: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"ownership claim {name} must be a non-empty list")
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"ownership claim {name} must contain non-empty strings")
+        normalized.append(item.strip())
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"ownership claim {name} must not contain duplicates")
+    return sorted(normalized)
+
+
+def _normalize_claim(
+    lane: str, payload: dict[str, Any], lane_state: dict[str, Any]
+) -> dict[str, Any]:
+    from orchestration_contract import (
+        normalize_branch,
+        normalize_github_url,
+        normalize_path_prefix,
+        normalize_repository,
+        path_is_owned,
+        repository_from_github_url,
+    )
+
+    expected = {
+        "repository", "issue_url", "lane_task_id", "branch", "worktree",
+        "decision_domains", "owned_path_prefixes", "shared_paths",
+    }
+    if set(payload) != expected:
+        raise ValueError(
+            f"ownership claim must contain exactly: {', '.join(sorted(expected))}"
+        )
+    if payload.get("lane_task_id") != lane:
+        raise ValueError("ownership claim lane_task_id must equal the ledger lane")
+    repository = normalize_repository(str(payload.get("repository", "")))
+    issue_url = normalize_github_url(str(payload.get("issue_url", "")), kind="issue")
+    if repository_from_github_url(issue_url, kind="issue") != repository:
+        raise ValueError("ownership claim issue repository does not match repository")
+    persisted_issue = lane_state.get("issue")
+    if not isinstance(persisted_issue, str) or normalize_github_url(
+        persisted_issue, kind="issue"
+    ) != issue_url:
+        raise ValueError("ownership claim issue does not match the persisted lane issue")
+    branch = normalize_branch(str(payload.get("branch", "")))
+    worktree_value = payload.get("worktree")
+    if not isinstance(worktree_value, str) or not worktree_value.strip():
+        raise ValueError("ownership claim worktree must be an absolute path")
+    worktree_path = Path(worktree_value).expanduser()
+    if not worktree_path.is_absolute():
+        raise ValueError("ownership claim worktree must be an absolute path")
+    worktree = str(worktree_path.resolve())
+    decision_domains = [
+        domain.casefold()
+        for domain in _normalized_string_list(payload.get("decision_domains"), "decision_domains")
+    ]
+    if len(decision_domains) != len(set(decision_domains)):
+        raise ValueError("ownership claim decision_domains collide after normalization")
+    normalized_owned = [
+        normalize_path_prefix(prefix)
+        for prefix in _normalized_string_list(
+            payload.get("owned_path_prefixes"), "owned_path_prefixes"
+        )
+    ]
+    if len(normalized_owned) != len(set(normalized_owned)):
+        raise ValueError("ownership claim owned_path_prefixes collide after normalization")
+    owned = sorted(normalized_owned)
+    shared_value = payload.get("shared_paths")
+    if not isinstance(shared_value, list):
+        raise ValueError("ownership claim shared_paths must be a list")
+    shared = sorted({
+        normalize_path_prefix(prefix)
+        for prefix in shared_value
+        if isinstance(prefix, str) and prefix.strip()
+    })
+    if len(shared) != len(shared_value):
+        raise ValueError("ownership claim shared_paths must contain unique non-empty paths")
+    if any(not path_is_owned(path, owned) for path in shared):
+        raise ValueError("every shared path must be contained by an owned path prefix")
+    lifecycle = _proof_lifecycle(lane_state)
+    return {
+        "status": "active",
+        "repository": repository,
+        "issue_url": issue_url,
+        "lane_task_id": lane,
+        "branch": branch,
+        "worktree": worktree,
+        "decision_domains": decision_domains,
+        "owned_path_prefixes": owned,
+        "shared_paths": shared,
+        "generations": _generation_tuple(lifecycle),
+        "base_sha": lifecycle["observations"].get("base"),
+    }
+
+
+def _claims_conflict(candidate: dict[str, Any], existing: dict[str, Any]) -> str | None:
+    from orchestration_contract import overlapping_path
+
+    if candidate["worktree"] == existing.get("worktree"):
+        return f"worktree is already claimed by {existing.get('lane_task_id')}"
+    if candidate["repository"] != existing.get("repository"):
+        return None
+    for field in ("issue_url", "branch"):
+        if candidate[field] == existing.get(field):
+            return f"{field} is already claimed by {existing.get('lane_task_id')}"
+    duplicate_domains = set(candidate["decision_domains"]) & set(
+        existing.get("decision_domains", [])
+    )
+    if duplicate_domains:
+        return f"decision domains are already claimed: {sorted(duplicate_domains)}"
+    for left in candidate["owned_path_prefixes"]:
+        for right in existing.get("owned_path_prefixes", []):
+            overlap = overlapping_path(left, right)
+            if overlap is None:
+                continue
+            if (
+                overlap not in candidate["shared_paths"]
+                or overlap not in existing.get("shared_paths", [])
+            ):
+                return f"path overlap is not bilaterally shared: {overlap}"
+    return None
+
+
+def acquire_claim(
+    session_id: str,
+    lane: str,
+    expected_revision: int,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    state = load_state(session_id)
+    if state is None or state.get("role") != "gepetto" or not state.get("active"):
+        raise ValueError(f"claim acquisition requires an active Gepetto coordinator: {session_id}")
+    observed_revision = int(state.get("state_revision", 0))
+    if observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
+    lane = _safe_id(lane)
+    ledger = _dict_container(state, "ledger")
+    lane_state = ledger.get(lane)
+    if not isinstance(lane_state, dict) or lane_state.get("tombstone"):
+        raise ValueError(f"no active ledger lane: {lane}")
+    expected_role = {
+        "implementation": "implementation",
+        "review": "review",
+        "fixer": "review",
+    }.get(lane_state.get("node"))
+    if expected_role is None:
+        raise ValueError("ownership claims require an implementation or review writer lane")
+    verify_registration(lane, expected_role, coordinator_thread_id=session_id)
+    candidate = _normalize_claim(lane, payload, lane_state)
+    claims = _dict_container(state, "ownership_claims")
+    state["ownership_claims_required"] = True
+    current = claims.get(lane)
+    if (
+        isinstance(current, dict)
+        and current.get("status") == "active"
+        and all(current.get(key) == value for key, value in candidate.items())
+    ):
+        return {"claim": current, "idempotent": True}
+    stale_current = (
+        isinstance(current, dict)
+        and current.get("status") == "active"
+        and (
+            current.get("generations") != candidate["generations"]
+            or current.get("base_sha") != candidate["base_sha"]
+        )
+    )
+    if current is not None and not stale_current:
+        raise ValueError(f"lane already has a different ownership claim: {lane}")
+    for existing_lane, existing in claims.items():
+        if existing_lane == lane:
+            continue
+        if not isinstance(existing, dict) or existing.get("status") != "active":
+            continue
+        conflict = _claims_conflict(candidate, existing)
+        if conflict:
+            raise ValueError(conflict)
+    if stale_current:
+        history = state.get("ownership_claim_history")
+        if history is None:
+            history = []
+            state["ownership_claim_history"] = history
+        if not isinstance(history, list):
+            raise ValueError("invalid ownership claim history")
+        history.append({
+            **current,
+            "status": "superseded",
+            "superseded_reason": "proof_invalidation",
+            "superseded_at": int(time.time()),
+        })
+    candidate["acquired_at"] = int(time.time())
+    claims[lane] = candidate
+    lane_state["ownership_claim_id"] = lane
+    lane_state["repository"] = candidate["repository"]
+    lane_state["branch"] = candidate["branch"]
+    lane_state["worktree"] = candidate["worktree"]
+    write_state(session_id, state, expected_revision=observed_revision)
+    return {"claim": candidate, "idempotent": False}
+
+
+def _release_claim_in_state(
+    state: dict[str, Any], lane: str, reason: str
+) -> dict[str, Any] | None:
+    if reason not in CLAIM_RELEASE_REASONS:
+        raise ValueError(f"unsupported ownership claim release reason: {reason}")
+    claims = _dict_container(state, "ownership_claims")
+    claim = claims.get(lane)
+    if claim is None:
+        return None
+    if not isinstance(claim, dict) or claim.get("status") != "active":
+        raise ValueError(f"invalid active ownership claim: {lane}")
+    released = dict(claim)
+    released.update({"status": "released", "release_reason": reason, "released_at": int(time.time())})
+    claims.pop(lane)
+    history = state.get("ownership_claim_history")
+    if history is None:
+        history = []
+        state["ownership_claim_history"] = history
+    if not isinstance(history, list):
+        raise ValueError("invalid ownership claim history")
+    history.append(released)
+    return released
+
+
+def _revoke_merge_authorities_for_lane(state: dict[str, Any], lane: str) -> None:
+    authorities = state.get("merge_authorities")
+    if authorities is None:
+        return
+    if not isinstance(authorities, dict):
+        raise ValueError("invalid merge authority container")
+    for pr_url in [
+        pr_url
+        for pr_url, authority in authorities.items()
+        if isinstance(authority, dict) and authority.get("lane") == lane
+    ]:
+        authorities.pop(pr_url)
+
+
+def release_claim(
+    session_id: str, lane: str, expected_revision: int, reason: str
+) -> dict[str, Any]:
+    state = load_state(session_id)
+    if state is None or state.get("role") != "gepetto" or not state.get("active"):
+        raise ValueError(f"claim release requires an active Gepetto coordinator: {session_id}")
+    observed_revision = int(state.get("state_revision", 0))
+    if observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
+    lane = _safe_id(lane)
+    lane_state = _dict_container(state, "ledger").get(lane)
+    if not isinstance(lane_state, dict) or lane_state.get("tombstone"):
+        raise ValueError(f"no active ledger lane: {lane}")
+    if reason == "verified_handoff":
+        raise ValueError(
+            "verified_handoff claims are released only atomically with accepted handoff proof"
+        )
+    elif reason == "delivery_cancellation" and lane_state.get("node") != "cancelled":
+        raise ValueError("delivery_cancellation requires a cancelled lane")
+    elif reason == "terminal_completion" and lane_state.get("node") != "complete":
+        raise ValueError("terminal_completion requires a complete lane")
+    released = _release_claim_in_state(state, lane, reason)
+    if released is None:
+        raise ValueError(f"no active ownership claim: {lane}")
+    write_state(session_id, state, expected_revision=observed_revision)
+    return released
+
+
+def _git_output(worktree: str, *arguments: str) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", worktree, *arguments],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(f"could not verify ownership claim against Git: {detail}")
+    return result.stdout
+
+
+def _verify_implementation_claim(
+    state: dict[str, Any], lane: str, lane_state: dict[str, Any], packet: dict[str, Any]
+) -> list[str]:
+    from orchestration_contract import (
+        normalize_github_url,
+        normalize_repository,
+        path_is_owned,
+        repository_from_github_url,
+    )
+
+    claim_id = lane_state.get("ownership_claim_id")
+    claims = state.get("ownership_claims")
+    if claim_id is None and not (isinstance(claims, dict) and lane in claims):
+        if not state.get("ownership_claims_required"):
+            # Compatibility for lanes already in flight before ownership claims existed.
+            return []
+        raise OwnershipBoundaryError("implementation lane has no authoritative ownership claim")
+    if claim_id != lane or not isinstance(claims, dict):
+        raise OwnershipBoundaryError("implementation lane has no authoritative ownership claim")
+    claim = claims.get(lane)
+    if not isinstance(claim, dict) or claim.get("status") != "active":
+        raise OwnershipBoundaryError("implementation ownership claim is not active")
+    lifecycle = _proof_lifecycle(lane_state)
+    if claim.get("generations") != _generation_tuple(lifecycle):
+        raise OwnershipBoundaryError("implementation ownership claim is from a stale proof generation")
+    base_sha = lifecycle["observations"].get("base")
+    if claim.get("base_sha") != base_sha or not isinstance(base_sha, str):
+        raise OwnershipBoundaryError("implementation ownership claim does not match the current base")
+    issue_url = normalize_github_url(packet["issue_url"], kind="issue")
+    pr_url = normalize_github_url(packet["pr_url"], kind="pull")
+    repository = normalize_repository(claim["repository"])
+    if (
+        issue_url != claim.get("issue_url")
+        or repository_from_github_url(issue_url, kind="issue") != repository
+        or repository_from_github_url(pr_url, kind="pull") != repository
+    ):
+        raise OwnershipBoundaryError("implementation packet is outside the claimed repository or issue")
+    worktree = claim.get("worktree")
+    if not isinstance(worktree, str):
+        raise OwnershipBoundaryError("implementation ownership claim has no canonical worktree")
+    observed_root = _git_output(worktree, "rev-parse", "--show-toplevel").decode().strip()
+    if str(Path(observed_root).resolve()) != worktree:
+        raise OwnershipBoundaryError("implementation worktree identity does not match Git")
+    observed_branch = _git_output(worktree, "branch", "--show-current").decode().strip()
+    if observed_branch != claim.get("branch"):
+        raise OwnershipBoundaryError("implementation branch does not match the ownership claim")
+    observed_head = _git_output(worktree, "rev-parse", "HEAD").decode().strip()
+    if observed_head != packet["pr_head_sha"]:
+        raise OwnershipBoundaryError("implementation worktree HEAD does not match the packet head")
+    raw_paths = _git_output(
+        worktree, "diff", "--name-only", "--no-renames", "-z",
+        f"{base_sha}...{packet['pr_head_sha']}",
+    )
+    try:
+        changed_files = sorted({
+            item.decode("utf-8") for item in raw_paths.split(b"\0") if item
+        })
+    except UnicodeDecodeError as error:
+        raise OwnershipBoundaryError("changed file names must be valid UTF-8") from error
+    outside = [
+        path for path in changed_files
+        if not path_is_owned(path, claim["owned_path_prefixes"])
+    ]
+    if outside:
+        raise OwnershipBoundaryError(
+            f"implementation diff contains out-of-claim files: {outside}",
+            changed_files=changed_files,
+        )
+    return changed_files
 
 
 def _proof_lifecycle(lane_state: dict[str, Any]) -> dict[str, Any]:
@@ -598,10 +1044,18 @@ def ledger_set(session_id: str, lane: str, updates: dict[str, Any]) -> Path:
     return write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
 
 
-def ledger_move(session_id: str, from_lane: str, to_lane: str) -> Path:
+def ledger_move(
+    session_id: str, from_lane: str, to_lane: str, expected_revision: int
+) -> Path:
     state = load_state(session_id)
     if state is None:
         raise ValueError(f"no registered session: {session_id}")
+    observed_revision = int(state.get("state_revision", 0))
+    if observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
     from_lane = _safe_id(from_lane)
     to_lane = _safe_id(to_lane)
     if from_lane == to_lane:
@@ -614,9 +1068,31 @@ def ledger_move(session_id: str, from_lane: str, to_lane: str) -> Path:
         raise ValueError(f"successor ledger lane already exists: {to_lane}")
     successor = dict(source)
     successor["continued_from"] = from_lane
+    claims = state.get("ownership_claims")
+    if claims is not None and not isinstance(claims, dict):
+        raise ValueError("invalid ownership claim container in coordinator state")
+    if isinstance(claims, dict):
+        if from_lane in claims and to_lane in claims:
+            raise ValueError("both ledger source and successor have ownership claims")
+        if from_lane in claims:
+            if not _is_continuation_successor(from_lane, to_lane):
+                raise ValueError(
+                    "ownership claim successor must be a registered checkpoint "
+                    "continuation of the source lane"
+                )
+            claim = claims.pop(from_lane)
+            if not isinstance(claim, dict) or claim.get("status") != "active":
+                raise ValueError(f"invalid active ownership claim: {from_lane}")
+            transferred = dict(claim)
+            transferred["lane_task_id"] = to_lane
+            transferred["transferred_from"] = from_lane
+            transferred["transferred_at"] = int(time.time())
+            claims[to_lane] = transferred
+        if to_lane in claims:
+            successor["ownership_claim_id"] = to_lane
     ledger[to_lane] = successor
     ledger[from_lane] = {"tombstone": True, "successor_lane": to_lane}
-    return write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
+    return write_state(session_id, state, expected_revision=observed_revision)
 
 
 def _is_continuation_successor(source_id: str, successor_id: str) -> bool:
@@ -722,6 +1198,11 @@ def bind_jiminy_ready(
     runner_session_id: str,
 ) -> dict[str, Any]:
     """Persist an authorized, generation-bound expected merge set."""
+    from orchestration_contract import (
+        normalize_github_url,
+        normalize_repository,
+        repository_from_github_url,
+    )
     from orchestration_packets import canonical_packet_digest, validate_packet
 
     validate_packet("JIMINY_READY", packet)
@@ -738,6 +1219,7 @@ def bind_jiminy_ready(
         )
     if packet["coordinator_thread_id"] != session_id:
         raise ValueError("JIMINY_READY coordinator does not match the persisted coordinator")
+    packet_repository = normalize_repository(packet["repository"])
 
     ledger = _dict_container(state, "ledger")
     lane = _safe_id(lane)
@@ -761,22 +1243,89 @@ def bind_jiminy_ready(
             f"{runner_session_id} is not its checkpoint successor"
         )
 
-    lifecycle = _proof_lifecycle(lane_state)
-    legacy_in_flight = not lifecycle["bindings"] and not lifecycle["invalidation_history"]
-    _require_current_proof(lifecycle, "JIMINY_READY")
-    pr_url = lane_state.get("pr")
-    if not isinstance(pr_url, str):
-        raise ValueError(f"ledger lane has no persisted PR URL: {lane}")
-    ready_entry = next(
-        (item for item in packet["pull_requests"] if item["pr_url"] == pr_url),
-        None,
-    )
-    if ready_entry is None:
-        raise ValueError(f"JIMINY_READY does not contain the lane PR: {pr_url}")
-    trusted_head = lifecycle["observations"].get("head")
-    if ready_entry["reviewed_head_sha"] != trusted_head:
-        raise ValueError("JIMINY_READY reviewed head does not match current proof")
-    if any(
+    reviewer_registration = load_state(lane)
+    if reviewer_registration is None or reviewer_registration.get("role") != "review":
+        lifecycle = _proof_lifecycle(lane_state)
+        legacy_in_flight = not lifecycle["bindings"] and not lifecycle["invalidation_history"]
+        _require_current_proof(lifecycle, "JIMINY_READY")
+        pr_url = lane_state.get("pr")
+        if not isinstance(pr_url, str):
+            raise ValueError(f"ledger lane has no persisted PR URL: {lane}")
+        ready_entry = next(
+            (item for item in packet["pull_requests"] if item["pr_url"] == pr_url),
+            None,
+        )
+        if ready_entry is None:
+            raise ValueError(f"JIMINY_READY does not contain the lane PR: {pr_url}")
+        trusted_head = lifecycle["observations"].get("head")
+        if ready_entry["reviewed_head_sha"] != trusted_head:
+            raise ValueError("JIMINY_READY reviewed head does not match current proof")
+        if any(
+            item["gates"]["review_packet_verified"] is not True
+            or item["gates"]["required_checks_green"] is not True
+            or item["gates"]["approvals_satisfied"] is not True
+            or item["gates"]["mergeable"] is not True
+            or type(item["gates"]["unresolved_required_threads"]) is not int
+            or item["gates"]["unresolved_required_threads"] != 0
+            for item in packet["pull_requests"]
+        ):
+            raise ValueError("JIMINY_READY requires every merge gate to be satisfied")
+
+        packet_digest = canonical_packet_digest(packet)
+        existing = lifecycle["bindings"].get("expected_merge_set")
+        existing_evidence = existing.get("evidence") if isinstance(existing, dict) else None
+        if (
+            _binding_is_current(lifecycle, "expected_merge_set")
+            and isinstance(existing_evidence, dict)
+            and existing_evidence.get("packet_digest") == packet_digest
+        ):
+            return {"lane": lane, "state": lane_state, "idempotent": True}
+        if _binding_is_current(lifecycle, "merge_result"):
+            raise ValueError("cannot replace JIMINY_READY after accepting merge results")
+
+        lane_state["jiminy_runner_session_id"] = runner_session_id
+        if legacy_in_flight:
+            _bind_current_proof(lifecycle, "review", {
+                "migration_source": "JIMINY_READY",
+                "reviewed_head_sha": ready_entry["reviewed_head_sha"],
+            })
+            _bind_current_proof(lifecycle, "ci", {
+                "migration_source": "JIMINY_READY",
+                "required_checks_green": True,
+                "reviewed_head_sha": ready_entry["reviewed_head_sha"],
+            })
+            _bind_current_proof(lifecycle, "merge_ready", {
+                "migration_source": "JIMINY_READY",
+                "reviewed_head_sha": ready_entry["reviewed_head_sha"],
+            })
+        _bind_current_proof(lifecycle, "expected_merge_set", {
+            "packet_digest": packet_digest,
+            "merge_authority": packet["merge_authority"],
+            "expected_pr_urls": list(packet["expected_pr_urls"]),
+            "merge_order": list(packet["merge_order"]),
+            "reviewed_heads": {
+                item["pr_url"]: item["reviewed_head_sha"]
+                for item in packet["pull_requests"]
+            },
+        })
+        write_state(session_id, state, expected_revision=observed_revision)
+        return {"lane": lane, "state": lane_state, "idempotent": False}
+
+    ready_by_reviewer: dict[str, tuple[dict[str, Any], str]] = {}
+    for item in packet["pull_requests"]:
+        reviewer_task_id = _safe_id(item["reviewer_task_id"])
+        if reviewer_task_id in ready_by_reviewer:
+            raise ValueError(
+                f"duplicate JIMINY_READY reviewer mapping: {reviewer_task_id}"
+            )
+        ready_by_reviewer[reviewer_task_id] = (
+            item,
+            normalize_github_url(item["pr_url"], kind="pull"),
+        )
+    if lane not in ready_by_reviewer:
+        raise ValueError(f"JIMINY_READY does not identify its review lane: {lane}")
+
+    if packet["merge_authority"] == "merge" and any(
         item["gates"]["review_packet_verified"] is not True
         or item["gates"]["required_checks_green"] is not True
         or item["gates"]["approvals_satisfied"] is not True
@@ -787,33 +1336,232 @@ def bind_jiminy_ready(
     ):
         raise ValueError("JIMINY_READY requires every merge gate to be satisfied")
 
+    verified_authorities: list[
+        tuple[str, dict[str, Any], dict[str, Any], str, str, str, bool]
+    ] = []
+    for reviewer_task_id, (item, pr_url) in ready_by_reviewer.items():
+        reviewer_registration = load_state(reviewer_task_id)
+        if reviewer_registration is None or reviewer_registration.get("role") != "review":
+            raise ValueError(
+                f"merge authority reviewer is not a registered review task: {reviewer_task_id}"
+            )
+        registered_coordinator = reviewer_registration.get("coordinator_thread_id")
+        candidate = registered_coordinator
+        visited: set[str] = set()
+        resolved_coordinator = None
+        while isinstance(candidate, str) and candidate not in visited:
+            visited.add(candidate)
+            observed = load_state(candidate)
+            if observed and observed.get("role") == "gepetto" and observed.get("active"):
+                resolved_coordinator = candidate
+                break
+            candidate = observed.get("successor_id") if observed else None
+        if resolved_coordinator != session_id:
+            raise ValueError(
+                f"merge authority reviewer coordinator mismatch: {reviewer_task_id}"
+            )
+        authority_state = ledger.get(reviewer_task_id)
+        if not isinstance(authority_state, dict) or authority_state.get("tombstone"):
+            raise ValueError(f"no active review ledger lane: {reviewer_task_id}")
+        if authority_state.get("node") != "merge":
+            raise ValueError(f"merge authority review lane is not at merge: {reviewer_task_id}")
+        persisted_pr = authority_state.get("pr")
+        if (
+            not isinstance(persisted_pr, str)
+            or normalize_github_url(persisted_pr, kind="pull") != pr_url
+        ):
+            raise ValueError(f"merge authority PR does not match review lane: {pr_url}")
+        pr_repository = repository_from_github_url(pr_url, kind="pull")
+        persisted_repository = authority_state.get("repository")
+        backfill_repository = "repository" not in authority_state
+        if backfill_repository:
+            repository = pr_repository
+        elif isinstance(persisted_repository, str):
+            repository = normalize_repository(persisted_repository)
+        else:
+            raise ValueError(
+                f"merge authority lane has invalid repository: {reviewer_task_id}"
+            )
+        if repository != packet_repository or pr_repository != packet_repository:
+            raise ValueError(f"merge authority repository does not match lane PR: {pr_url}")
+        authority_runner = authority_state.get("jiminy_runner_session_id")
+        if not isinstance(authority_runner, str) or (
+            runner_session_id != authority_runner
+            and not _is_continuation_successor(authority_runner, runner_session_id)
+        ):
+            raise ValueError(
+                f"review lane is not bound to the selected Jiminy runner: {reviewer_task_id}"
+            )
+        authority_lifecycle = _proof_lifecycle(authority_state)
+        _require_current_proof(authority_lifecycle, "JIMINY_READY")
+        missing = [
+            name for name in ("review", "ci", "merge_ready")
+            if not _binding_is_current(authority_lifecycle, name)
+        ]
+        if missing:
+            raise ValueError(
+                "JIMINY_READY requires current-generation review lane proof: "
+                + ", ".join(missing)
+            )
+        if item["reviewed_head_sha"] != authority_lifecycle["observations"].get("head"):
+            raise ValueError(f"merge authority head does not match current lane proof: {pr_url}")
+        verified_authorities.append(
+            (
+                reviewer_task_id,
+                authority_state,
+                authority_lifecycle,
+                pr_url,
+                item["reviewed_head_sha"],
+                repository,
+                backfill_repository,
+            )
+        )
+
+    lifecycle = _proof_lifecycle(lane_state)
+
     packet_digest = canonical_packet_digest(packet)
+    aggregate_value = state.get("jiminy_ready_aggregate")
+    if aggregate_value is None:
+        aggregate: dict[str, Any] = {}
+    elif isinstance(aggregate_value, dict):
+        aggregate = aggregate_value
+    else:
+        raise ValueError("invalid coordinator JIMINY_READY aggregate")
+    superseded_value = state.get("superseded_jiminy_ready_digests", [])
+    if not isinstance(superseded_value, list) or any(
+        not isinstance(digest, str) for digest in superseded_value
+    ):
+        raise ValueError("invalid superseded JIMINY_READY digest history")
+    superseded_digests = list(superseded_value)
+    aggregate_digest = aggregate.get("packet_digest")
+    if (
+        packet_digest in superseded_digests
+        and packet_digest != aggregate_digest
+    ):
+        raise ValueError("superseded JIMINY_READY packet cannot be rebound")
+    aggregate_replacement = (
+        isinstance(aggregate_digest, str) and aggregate_digest != packet_digest
+    )
+    if aggregate_replacement:
+        for candidate in ledger.values():
+            if not isinstance(candidate, dict) or candidate.get("tombstone"):
+                continue
+            candidate_lifecycle = _proof_lifecycle(candidate)
+            candidate_expected = candidate_lifecycle["bindings"].get(
+                "expected_merge_set"
+            )
+            candidate_evidence = (
+                candidate_expected.get("evidence")
+                if isinstance(candidate_expected, dict) else None
+            )
+            if (
+                isinstance(candidate_evidence, dict)
+                and candidate_evidence.get("packet_digest") == aggregate_digest
+                and _binding_is_current(candidate_lifecycle, "merge_result")
+            ):
+                raise ValueError(
+                    "cannot replace aggregate JIMINY_READY after accepting merge results"
+                )
     existing = lifecycle["bindings"].get("expected_merge_set")
     existing_evidence = existing.get("evidence") if isinstance(existing, dict) else None
-    if (
+    expected_set_current = (
         _binding_is_current(lifecycle, "expected_merge_set")
         and isinstance(existing_evidence, dict)
         and existing_evidence.get("packet_digest") == packet_digest
+    )
+    aggregate_expected_pr_urls = aggregate.get("expected_pr_urls")
+    previous_expected_pr_urls = (
+        aggregate_expected_pr_urls
+        if isinstance(aggregate_digest, str)
+        else (
+            existing_evidence.get("expected_pr_urls", [])
+            if isinstance(existing_evidence, dict)
+            else []
+        )
+    )
+    if not isinstance(previous_expected_pr_urls, list) or any(
+        not isinstance(pr_url, str) for pr_url in previous_expected_pr_urls
+    ):
+        raise ValueError("invalid persisted expected merge set")
+    authorities_value = state.get("merge_authorities")
+    if authorities_value is None:
+        observed_authorities: dict[str, Any] = {}
+    elif isinstance(authorities_value, dict):
+        observed_authorities = authorities_value
+    else:
+        raise ValueError("invalid merge authority container")
+    expected_authorities = {
+        pr_url: {
+            "repository": repository,
+            "pr_url": pr_url,
+            "reviewed_head_sha": reviewed_head_sha,
+            "generations": _generation_tuple(authority_lifecycle),
+            "runner_session_id": runner_session_id,
+            "lane": authority_lane,
+            "ready_packet_digest": packet_digest,
+        }
+        for (
+            authority_lane,
+            _,
+            authority_lifecycle,
+            pr_url,
+            reviewed_head_sha,
+            repository,
+            _,
+        ) in verified_authorities
+    }
+    if packet["merge_authority"] == "merge":
+        authority_complete = all(
+            isinstance(observed_authorities.get(pr_url), dict)
+            and all(
+                observed_authorities[pr_url].get(key) == value
+                for key, value in expected_authority.items()
+            )
+            for pr_url, expected_authority in expected_authorities.items()
+        ) and all(
+            pr_url in expected_authorities or pr_url not in observed_authorities
+            for pr_url in previous_expected_pr_urls
+        )
+    else:
+        authority_complete = all(
+            pr_url not in observed_authorities for pr_url in expected_authorities
+        )
+    repository_complete = not any(
+        backfill_repository
+        for _, _, _, _, _, _, backfill_repository in verified_authorities
+    )
+    aggregate_current = aggregate_digest == packet_digest
+    if (
+        expected_set_current
+        and aggregate_current
+        and repository_complete
+        and authority_complete
     ):
         return {"lane": lane, "state": lane_state, "idempotent": True}
-    if _binding_is_current(lifecycle, "merge_result"):
+    if not expected_set_current and _binding_is_current(lifecycle, "merge_result"):
         raise ValueError("cannot replace JIMINY_READY after accepting merge results")
 
+    for (
+        _, authority_state, _, _, _, repository, backfill_repository
+    ) in verified_authorities:
+        if backfill_repository:
+            authority_state["repository"] = repository
+    if aggregate_replacement and isinstance(aggregate_digest, str):
+        superseded_digests.append(aggregate_digest)
+    state["superseded_jiminy_ready_digests"] = list(dict.fromkeys(
+        superseded_digests
+    ))
+    state["jiminy_ready_aggregate"] = {
+        "packet_digest": packet_digest,
+        "merge_authority": packet["merge_authority"],
+        "expected_pr_urls": list(packet["expected_pr_urls"]),
+        "merge_order": list(packet["merge_order"]),
+        "reviewed_heads": {
+            item["pr_url"]: item["reviewed_head_sha"]
+            for item in packet["pull_requests"]
+        },
+    }
     lane_state["jiminy_runner_session_id"] = runner_session_id
-    if legacy_in_flight:
-        _bind_current_proof(lifecycle, "review", {
-            "migration_source": "JIMINY_READY",
-            "reviewed_head_sha": ready_entry["reviewed_head_sha"],
-        })
-        _bind_current_proof(lifecycle, "ci", {
-            "migration_source": "JIMINY_READY",
-            "required_checks_green": True,
-            "reviewed_head_sha": ready_entry["reviewed_head_sha"],
-        })
-        _bind_current_proof(lifecycle, "merge_ready", {
-            "migration_source": "JIMINY_READY",
-            "reviewed_head_sha": ready_entry["reviewed_head_sha"],
-        })
     _bind_current_proof(lifecycle, "expected_merge_set", {
         "packet_digest": packet_digest,
         "merge_authority": packet["merge_authority"],
@@ -824,8 +1572,80 @@ def bind_jiminy_ready(
             for item in packet["pull_requests"]
         },
     })
+    authorities = _dict_container(state, "merge_authorities")
+    for previous_pr_url in previous_expected_pr_urls:
+        if previous_pr_url not in expected_authorities:
+            authorities.pop(previous_pr_url, None)
+    for (
+        authority_lane,
+        authority_state,
+        authority_lifecycle,
+        pr_url,
+        reviewed_head_sha,
+        repository,
+        _,
+    ) in verified_authorities:
+        if packet["merge_authority"] == "merge":
+            authorities[pr_url] = expected_authorities[pr_url]
+        else:
+            authorities.pop(pr_url, None)
     write_state(session_id, state, expected_revision=observed_revision)
     return {"lane": lane, "state": lane_state, "idempotent": False}
+
+
+def verify_merge_authority(
+    runner_session_id: str, repository: str, pr_url: str, reviewed_head_sha: str
+) -> dict[str, Any]:
+    from orchestration_contract import normalize_github_url, normalize_repository
+
+    runner_session_id = _safe_id(runner_session_id)
+    runner = load_state(runner_session_id)
+    if runner is None or runner.get("role") != "jiminy" or not runner.get("active"):
+        raise ValueError("merge requires an active Jiminy registration")
+    coordinator_id = runner.get("coordinator_thread_id")
+    if not isinstance(coordinator_id, str):
+        raise ValueError("Jiminy registration has no coordinator")
+    verification = verify_registration(runner_session_id, "jiminy")
+    coordinator_id = verification["coordinator_thread_id"]
+    coordinator = load_state(coordinator_id)
+    if coordinator is None:
+        raise ValueError("merge coordinator is unavailable")
+    repository = normalize_repository(repository)
+    pr_url = normalize_github_url(pr_url, kind="pull")
+    if not FULL_SHA_PATTERN.fullmatch(reviewed_head_sha):
+        raise ValueError("merge head must be a full lowercase SHA")
+    authorities = coordinator.get("merge_authorities")
+    authority = authorities.get(pr_url) if isinstance(authorities, dict) else None
+    if not isinstance(authority, dict):
+        raise ValueError("no coordinator-recorded merge authority for this PR")
+    if (
+        authority.get("repository") != repository
+        or authority.get("pr_url") != pr_url
+        or authority.get("reviewed_head_sha") != reviewed_head_sha
+    ):
+        raise ValueError("merge repository, PR, or reviewed head differs from authority")
+    bound_runner = authority.get("runner_session_id")
+    if not isinstance(bound_runner, str) or (
+        bound_runner != runner_session_id
+        and not _is_continuation_successor(bound_runner, runner_session_id)
+    ):
+        raise ValueError("merge authority belongs to a different Jiminy runner")
+    lane_id = authority.get("lane")
+    lane_state = coordinator.get("ledger", {}).get(lane_id)
+    if (
+        not isinstance(lane_state, dict)
+        or lane_state.get("tombstone")
+        or lane_state.get("node") != "merge"
+    ):
+        raise ValueError("merge authority lane is unavailable")
+    lifecycle = _proof_lifecycle(lane_state)
+    if (
+        authority.get("generations") != _generation_tuple(lifecycle)
+        or lifecycle["observations"].get("head") != reviewed_head_sha
+        or not _binding_is_current(lifecycle, "expected_merge_set")
+    ):
+        raise ValueError("merge authority is stale for the current proof generation")
+    return authority
 
 
 def apply_graph_transition(
@@ -1021,6 +1841,9 @@ def apply_graph_transition(
             "merge_results": dict(context["packet"]["merge_results"]),
         })
     lane_state["node"] = target_node
+    if event == "DELIVERY_CANCELLED":
+        _release_claim_in_state(state, lane, "delivery_cancellation")
+        _revoke_merge_authorities_for_lane(state, lane)
     write_state(session_id, state, expected_revision=observed_revision)
     return {"transition_id": transition["id"], "lane": lane, "state": lane_state}
 
@@ -1212,6 +2035,30 @@ def accept_graph_event(
         if current_contract not in {None, contract_observation}:
             raise ValueError("changed research contract requires MATERIAL_CONTRACT_CHANGED")
         lane_state["validated_delivery_spec_digest"] = validated_spec_digest
+        state["ownership_claims_required"] = True
+
+    changed_files: list[str] = []
+    if event == "IMPLEMENTATION_PACKET":
+        try:
+            changed_files = _verify_implementation_claim(state, lane, lane_state, packet)
+        except OwnershipBoundaryError as error:
+            failures = lane_state.get("ownership_boundary_failures", [])
+            if not isinstance(failures, list):
+                raise ValueError("invalid ownership boundary failure history") from error
+            lane_state["ownership_boundary_failures"] = [*failures, {
+                "base_sha": lifecycle["observations"].get("base"),
+                "head_sha": packet["pr_head_sha"],
+                "changed_files": error.changed_files,
+                "reason": str(error),
+                "timestamp": int(time.time()),
+            }]
+            lane_state["node"] = "research"
+            lane_state["resume_node"] = "implementation"
+            write_state(session_id, state, expected_revision=expected_revision)
+            raise OwnershipBoundaryError(
+                f"ownership boundary rejected implementation and returned it to research: {error}",
+                changed_files=error.changed_files,
+            ) from error
 
     evaluation_context = dict(lane_state)
     evaluation_context["packet"] = packet
@@ -1230,8 +2077,40 @@ def accept_graph_event(
         contract_observation = packet["artifact"]["content_ref"]
         lifecycle["observations"]["contract"] = contract_observation
     elif event == "IMPLEMENTATION_PACKET":
+        from orchestration_contract import normalize_github_url
+
+        packet_pr = normalize_github_url(packet["pr_url"], kind="pull")
+        persisted_pr = lane_state.get("pr")
+        if persisted_pr is not None and (
+            not isinstance(persisted_pr, str)
+            or normalize_github_url(persisted_pr, kind="pull") != packet_pr
+        ):
+            raise ValueError("implementation packet PR does not match the persisted lane PR")
+        lane_state["pr"] = packet_pr
         lifecycle["observations"]["head"] = packet["pr_head_sha"]
     elif event == "REVIEW_PACKET":
+        from orchestration_contract import (
+            normalize_github_url,
+            normalize_repository,
+            repository_from_github_url,
+        )
+
+        packet_pr = normalize_github_url(packet["pr_url"], kind="pull")
+        persisted_pr = lane_state.get("pr")
+        if persisted_pr is not None and (
+            not isinstance(persisted_pr, str)
+            or normalize_github_url(persisted_pr, kind="pull") != packet_pr
+        ):
+            raise ValueError("review packet PR does not match the persisted lane PR")
+        packet_repository = repository_from_github_url(packet_pr, kind="pull")
+        repository = lane_state.get("repository")
+        if "repository" not in lane_state:
+            lane_state["repository"] = packet_repository
+        elif not isinstance(repository, str):
+            raise ValueError("review lane has invalid persisted repository")
+        elif packet_repository != normalize_repository(repository):
+            raise ValueError("review packet PR is outside the persisted lane repository")
+        lane_state["pr"] = packet_pr
         trusted_head = lifecycle["observations"].get("head")
         if trusted_head not in {None, packet["reviewed_head_sha"]}:
             raise ValueError("changed PR head requires PR_HEAD_CHANGED")
@@ -1311,9 +2190,11 @@ def accept_graph_event(
         implementation_evidence = {
             "packet_digest": packet_digest,
             "pr_head_sha": packet["pr_head_sha"],
+            "changed_files": changed_files,
         }
         _bind_current_proof(lifecycle, "implementation", implementation_evidence)
         _bind_current_proof(lifecycle, "implementation_acceptance", implementation_evidence)
+        _release_claim_in_state(state, lane, "verified_handoff")
     elif event == "REVIEW_PACKET":
         review_evidence = {
             "packet_digest": packet_digest,
@@ -1332,6 +2213,7 @@ def accept_graph_event(
             "ready_for_jiminy": packet["ready_for_jiminy"],
             "reviewed_head_sha": packet["reviewed_head_sha"],
         })
+        _release_claim_in_state(state, lane, "verified_handoff")
     elif event == "JIMINY_PR_RESULT":
         _bind_current_proof(lifecycle, "merge_result", {
             "packet_digest": packet_digest,
@@ -1344,6 +2226,7 @@ def accept_graph_event(
             "packet_digest": packet_digest,
             "verified_default_head_sha": packet["verified_default_head_sha"],
         })
+        _release_claim_in_state(state, lane, "terminal_completion")
 
     receipts = lane_state.get("acceptance_receipts", [])
     if not isinstance(receipts, list):
@@ -1555,6 +2438,23 @@ def _parser() -> argparse.ArgumentParser:
     ledger_move_parser.add_argument("--session-id", required=True)
     ledger_move_parser.add_argument("--from-lane", required=True)
     ledger_move_parser.add_argument("--to-lane", required=True)
+    ledger_move_parser.add_argument("--expected-revision", type=int, required=True)
+
+    claim_parser = subparsers.add_parser("claim")
+    claim_actions = claim_parser.add_subparsers(dest="claim_command", required=True)
+    claim_acquire_parser = claim_actions.add_parser("acquire")
+    claim_acquire_parser.add_argument("--session-id", required=True)
+    claim_acquire_parser.add_argument("--lane", required=True)
+    claim_acquire_parser.add_argument("--expected-revision", type=int, required=True)
+    claim_acquire_parser.add_argument("--json", required=True)
+    claim_release_parser = claim_actions.add_parser("release")
+    claim_release_parser.add_argument("--session-id", required=True)
+    claim_release_parser.add_argument("--lane", required=True)
+    claim_release_parser.add_argument("--expected-revision", type=int, required=True)
+    claim_release_parser.add_argument("--reason", choices=sorted(CLAIM_RELEASE_REASONS), required=True)
+    claim_show_parser = claim_actions.add_parser("show")
+    claim_show_parser.add_argument("--session-id", required=True)
+    claim_show_parser.add_argument("--lane")
 
     context_parser = subparsers.add_parser("context")
     context_actions = context_parser.add_subparsers(dest="context_command", required=True)
@@ -1656,13 +2556,43 @@ def _dispatch(args: argparse.Namespace) -> int:
                 return 1
         elif args.ledger_command == "move":
             try:
-                print(ledger_move(args.session_id, args.from_lane, args.to_lane))
+                print(ledger_move(
+                    args.session_id, args.from_lane, args.to_lane, args.expected_revision
+                ))
             except ValueError as error:
                 print(f"orchestration_state: {error}", file=sys.stderr)
                 return 1
         else:
             state = load_state(args.session_id) or {}
             print(json.dumps(state.get("ledger", {}), sort_keys=True))
+        return 0
+    if args.command == "claim":
+        try:
+            if args.claim_command == "acquire":
+                payload = json.loads(args.json)
+                if not isinstance(payload, dict):
+                    raise ValueError("--json must be a JSON object")
+                result = acquire_claim(
+                    args.session_id, args.lane, args.expected_revision, payload
+                )
+            elif args.claim_command == "release":
+                result = release_claim(
+                    args.session_id, args.lane, args.expected_revision, args.reason
+                )
+            else:
+                state = load_state(args.session_id)
+                if state is None:
+                    raise ValueError(f"no registered session: {args.session_id}")
+                claims = state.get("ownership_claims", {})
+                if not isinstance(claims, dict):
+                    raise ValueError("invalid ownership claim container")
+                result = claims.get(_safe_id(args.lane)) if args.lane else claims
+                if args.lane and result is None:
+                    raise ValueError(f"no active ownership claim: {args.lane}")
+        except (json.JSONDecodeError, OSError, ValueError) as error:
+            print(f"orchestration_state: {error}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "status":
         sessions = state_root() / "sessions"

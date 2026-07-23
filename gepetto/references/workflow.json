@@ -84,7 +84,7 @@
     },
     {
       "id": "review-found-issues",
-      "from": ["review"],
+      "from": ["review", "merge"],
       "event": "ACTIONABLE_FINDINGS",
       "to": "fixer",
       "all": [

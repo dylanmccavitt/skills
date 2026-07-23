@@ -87,7 +87,7 @@ Checkpoint capsules point at this ledger instead of restating lane state.
 Move a continued lane atomically instead of copying it with `ledger set`:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger move --session-id <gepetto-task-id> --from-lane <source-task-id> --to-lane <successor-task-id>
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger move --session-id <gepetto-task-id> --from-lane <source-task-id> --to-lane <successor-task-id> --expected-revision <revision>
 ```
 
 The successor receives the lane state plus `continued_from`; the source becomes a tombstone with `successor_lane`.
@@ -170,6 +170,18 @@ python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_st
 
 ## Implementation task prompt
 
+Before dispatch, acquire one current-generation coordinator-owned claim with the current
+coordinator revision. The worktree must be its canonical absolute path and every list must
+come from the approved delivery specification/decision ownership contract:
+
+```bash
+python3 hooks/orchestration_state.py claim acquire --session-id <gepetto-task-id> --lane <implementation-task-id> --expected-revision <revision> --json '{"repository":"owner/repo","issue_url":"https://github.com/owner/repo/issues/1","lane_task_id":"<implementation-task-id>","branch":"issue-1-slug","worktree":"/absolute/worktree","decision_domains":["domain"],"owned_path_prefixes":["path/"],"shared_paths":[]}'
+```
+
+Conflicts do not mutate state. A checkpoint continuation moves the claim to the successor;
+`ledger move` reconciles the lane locator atomically. Verified implementation handoff,
+delivery cancellation, and terminal completion are the only release events.
+
 Read [../../pinocchio/references/protocol.md](../../pinocchio/references/protocol.md) before dispatching. Include the actual leaf issue URL, approved research artifact URL or absolute temporary Markdown path, its compact receipt, project path, default branch, base SHA, branch convention, authority to commit/push/open one PR and update the leaf issue, and `coordinatorThreadId`. Do not embed the full research contract. Use this request:
 
 ```text
@@ -181,6 +193,9 @@ Use $pinocchio to deliver <leaf-issue-url> from the approved contract at <resear
 Use Pinocchio's packet schema and gates exactly. Dispatch review only after confirming the live PR head equals `pr_head_sha`.
 
 Accept the verified packet against the live head and current coordinator revision. Packet events must use `graph accept`; `graph apply` remains the explicit administrative path for non-packet transitions.
+Acceptance resolves the claimed worktree's actual `base...head` diff with rename detection
+disabled so both sides of renames are checked. Any out-of-claim path rejects the packet and
+returns the lane to research without rebinding proof.
 
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph accept --session-id <gepetto-task-id> --lane <implementation-task-id> --actor-session-id <implementation-task-id> --expected-revision <current-coordinator-revision> --event IMPLEMENTATION_PACKET --packet-json '<packet-json>' --observed-pr-head-sha <live-pr-head-sha>
