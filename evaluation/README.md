@@ -42,8 +42,9 @@ digest. They never expose grader paths, commands, expected observations,
 seeded-defect inventories, or private rubric text. A future runner must
 materialize only `public/payload/` for delivery, then stage the matching grader
 after delivery has stopped. Validation derives private check IDs, command paths,
-commands, and expected-observation names from each grader contract and rejects
-them anywhere in the public tree.
+commands, expected-observation names, and nontrivial nested expected-result text
+from each grader contract and rejects them in public paths, filenames, or file
+contents.
 
 Validate the checked-in corpus without network access:
 

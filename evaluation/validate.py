@@ -352,6 +352,7 @@ def _grader_sensitive_text(grader: dict[str, Any]) -> set[str]:
     for check in grader["checks"]:
         sensitive.add(check["id"].lower())
         sensitive.add(check["expected"]["observation"].lower())
+        sensitive.update(_nested_sensitive_text(check["expected"]["value"]))
         argv = check["execution"]["argv"]
         sensitive.add(" ".join(argv).lower())
         sensitive.update(
@@ -362,11 +363,46 @@ def _grader_sensitive_text(grader: dict[str, Any]) -> set[str]:
     return sensitive
 
 
+def _nested_sensitive_text(value: Any) -> set[str]:
+    sensitive: set[str] = set()
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if len(text) >= 8:
+            sensitive.add(text)
+    elif isinstance(value, list):
+        for item in value:
+            sensitive.update(_nested_sensitive_text(item))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            sensitive.update(_nested_sensitive_text(key))
+            sensitive.update(_nested_sensitive_text(item))
+    return sensitive
+
+
+def _normalized_leakage_text(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def _contains_sensitive_text(value: str, sensitive: set[str]) -> bool:
+    lowered = value.lower()
+    normalized = _normalized_leakage_text(value)
+    for forbidden in sensitive:
+        if forbidden in lowered:
+            return True
+        normalized_forbidden = _normalized_leakage_text(forbidden)
+        if len(normalized_forbidden) >= 8 and normalized_forbidden in normalized:
+            return True
+    return False
+
+
 def _assert_public_boundary(public_root: Path, grader: dict[str, Any]) -> None:
     forbidden_text = _grader_sensitive_text(grader)
     for path in public_root.rglob("*"):
         relative = path.relative_to(public_root).as_posix().lower()
-        if "grader" in PurePosixPath(relative).parts:
+        if (
+            "grader" in PurePosixPath(relative).parts
+            or _contains_sensitive_text(relative, forbidden_text)
+        ):
             raise ContractError(f"{path}: held-out grader path leaked into public tree")
         if path.is_file():
             try:
@@ -375,11 +411,10 @@ def _assert_public_boundary(public_root: Path, grader: dict[str, Any]) -> None:
                 raise ContractError(
                     f"{path}: public assets must be UTF-8 text"
                 ) from error
-            for forbidden in forbidden_text:
-                if forbidden in text:
-                    raise ContractError(
-                        f"{path}: held-out grader detail leaked into public content"
-                    )
+            if _contains_sensitive_text(text, forbidden_text):
+                raise ContractError(
+                    f"{path}: held-out grader detail leaked into public content"
+                )
 
 
 def _validate_schema_documents(root: Path) -> None:

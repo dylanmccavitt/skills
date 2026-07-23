@@ -202,6 +202,29 @@ class EvaluationContractTests(unittest.TestCase):
         self.rebind_fixture(REVIEW)
         self.assert_invalid("public assets must be UTF-8 text")
 
+    def test_private_grader_paths_cannot_leak_as_public_asset_names(self):
+        leak = (
+            self.root
+            / f"fixtures/{REVIEW}/public/payload/grader_tools/grade_review.py"
+        )
+        leak.parent.mkdir()
+        leak.write_text("# harmless content\n", encoding="utf-8")
+        self.rebind_fixture(REVIEW)
+        self.assert_invalid("held-out grader path leaked")
+
+    def test_nested_expected_result_strings_cannot_leak_when_rebound(self):
+        private_result = "private-result-token-42"
+        grader_path = self.root / f"fixtures/{REVIEW}/grader/grader-v1.json"
+        grader = load_json(grader_path)
+        grader["checks"][0]["expected"]["value"] = {
+            "result_metadata": [{"private_token": private_result}]
+        }
+        grader_path.write_text(json.dumps(grader, indent=2) + "\n", encoding="utf-8")
+        leak = self.root / f"fixtures/{REVIEW}/public/payload/result.txt"
+        leak.write_text(private_result + "\n", encoding="utf-8")
+        self.rebind_fixture(REVIEW)
+        self.assert_invalid("held-out grader detail leaked")
+
     def test_required_grading_categories_cannot_be_diagnostic_only(self):
         grader_path = self.root / f"fixtures/{LOW}/grader/grader-v1.json"
         grader = load_json(grader_path)
