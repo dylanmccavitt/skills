@@ -535,6 +535,11 @@ class OrchestrationHookTest(unittest.TestCase):
             "git config user.name attacker",
             "git notes add -m x HEAD",
             "git update-ref refs/heads/main HEAD",
+            "git symbolic-ref HEAD refs/heads/other",
+            "git symbolic-ref --delete refs/heads/other",
+            "git reflog expire --expire=now --all",
+            "git reflog delete HEAD@{0}",
+            "git pack-refs --all",
             "git fetch origin",
             "git remote add attacker https://example.test/repository.git",
             "sh -c 'rm hooks/file.py'",
@@ -558,7 +563,13 @@ class OrchestrationHookTest(unittest.TestCase):
                     self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
             self.assertIsNone(self.hook(
                 "PreToolUse", session_id=session_id, tool_name="Bash",
-                tool_input={"command": "git diff -- hooks/file.py && sed -n '1,20p' hooks/file.py"},
+                tool_input={
+                    "command": (
+                        "git diff -- hooks/file.py && "
+                        "git symbolic-ref HEAD && git reflog show -1 && "
+                        "sed -n '1,20p' hooks/file.py"
+                    )
+                },
             ))
 
     def test_implementation_can_edit_and_write(self) -> None:
@@ -572,6 +583,9 @@ class OrchestrationHookTest(unittest.TestCase):
             "gh api repos/o/r/pulls/1/merge -X PUT",
             '"gh" "api" repos/o/r/pulls/1/merge -X PUT',
             r"g\h a\p\i repos/o/r/pulls/1/merge -X PUT",
+            'sh -c \'"gh" "api" repos/o/r/pulls/1/merge -X PUT\'',
+            'eval \'"gh" "api" repos/o/r/pulls/1/merge -X PUT\'',
+            "gh --hostname github.com api repos/o/r/pulls/1/merge -X PUT",
         ):
             with self.subTest(command=command):
                 rest = self.hook(
@@ -2690,12 +2704,13 @@ class OrchestrationHookTest(unittest.TestCase):
         aggregate["pull_requests"].append(second)
         aggregate["expected_pr_urls"] = [pr_one, pr_two]
         aggregate["merge_order"] = [pr_one, pr_two]
-        self.state_command(
-            "graph", "ready", "--session-id", "session-1", "--lane", "lane-1",
-            "--expected-revision", str(self.session_state()["state_revision"]),
-            "--packet-json", json.dumps(aggregate),
-            "--runner-session-id", "jiminy-1",
-        )
+        for lane in ("lane-1", "lane-2"):
+            self.state_command(
+                "graph", "ready", "--session-id", "session-1", "--lane", lane,
+                "--expected-revision", str(self.session_state()["state_revision"]),
+                "--packet-json", json.dumps(aggregate),
+                "--runner-session-id", "jiminy-1",
+            )
         self.assertEqual(
             set(self.session_state()["merge_authorities"]), {pr_one, pr_two}
         )
@@ -2716,6 +2731,17 @@ class OrchestrationHookTest(unittest.TestCase):
             ["expected_merge_set"]["evidence"]
         )
         self.assertEqual(evidence["expected_pr_urls"], [pr_one])
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        stale_retry = self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "lane-2",
+            "--expected-revision", str(state["state_revision"]),
+            "--packet-json", json.dumps(aggregate),
+            "--runner-session-id", "jiminy-1", check=False,
+        )
+        self.assertEqual(stale_retry.returncode, 1)
+        self.assertIn("superseded JIMINY_READY", stale_retry.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_block_and_resume_capture_trusted_source_node_atomically(self) -> None:
         self.register("gepetto")
@@ -3219,6 +3245,18 @@ class OrchestrationHookTest(unittest.TestCase):
         for command in (
             f'"gh" "pr" "merge" 1 --repo owner/repo --squash --match-head-commit {SHA}',
             rf"g\h p\r m\e\r\g\e 1 --repo owner/repo --squash --match-head-commit {SHA}",
+            (
+                f"sh -c '\"gh\" \"pr\" \"merge\" 1 --repo owner/repo "
+                f"--squash --match-head-commit {SHA}'"
+            ),
+            (
+                f"eval '\"gh\" \"pr\" \"merge\" 1 --repo owner/repo "
+                f"--squash --match-head-commit {SHA}'"
+            ),
+            (
+                f"gh --repo owner/repo pr merge 1 --squash "
+                f"--match-head-commit {SHA}"
+            ),
         ):
             with self.subTest(command=command):
                 quoted_unbound = self.hook(
@@ -3228,6 +3266,18 @@ class OrchestrationHookTest(unittest.TestCase):
                 self.assertEqual(
                     quoted_unbound["hookSpecificOutput"]["permissionDecision"], "deny"
                 )
+        deeply_nested_merge = (
+            f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA}"
+        )
+        for _ in range(6):
+            deeply_nested_merge = f"sh -c {shlex.quote(deeply_nested_merge)}"
+        recursion_denied = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={"command": deeply_nested_merge},
+        )
+        self.assertEqual(
+            recursion_denied["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
 
         coordinator_id = "authorized-jiminy-coordinator"
         coordinator = self.session_state(coordinator_id)
@@ -3283,6 +3333,26 @@ class OrchestrationHookTest(unittest.TestCase):
             },
         )
         self.assertIsNone(quoted_allowed)
+        wrapped_allowed = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={
+                "command": (
+                    f"sh -c '\"gh\" \"pr\" \"merge\" 1 --repo owner/repo "
+                    f"--squash --match-head-commit {SHA}'"
+                )
+            },
+        )
+        self.assertIsNone(wrapped_allowed)
+        global_repo_allowed = self.hook(
+            "PreToolUse", session_id="authorized-jiminy", tool_name="Bash",
+            tool_input={
+                "command": (
+                    f"gh --repo owner/repo pr merge 1 --squash "
+                    f"--match-head-commit {SHA}"
+                )
+            },
+        )
+        self.assertIsNone(global_repo_allowed)
         for command in (
             f"gh pr merge 1 --repo other/repo --squash --match-head-commit {SHA}",
             f"gh pr merge 2 --repo owner/repo --squash --match-head-commit {SHA}",
@@ -3290,6 +3360,7 @@ class OrchestrationHookTest(unittest.TestCase):
             f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA} --match-head-commit {'b' * 40}",
             f"gh pr merge 1 --repo owner/repo --squash --admin --match-head-commit {SHA}",
             f"gh pr merge 1 --repo owner/repo --squash --delete-branch --match-head-commit {SHA}",
+            f"gh pr merge 1 --repo owner/repo --squash -d --match-head-commit {SHA}",
             f"gh pr merge 1 --repo owner/repo --squash --match-head-commit {SHA} && "
             f"gh pr merge 2 --repo owner/repo --squash --match-head-commit {SHA}",
         ):

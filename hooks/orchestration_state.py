@@ -1420,6 +1420,48 @@ def bind_jiminy_ready(
     lifecycle = _proof_lifecycle(lane_state)
 
     packet_digest = canonical_packet_digest(packet)
+    aggregate_value = state.get("jiminy_ready_aggregate")
+    if aggregate_value is None:
+        aggregate: dict[str, Any] = {}
+    elif isinstance(aggregate_value, dict):
+        aggregate = aggregate_value
+    else:
+        raise ValueError("invalid coordinator JIMINY_READY aggregate")
+    superseded_value = state.get("superseded_jiminy_ready_digests", [])
+    if not isinstance(superseded_value, list) or any(
+        not isinstance(digest, str) for digest in superseded_value
+    ):
+        raise ValueError("invalid superseded JIMINY_READY digest history")
+    superseded_digests = list(superseded_value)
+    aggregate_digest = aggregate.get("packet_digest")
+    if (
+        packet_digest in superseded_digests
+        and packet_digest != aggregate_digest
+    ):
+        raise ValueError("superseded JIMINY_READY packet cannot be rebound")
+    aggregate_replacement = (
+        isinstance(aggregate_digest, str) and aggregate_digest != packet_digest
+    )
+    if aggregate_replacement:
+        for candidate in ledger.values():
+            if not isinstance(candidate, dict) or candidate.get("tombstone"):
+                continue
+            candidate_lifecycle = _proof_lifecycle(candidate)
+            candidate_expected = candidate_lifecycle["bindings"].get(
+                "expected_merge_set"
+            )
+            candidate_evidence = (
+                candidate_expected.get("evidence")
+                if isinstance(candidate_expected, dict) else None
+            )
+            if (
+                isinstance(candidate_evidence, dict)
+                and candidate_evidence.get("packet_digest") == aggregate_digest
+                and _binding_is_current(candidate_lifecycle, "merge_result")
+            ):
+                raise ValueError(
+                    "cannot replace aggregate JIMINY_READY after accepting merge results"
+                )
     existing = lifecycle["bindings"].get("expected_merge_set")
     existing_evidence = existing.get("evidence") if isinstance(existing, dict) else None
     expected_set_current = (
@@ -1427,10 +1469,15 @@ def bind_jiminy_ready(
         and isinstance(existing_evidence, dict)
         and existing_evidence.get("packet_digest") == packet_digest
     )
+    aggregate_expected_pr_urls = aggregate.get("expected_pr_urls")
     previous_expected_pr_urls = (
-        existing_evidence.get("expected_pr_urls", [])
-        if isinstance(existing_evidence, dict)
-        else []
+        aggregate_expected_pr_urls
+        if isinstance(aggregate_digest, str)
+        else (
+            existing_evidence.get("expected_pr_urls", [])
+            if isinstance(existing_evidence, dict)
+            else []
+        )
     )
     if not isinstance(previous_expected_pr_urls, list) or any(
         not isinstance(pr_url, str) for pr_url in previous_expected_pr_urls
@@ -1483,7 +1530,13 @@ def bind_jiminy_ready(
         backfill_repository
         for _, _, _, _, _, _, backfill_repository in verified_authorities
     )
-    if expected_set_current and repository_complete and authority_complete:
+    aggregate_current = aggregate_digest == packet_digest
+    if (
+        expected_set_current
+        and aggregate_current
+        and repository_complete
+        and authority_complete
+    ):
         return {"lane": lane, "state": lane_state, "idempotent": True}
     if not expected_set_current and _binding_is_current(lifecycle, "merge_result"):
         raise ValueError("cannot replace JIMINY_READY after accepting merge results")
@@ -1493,6 +1546,21 @@ def bind_jiminy_ready(
     ) in verified_authorities:
         if backfill_repository:
             authority_state["repository"] = repository
+    if aggregate_replacement and isinstance(aggregate_digest, str):
+        superseded_digests.append(aggregate_digest)
+    state["superseded_jiminy_ready_digests"] = list(dict.fromkeys(
+        superseded_digests
+    ))
+    state["jiminy_ready_aggregate"] = {
+        "packet_digest": packet_digest,
+        "merge_authority": packet["merge_authority"],
+        "expected_pr_urls": list(packet["expected_pr_urls"]),
+        "merge_order": list(packet["merge_order"]),
+        "reviewed_heads": {
+            item["pr_url"]: item["reviewed_head_sha"]
+            for item in packet["pull_requests"]
+        },
+    }
     lane_state["jiminy_runner_session_id"] = runner_session_id
     _bind_current_proof(lifecycle, "expected_merge_set", {
         "packet_digest": packet_digest,

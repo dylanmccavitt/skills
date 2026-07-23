@@ -54,10 +54,11 @@ FILE_WRITE_COMMANDS = {
 GIT_WRITE_COMMANDS = {
     "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean", "commit",
     "config", "fast-import", "fetch", "gc", "init", "maintenance", "merge", "mv",
-    "notes", "prune", "pull", "push", "rebase", "remote", "replace", "reset",
-    "restore", "rm", "sparse-checkout", "stash", "submodule", "switch", "tag",
-    "update-index", "update-ref", "worktree",
+    "notes", "pack-refs", "prune", "pull", "push", "rebase", "remote", "replace",
+    "reset", "restore", "rm", "sparse-checkout", "stash", "submodule", "switch",
+    "tag", "update-index", "update-ref", "worktree",
 }
+GH_GLOBAL_VALUE_OPTIONS = {"--hostname", "--repo", "-R"}
 
 
 def _is_force_push(command: str) -> bool:
@@ -234,12 +235,45 @@ def _bash_writes_files(command: str, *, _depth: int = 0) -> bool:
                 break
             if subcommand in GIT_WRITE_COMMANDS:
                 return True
+            if subcommand == "symbolic-ref":
+                subcommand_index = arguments.index(subcommand)
+                symbolic_arguments = arguments[subcommand_index + 1:]
+                positionals: list[str] = []
+                skip = False
+                for argument in symbolic_arguments:
+                    if argument in SHELL_CONTROLS:
+                        break
+                    if skip:
+                        skip = False
+                        continue
+                    if argument == "-m":
+                        skip = True
+                        continue
+                    if argument == "--delete":
+                        return True
+                    if not argument.startswith("-"):
+                        positionals.append(argument)
+                if len(positionals) >= 2:
+                    return True
+            if subcommand == "reflog":
+                subcommand_index = arguments.index(subcommand)
+                action = "show"
+                for argument in arguments[subcommand_index + 1:]:
+                    if argument in SHELL_CONTROLS:
+                        break
+                    if not argument.startswith("-"):
+                        action = argument
+                        break
+                if action in {"delete", "drop", "expire", "write"}:
+                    return True
         if executable == "find" and "-delete" in tokens[index + 1:]:
             return True
     return False
 
 
-def _gh_invocations(command: str) -> tuple[list[list[str]], bool]:
+def _gh_invocations(
+    command: str, *, _depth: int = 0
+) -> tuple[list[list[str]], bool]:
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
         lexer.whitespace_split = True
@@ -249,6 +283,7 @@ def _gh_invocations(command: str) -> tuple[list[list[str]], bool]:
         return [], bool(re.search(r"(?:^|[\s\"'\\/])gh(?:[\s\"'\\/]|$)", command))
 
     invocations: list[list[str]] = []
+    ambiguous = False
     segments: list[list[str]] = [[]]
     for token in tokens:
         if token in SHELL_CONTROLS:
@@ -257,61 +292,123 @@ def _gh_invocations(command: str) -> tuple[list[list[str]], bool]:
             segments[-1].append(token)
     for segment in segments:
         for index, token in enumerate(segment):
-            if os.path.basename(token) == "gh":
+            executable = os.path.basename(token)
+            if executable == "gh":
                 invocations.append(segment[index + 1:])
-    return invocations, False
+            if executable in {"bash", "dash", "ksh", "sh", "zsh"}:
+                shell_arguments = segment[index + 1:]
+                for argument_index, argument in enumerate(shell_arguments):
+                    if argument == "-c" or (
+                        argument.startswith("-")
+                        and not argument.startswith("--")
+                        and "c" in argument[1:]
+                    ):
+                        if argument_index + 1 < len(shell_arguments):
+                            if _depth >= 4:
+                                ambiguous = True
+                            else:
+                                nested, nested_ambiguous = _gh_invocations(
+                                    shell_arguments[argument_index + 1],
+                                    _depth=_depth + 1,
+                                )
+                                invocations.extend(nested)
+                                ambiguous = ambiguous or nested_ambiguous
+                        break
+            if executable == "eval":
+                evaluated = segment[index + 1:]
+                if evaluated:
+                    if _depth >= 4:
+                        ambiguous = True
+                    else:
+                        nested, nested_ambiguous = _gh_invocations(
+                            " ".join(evaluated), _depth=_depth + 1
+                        )
+                        invocations.extend(nested)
+                        ambiguous = ambiguous or nested_ambiguous
+    return invocations, ambiguous
+
+
+def _gh_subcommand(arguments: list[str]) -> tuple[str | None, int | None]:
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in GH_GLOBAL_VALUE_OPTIONS:
+            if index + 1 >= len(arguments):
+                return None, None
+            index += 2
+            continue
+        if any(
+            argument.startswith(f"{option}=")
+            for option in GH_GLOBAL_VALUE_OPTIONS
+        ):
+            index += 1
+            continue
+        if argument.startswith("-R") and len(argument) > 2:
+            index += 1
+            continue
+        if argument in {"--help", "--version"}:
+            index += 1
+            continue
+        if argument.startswith("-"):
+            return None, None
+        return argument, index
+    return None, None
 
 
 def _merge_scope(command: str) -> tuple[str, str, str] | None:
     from orchestration_contract import normalize_github_url, normalize_repository
 
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
+    invocations, ambiguous = _gh_invocations(command)
+    if ambiguous:
         return None
-    merge_indexes = [
-        index
-        for index in range(len(tokens) - 2)
-        if os.path.basename(tokens[index]) == "gh"
-        and tokens[index + 1:index + 3] == ["pr", "merge"]
-    ]
-    if len(merge_indexes) != 1:
+    merge_invocations: list[tuple[list[str], int]] = []
+    for invocation in invocations:
+        subcommand, subcommand_index = _gh_subcommand(invocation)
+        if (
+            subcommand == "pr"
+            and isinstance(subcommand_index, int)
+            and invocation[subcommand_index + 1:subcommand_index + 2] == ["merge"]
+        ):
+            merge_invocations.append((invocation, subcommand_index))
+    if len(merge_invocations) != 1:
         return None
-    for index in merge_indexes:
-        arguments: list[str] = []
-        for token in tokens[index + 3:]:
-            if token in SHELL_CONTROLS:
-                break
-            arguments.append(token)
+    for invocation, subcommand_index in merge_invocations:
+        arguments = invocation[subcommand_index + 2:]
         if any(
             argument in {"--admin", "--delete-branch"}
             or argument.startswith(("--admin=", "--delete-branch="))
+            or (
+                argument.startswith("-")
+                and not argument.startswith("--")
+                and "d" in argument[1:]
+            )
             for argument in arguments
         ):
             return None
-        def option_values(*options: str) -> list[str]:
-            values: list[str] = []
+        def option_values(source: list[str], *options: str) -> list[str]:
+            found: list[str] = []
             skip = False
-            for argument_index, argument in enumerate(arguments):
+            for argument_index, argument in enumerate(source):
                 if skip:
                     skip = False
                     continue
                 if argument in options:
-                    if argument_index + 1 >= len(arguments):
+                    if argument_index + 1 >= len(source):
                         return []
-                    values.append(arguments[argument_index + 1])
+                    found.append(source[argument_index + 1])
                     skip = True
                     continue
                 for option in options:
                     if argument.startswith(f"{option}="):
-                        values.append(argument.split("=", 1)[1])
-            return values
+                        found.append(argument.split("=", 1)[1])
+                    elif option == "-R" and argument.startswith("-R") and len(argument) > 2:
+                        found.append(argument[2:])
+            return found
 
-        repositories = option_values("--repo", "-R")
-        heads = option_values("--match-head-commit")
+        repositories = option_values(
+            invocation[:subcommand_index] + arguments, "--repo", "-R"
+        )
+        heads = option_values(arguments, "--match-head-commit")
         if len(repositories) != 1 or len(heads) != 1:
             return None
         repository = repositories[0]
@@ -546,10 +643,18 @@ def pre_tool_use(context: HookContext) -> HookResult:
     if ambiguous_gh and "merge" in command:
         return deny_tool("Ambiguous GitHub CLI merge invocation is denied.")
 
-    if any(
-        arguments[:1] == ["api"]
-        and any(MERGE_ENDPOINT.search(argument) for argument in arguments[1:])
+    classified_gh = [
+        (arguments, *_gh_subcommand(arguments))
         for arguments in gh_invocations
+    ]
+    if any(
+        subcommand == "api"
+        and isinstance(subcommand_index, int)
+        and any(
+            MERGE_ENDPOINT.search(argument)
+            for argument in arguments[subcommand_index + 1:]
+        )
+        for arguments, subcommand, subcommand_index in classified_gh
     ):
         return deny_tool(
             "Merging via gh api is forbidden; use gh pr merge --match-head-commit <sha> "
@@ -557,7 +662,11 @@ def pre_tool_use(context: HookContext) -> HookResult:
         )
 
     pr_merge_invocations = [
-        arguments for arguments in gh_invocations if arguments[:2] == ["pr", "merge"]
+        arguments
+        for arguments, subcommand, subcommand_index in classified_gh
+        if subcommand == "pr"
+        and isinstance(subcommand_index, int)
+        and arguments[subcommand_index + 1:subcommand_index + 2] == ["merge"]
     ]
     if pr_merge_invocations:
         if context.role != "jiminy":
