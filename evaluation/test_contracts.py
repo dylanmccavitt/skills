@@ -203,14 +203,40 @@ class EvaluationContractTests(unittest.TestCase):
         self.assert_invalid("public assets must be UTF-8 text")
 
     def test_private_grader_paths_cannot_leak_as_public_asset_names(self):
-        leak = (
-            self.root
-            / f"fixtures/{REVIEW}/public/payload/grader_tools/grade_review.py"
+        paths = (
+            "grader_tools/grade_review.py",
+            "grader-tools/grade-review.py",
         )
-        leak.parent.mkdir()
-        leak.write_text("# harmless content\n", encoding="utf-8")
+        for relative in paths:
+            with self.subTest(relative=relative):
+                leak = self.root / f"fixtures/{REVIEW}/public/payload" / relative
+                leak.parent.mkdir()
+                leak.write_text("# harmless content\n", encoding="utf-8")
+                self.rebind_fixture(REVIEW)
+                self.assert_invalid("held-out grader path leaked")
+                self.reset_corpus()
+
+    def test_sensitive_matching_uses_whole_token_boundaries(self):
+        prompt = self.root / f"fixtures/{LOW}/public/payload/prompt.md"
+        prompt.write_text("Make a focused change.\n", encoding="utf-8")
+        self.rebind_fixture(LOW)
+        self.assert_invalid("held-out grader detail leaked")
+
+        self.reset_corpus()
+        prompt = self.root / f"fixtures/{LOW}/public/payload/prompt.md"
+        prompt.write_text("Avoid unfocused changes.\n", encoding="utf-8")
+        self.rebind_fixture(LOW)
+        validate(self.root)
+
+        self.reset_corpus()
+        notes = (
+            self.root
+            / f"fixtures/{REVIEW}/public/payload/upgrader_tools/notes.md"
+        )
+        notes.parent.mkdir()
+        notes.write_text("Public upgrader documentation.\n", encoding="utf-8")
         self.rebind_fixture(REVIEW)
-        self.assert_invalid("held-out grader path leaked")
+        validate(self.root)
 
     def test_nested_expected_result_strings_cannot_leak_when_rebound(self):
         private_result = "private-result-token-42"

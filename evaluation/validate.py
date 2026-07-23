@@ -379,19 +379,20 @@ def _nested_sensitive_text(value: Any) -> set[str]:
     return sensitive
 
 
-def _normalized_leakage_text(value: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+def _leakage_tokens(value: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[^\W_]+", value.lower()))
 
 
 def _contains_sensitive_text(value: str, sensitive: set[str]) -> bool:
-    lowered = value.lower()
-    normalized = _normalized_leakage_text(value)
+    value_tokens = _leakage_tokens(value)
     for forbidden in sensitive:
-        if forbidden in lowered:
-            return True
-        normalized_forbidden = _normalized_leakage_text(forbidden)
-        if len(normalized_forbidden) >= 8 and normalized_forbidden in normalized:
-            return True
+        forbidden_tokens = _leakage_tokens(forbidden)
+        if not forbidden_tokens or len(forbidden_tokens) > len(value_tokens):
+            continue
+        width = len(forbidden_tokens)
+        for index in range(len(value_tokens) - width + 1):
+            if value_tokens[index : index + width] == forbidden_tokens:
+                return True
     return False
 
 
