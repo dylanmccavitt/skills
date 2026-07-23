@@ -1,11 +1,15 @@
 # Evaluation contracts and protocol replay
 
 This directory contains immutable evaluation inputs for later workflow runners.
-It also contains a deterministic, standard-library protocol replay command that
-reads historical workflow JSON strictly as data and produces versioned raw
-evidence. It does not execute Codex, collect telemetry, aggregate trials, score
-workflow versions, or produce reports. Passing these contracts cannot establish
-that one workflow is better.
+It also contains deterministic, standard-library replay and comparison
+commands. Replay reads historical workflow JSON strictly as data and produces
+versioned raw evidence. Comparison validates complete replay runs and strict
+comparability before building one normalized display model and rendering
+Markdown plus a static HTML dashboard.
+
+Every comparison output describes deterministic protocol behavior only. It does
+not measure live-agent delivery quality, cost, latency, model performance,
+production safety, or identify a winning workflow.
 
 ## Versioned layout
 
@@ -20,6 +24,10 @@ that one workflow is better.
   rejected, blocked/resumed, and unsupported event behavior.
 - `replay.py` resolves local Git refs and writes one content-bound run directory
   per exact workflow commit.
+- `compare.py` validates complete run directories, constructs the strict
+  comparison/display model, and renders synchronized deterministic human output.
+- `baseline-v1/` records the exact four-ref raw evidence, canonical comparison
+  model, concise Markdown, and self-contained static HTML dashboard.
 
 An indexed contract version is immutable. Any incompatible schema, fixture, or
 evidence change requires a new version and new digests. Version 1 public assets
@@ -139,6 +147,52 @@ The checked-in tests construct equivalent local history without network access,
 including the bounded review/fix behavior introduced after v0.2.0 and the
 frozen candidate's additional merge-node review transition.
 
+## Frozen comparison baseline
+
+The version 1 baseline fixes workflow order to `v0.2.0`, `v0.4.0`, main anchor
+`365c4a6acebd6e7d40adb23f49d0e2bec6c60fbc`, and frozen candidate
+`5095aedcd498e868df791c122d2b8c687c9fb764`. `v0.4.0` is the designated
+comparison reference for signed event-count deltas. “Comparison reference” is
+not a winner, rank, score, or quality judgment.
+
+The comparison model is the only input to both renderers. Vocabulary version 1
+defines readable workflow, event, node, transition, disposition, error, status,
+unit, and delta semantics. Unknown future values render as “Unknown” alongside
+their exact raw value; the renderer never splits identifiers, title-cases raw
+values, guesses units, or treats sequence and counts as time. Replay records no
+wall-clock duration.
+
+Regenerate the exact checked-in raw evidence and all three derived outputs using
+only local refs:
+
+```sh
+python3 evaluation/replay.py \
+  --repo . \
+  --trace evaluation/replay-trace-v1.json \
+  --output evaluation/baseline-v1/raw \
+  --evaluator-ref 06f95fad117857fbeeab4b8a255ddee2dcbc41ee \
+  --ref v0.2.0 \
+  --ref v0.4.0 \
+  --ref 365c4a6acebd6e7d40adb23f49d0e2bec6c60fbc \
+  --ref 5095aedcd498e868df791c122d2b8c687c9fb764
+
+python3 evaluation/compare.py \
+  --output evaluation/baseline-v1 \
+  --baseline-run run-be30c7a68e8a732c789a28a3 \
+  --run evaluation/baseline-v1/raw/run-25461cb9e642f5f1573653ba \
+  --run evaluation/baseline-v1/raw/run-be30c7a68e8a732c789a28a3 \
+  --run evaluation/baseline-v1/raw/run-6c62c2be0d29c49ebf0d3c07 \
+  --run evaluation/baseline-v1/raw/run-aaa790b836d826c55da5b477
+```
+
+Check the checked-in bytes without rewriting them by repeating the comparison
+command with `--check`. `python3 evaluation/validate.py` performs the same
+model/source binding and derived-byte check as part of repository validation.
+Open `evaluation/baseline-v1/dashboard-v1.html` directly from disk; it contains
+no scripts, fonts, remote assets, server dependency, or network request. Its
+relative links reach the canonical manifest JSON, event JSONL, and result JSON
+for each run. The raw evidence remains the source of truth.
+
 Validate the checked-in corpus and replay contracts without network access:
 
 ```sh
@@ -149,5 +203,5 @@ python3 -m unittest discover -s evaluation -p "test_*.py"
 Raw replay evidence is evaluator output, not trusted telemetry or a quality
 conclusion. Consumers must validate all cross-artifact digests and state
 bindings before use. Live trials, repeated-trial statistics, cost and latency
-collection, Pareto analysis, reporting, ranking, and winner selection belong to
-later evaluation layers.
+collection, Pareto analysis, ranking, winner selection, and
+orchestration-policy changes belong to later evaluation layers.

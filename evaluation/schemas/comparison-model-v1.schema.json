@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dylanmccavitt/skills/evaluation/schemas/comparison-model-v1.schema.json",
+  "title": "Protocol replay comparison and display model v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "vocabulary_version",
+    "interpretation",
+    "comparison_reference_run_id",
+    "comparability",
+    "source_order",
+    "sources",
+    "summaries",
+    "flows"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "vocabulary_version": {"const": 1},
+    "interpretation": {"type": "string", "minLength": 1},
+    "comparison_reference_run_id": {"$ref": "#/$defs/run_id"},
+    "comparability": {"$ref": "#/$defs/comparability"},
+    "source_order": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/run_id"}
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/source"}
+    },
+    "summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/summary"}
+    },
+    "flows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/flow"}
+    }
+  },
+  "$defs": {
+    "run_id": {"type": "string", "pattern": "^run-[0-9a-f]{24}$"},
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "label": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw", "label", "explanation"],
+      "properties": {
+        "raw": {"type": ["string", "null"]},
+        "label": {"type": "string", "minLength": 1},
+        "explanation": {"type": ["string", "null"]}
+      }
+    },
+    "comparability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "suite.id",
+        "suite.version",
+        "suite.content_sha256",
+        "fixture.id",
+        "fixture.version",
+        "fixture.content_sha256",
+        "trace.id",
+        "trace.version",
+        "trace.content_sha256",
+        "evaluator.commit_sha",
+        "evaluator.version",
+        "initial_repository_sha",
+        "execution.kind",
+        "execution.model",
+        "execution.reasoning",
+        "execution.time_budget_seconds",
+        "execution.environment_contract_sha256",
+        "execution.trial_id"
+      ],
+      "properties": {
+        "suite.id": {"type": "string", "minLength": 1},
+        "suite.version": {"const": 1},
+        "suite.content_sha256": {"$ref": "#/$defs/digest"},
+        "fixture.id": {"type": "string", "minLength": 1},
+        "fixture.version": {"const": 1},
+        "fixture.content_sha256": {"$ref": "#/$defs/digest"},
+        "trace.id": {"type": "string", "minLength": 1},
+        "trace.version": {"const": 1},
+        "trace.content_sha256": {"$ref": "#/$defs/digest"},
+        "evaluator.commit_sha": {"$ref": "#/$defs/sha"},
+        "evaluator.version": {"const": 1},
+        "initial_repository_sha": {"$ref": "#/$defs/sha"},
+        "execution.kind": {"const": "protocol-replay"},
+        "execution.model": {"const": "non-agent"},
+        "execution.reasoning": {"const": "none"},
+        "execution.time_budget_seconds": {"type": "integer", "minimum": 1},
+        "execution.environment_contract_sha256": {"$ref": "#/$defs/digest"},
+        "execution.trial_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "events", "result"],
+      "properties": {
+        "manifest": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"},
+        "events": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"},
+        "result": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "workflow",
+        "workflow_commit_sha",
+        "workflow_content_sha256",
+        "manifest_sha256",
+        "event_trace_sha256",
+        "result_sha256",
+        "evidence",
+        "event_count"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "workflow": {"$ref": "#/$defs/label"},
+        "workflow_commit_sha": {"$ref": "#/$defs/sha"},
+        "workflow_content_sha256": {"$ref": "#/$defs/digest"},
+        "manifest_sha256": {"$ref": "#/$defs/digest"},
+        "event_trace_sha256": {"$ref": "#/$defs/digest"},
+        "result_sha256": {"$ref": "#/$defs/digest"},
+        "evidence": {"$ref": "#/$defs/evidence"},
+        "event_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "delta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "value"],
+      "properties": {
+        "state": {"$ref": "#/$defs/label"},
+        "value": {"type": ["integer", "null"]}
+      }
+    },
+    "count": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "unit", "value", "delta"],
+      "properties": {
+        "metric": {"$ref": "#/$defs/label"},
+        "unit": {"const": "event count"},
+        "value": {"type": "integer", "minimum": 0},
+        "delta": {"$ref": "#/$defs/delta"}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "status", "counts", "duration"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "status": {"$ref": "#/$defs/label"},
+        "counts": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "items": {"$ref": "#/$defs/count"}
+        },
+        "duration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "raw", "value", "unit", "delta"],
+          "properties": {
+            "status": {"$ref": "#/$defs/label"},
+            "raw": {"type": "null"},
+            "value": {"type": "null"},
+            "unit": {"type": "null"},
+            "delta": {"$ref": "#/$defs/delta"}
+          }
+        }
+      }
+    },
+    "flow_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "event",
+        "source_node",
+        "target_node",
+        "disposition",
+        "transition",
+        "error"
+      ],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 0},
+        "event": {"$ref": "#/$defs/label"},
+        "source_node": {"$ref": "#/$defs/label"},
+        "target_node": {"$ref": "#/$defs/label"},
+        "disposition": {"$ref": "#/$defs/label"},
+        "transition": {"$ref": "#/$defs/label"},
+        "error": {"$ref": "#/$defs/label"}
+      }
+    },
+    "flow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "events"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/flow_event"}
+        }
+      }
+    }
+  }
+}
