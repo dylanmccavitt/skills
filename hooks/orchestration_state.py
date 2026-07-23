@@ -19,6 +19,19 @@ from typing import Any
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 ROLES = {"gepetto", "jiminy", "research", "implementation", "review"}
+PROOF_DOMAINS = ("contract", "base", "head")
+INVALIDATION_EVENTS = {
+    "MATERIAL_CONTRACT_CHANGED": "contract",
+    "MATERIAL_BASE_CHANGED": "base",
+    "PR_HEAD_CHANGED": "head",
+}
+PROTECTED_CONTEXT_KEYS = {
+    "acceptance_receipts", "expected_pr_urls", "merge_ready",
+    "proof_lifecycle", "ready", "resume_node", "reviewed_head_sha",
+}
+FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+CONTENT_REF_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+REVIEW_ATTEMPT_PATTERN = CONTENT_REF_PATTERN
 
 
 def state_root() -> Path:
@@ -292,6 +305,281 @@ def _dict_container(state: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _proof_lifecycle(lane_state: dict[str, Any]) -> dict[str, Any]:
+    """Return the coordinator-owned proof lifecycle, initializing legacy lanes safely."""
+    lifecycle = lane_state.get("proof_lifecycle")
+    legacy_observations = {
+        "contract": lane_state.get("research_content_ref"),
+        "base": lane_state.get("base_sha"),
+        "head": lane_state.get("head_sha"),
+    }
+    if lifecycle is None:
+        observations = dict(legacy_observations)
+        for domain, observation in observations.items():
+            if observation is None:
+                continue
+            _validate_invalidation_observation(domain, observation)
+        lifecycle = {
+            "generations": {domain: 0 for domain in PROOF_DOMAINS},
+            "observations": observations,
+            "bindings": {},
+            "invalidation_history": [],
+        }
+        lane_state["proof_lifecycle"] = lifecycle
+    if not isinstance(lifecycle, dict):
+        raise ValueError("invalid proof lifecycle in orchestration state")
+    generations = lifecycle.get("generations")
+    observations = lifecycle.get("observations")
+    bindings = lifecycle.get("bindings")
+    history = lifecycle.get("invalidation_history")
+    if (
+        not isinstance(generations, dict)
+        or set(generations) != set(PROOF_DOMAINS)
+        or any(
+            type(generations[domain]) is not int or generations[domain] < 0
+            for domain in PROOF_DOMAINS
+        )
+        or not isinstance(observations, dict)
+        or set(observations) != set(PROOF_DOMAINS)
+        or not isinstance(bindings, dict)
+        or not isinstance(history, list)
+    ):
+        raise ValueError("invalid proof lifecycle in orchestration state")
+    for domain in PROOF_DOMAINS:
+        observation = observations.get(domain)
+        legacy_observation = legacy_observations[domain]
+        if observation is None and legacy_observation is not None:
+            _validate_invalidation_observation(domain, legacy_observation)
+            observations[domain] = legacy_observation
+        elif observation is not None:
+            _validate_invalidation_observation(domain, observation)
+    return lifecycle
+
+
+def _generation_tuple(lifecycle: dict[str, Any]) -> dict[str, int]:
+    return {domain: lifecycle["generations"][domain] for domain in PROOF_DOMAINS}
+
+
+def _binding_is_current(lifecycle: dict[str, Any], name: str) -> bool:
+    binding = lifecycle["bindings"].get(name)
+    return (
+        isinstance(binding, dict)
+        and binding.get("generations") == _generation_tuple(lifecycle)
+    )
+
+
+def _binding_evidence(lifecycle: dict[str, Any], name: str) -> dict[str, Any] | None:
+    if not _binding_is_current(lifecycle, name):
+        return None
+    binding = lifecycle["bindings"].get(name)
+    evidence = binding.get("evidence") if isinstance(binding, dict) else None
+    return evidence if isinstance(evidence, dict) else None
+
+
+def _accepted_merge_results(
+    ledger: dict[str, Any], expected_pr_urls: list[str]
+) -> dict[str, str]:
+    """Resolve every expected PR to its unique current accepted Jiminy result."""
+    accepted: dict[str, str] = {}
+    for pr_url in expected_pr_urls:
+        matches: list[str] = []
+        for lane_state in ledger.values():
+            if (
+                not isinstance(lane_state, dict)
+                or lane_state.get("tombstone")
+                or lane_state.get("pr") != pr_url
+                or not isinstance(lane_state.get("proof_lifecycle"), dict)
+            ):
+                continue
+            lifecycle = _proof_lifecycle(lane_state)
+            ready = _binding_evidence(lifecycle, "expected_merge_set")
+            result = _binding_evidence(lifecycle, "merge_result")
+            if (
+                ready is None
+                or ready.get("expected_pr_urls") != expected_pr_urls
+                or result is None
+                or result.get("pr_url") != pr_url
+                or result.get("reviewed_head_sha") != lifecycle["observations"].get("head")
+            ):
+                continue
+            merge_commit_sha = result.get("merge_commit_sha")
+            if isinstance(merge_commit_sha, str) and FULL_SHA_PATTERN.fullmatch(
+                merge_commit_sha
+            ):
+                matches.append(merge_commit_sha)
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected one current accepted merge result for {pr_url}, "
+                f"found {len(matches)}"
+            )
+        accepted[pr_url] = matches[0]
+    return accepted
+
+
+def _bind_current_proof(
+    lifecycle: dict[str, Any], name: str, evidence: dict[str, Any]
+) -> None:
+    lifecycle["bindings"][name] = {
+        "generations": _generation_tuple(lifecycle),
+        "evidence": evidence,
+    }
+
+
+def _validate_invalidation_observation(domain: str, observation: Any) -> str:
+    if not isinstance(observation, str):
+        raise ValueError(f"{domain} invalidation observation must be a string")
+    pattern = CONTENT_REF_PATTERN if domain == "contract" else FULL_SHA_PATTERN
+    if not pattern.fullmatch(observation):
+        expected = (
+            "sha256 content reference" if domain == "contract" else "full lowercase SHA"
+        )
+        raise ValueError(f"{domain} invalidation observation must be a {expected}")
+    return observation
+
+
+def _apply_invalidation(
+    lane_state: dict[str, Any],
+    event: str,
+    context: dict[str, Any],
+    *,
+    transition_id: str,
+    source_node: str,
+    target_node: str,
+    runner_session_id: str | None,
+) -> bool:
+    """Advance one proof generation. Return False for an exact idempotent replay."""
+    if set(context) != {"observation", "reason"}:
+        raise ValueError(
+            f"{event} context must contain exactly observation and reason"
+        )
+    reason = context.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("invalidation reason must be a non-empty string")
+    domain = INVALIDATION_EVENTS[event]
+    observation = _validate_invalidation_observation(domain, context.get("observation"))
+    lifecycle = _proof_lifecycle(lane_state)
+    history = lifecycle["invalidation_history"]
+    fingerprint = {"event": event, "observation": observation, "reason": reason}
+    old_observation = lifecycle["observations"].get(domain)
+    if old_observation == observation:
+        if any(
+            isinstance(entry, dict)
+            and all(entry.get(key) == value for key, value in fingerprint.items())
+            for entry in history
+        ):
+            return False
+        raise ValueError(f"{event} requires a genuinely new {domain} observation")
+    lifecycle["generations"][domain] += 1
+    lifecycle["observations"][domain] = observation
+    history.append({
+        **fingerprint,
+        "domain": domain,
+        "transition_id": transition_id,
+        "source_node": source_node,
+        "target_node": target_node,
+        "runner_session_id": runner_session_id,
+        "old_observation": old_observation,
+        "new_observation": observation,
+        "generations": _generation_tuple(lifecycle),
+        "timestamp": int(time.time()),
+    })
+
+    clear = {
+        "contract": {
+            "research", "implementation", "implementation_acceptance", "review", "ci",
+            "review_attempt", "expected_merge_set", "merge_result", "merge_ready",
+            "integration",
+        },
+        "base": {
+            "implementation", "implementation_acceptance", "review", "ci",
+            "review_attempt", "expected_merge_set", "merge_result", "merge_ready",
+            "integration",
+        },
+        "head": {
+            "implementation", "implementation_acceptance", "review", "ci",
+            "review_attempt", "expected_merge_set", "merge_result", "merge_ready",
+            "integration",
+        },
+    }[domain]
+    for name in clear:
+        lifecycle["bindings"].pop(name, None)
+    return True
+
+
+def _recorded_invalidation_replay(
+    lane_state: dict[str, Any], event: str, context: dict[str, Any], current_node: str
+) -> dict[str, Any] | None:
+    """Return a current exact retry recorded as producing the current node."""
+    if set(context) != {"observation", "reason"}:
+        raise ValueError(
+            f"{event} context must contain exactly observation and reason"
+        )
+    reason = context.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("invalidation reason must be a non-empty string")
+    domain = INVALIDATION_EVENTS[event]
+    observation = _validate_invalidation_observation(domain, context.get("observation"))
+    lifecycle = _proof_lifecycle(lane_state)
+    if lifecycle["observations"].get(domain) != observation:
+        return None
+    current_generations = _generation_tuple(lifecycle)
+    for entry in reversed(lifecycle["invalidation_history"]):
+        if (
+            isinstance(entry, dict)
+            and entry.get("event") == event
+            and entry.get("observation") == observation
+            and entry.get("reason") == reason
+            and entry.get("target_node") == current_node
+            and entry.get("generations") == current_generations
+            and isinstance(entry.get("source_node"), str)
+            and isinstance(entry.get("transition_id"), str)
+        ):
+            return entry
+    return None
+
+
+def _reject_stale_packet_replay(
+    lane_state: dict[str, Any],
+    event: str,
+    packet_digest: str,
+    fresh_review_attempt: bool,
+) -> None:
+    current = _generation_tuple(_proof_lifecycle(lane_state))
+    receipts = lane_state.get("acceptance_receipts", [])
+    if not isinstance(receipts, list):
+        raise ValueError("invalid acceptance receipt container")
+    if any(
+        isinstance(receipt, dict)
+        and receipt.get("event") == event
+        and receipt.get("packet_digest") == packet_digest
+        and not (event == "REVIEW_PACKET" and fresh_review_attempt)
+        and receipt.get("generations") != current
+        for receipt in receipts
+    ):
+        raise ValueError(f"stale {event} proof cannot be rebound to current generations")
+
+
+def _require_current_proof(lifecycle: dict[str, Any], event: str) -> None:
+    # Pre-F4 lanes may already be in flight without lifecycle bindings. Preserve
+    # that compatibility until the lane records proof or its first invalidation.
+    if (
+        event != "JIMINY_PR_RESULT"
+        and not lifecycle["bindings"]
+        and not lifecycle["invalidation_history"]
+    ):
+        return
+    required = {
+        "JIMINY_READY": ("review", "ci", "merge_ready"),
+        "JIMINY_PR_RESULT": ("review", "ci", "merge_ready", "expected_merge_set"),
+        "JIMINY_COMPLETE": ("merge_ready",),
+    }.get(event, ())
+    missing = [name for name in required if not _binding_is_current(lifecycle, name)]
+    if missing:
+        raise ValueError(
+            f"{event} requires current-generation proof: {', '.join(missing)}"
+        )
+
+
 def ledger_set(session_id: str, lane: str, updates: dict[str, Any]) -> Path:
     state = load_state(session_id)
     if state is None:
@@ -300,6 +588,9 @@ def ledger_set(session_id: str, lane: str, updates: dict[str, Any]) -> Path:
     lane_state = ledger.setdefault(_safe_id(lane), {})
     if not isinstance(lane_state, dict):
         raise ValueError(f"invalid ledger lane container: {lane}")
+    protected = sorted(set(updates) & PROTECTED_CONTEXT_KEYS)
+    if protected:
+        raise ValueError(f"trusted lane state cannot be set directly: {protected}")
     _deep_merge(lane_state, updates)
     return write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
 
@@ -344,6 +635,196 @@ def _is_continuation_successor(source_id: str, successor_id: str) -> bool:
     return False
 
 
+def bind_review_attempt(
+    session_id: str,
+    lane: str,
+    expected_revision: int,
+    actor_session_id: str,
+) -> dict[str, Any]:
+    """Persist one authenticated review attempt for the current proof generation."""
+    state = load_state(session_id)
+    if state is None:
+        raise ValueError(f"no registered session: {session_id}")
+    if state.get("role") != "gepetto" or not state.get("active"):
+        raise ValueError(
+            f"review-attempt binding requires an active Gepetto coordinator: {session_id}"
+        )
+    observed_revision = int(state.get("state_revision", 0))
+    if observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
+    ledger = _dict_container(state, "ledger")
+    lane = _safe_id(lane)
+    actor_session_id = _safe_id(actor_session_id)
+    lane_state = ledger.get(lane)
+    if not isinstance(lane_state, dict) or lane_state.get("tombstone"):
+        raise ValueError(f"no active ledger lane: {lane}")
+    if lane_state.get("node") != "review":
+        raise ValueError(f"review attempt can bind only at review: {lane}")
+    if actor_session_id != lane:
+        raise ValueError(f"actor {actor_session_id} does not own ledger lane {lane}")
+    verify_registration(
+        actor_session_id,
+        "review",
+        coordinator_thread_id=session_id,
+    )
+
+    lifecycle = _proof_lifecycle(lane_state)
+    existing = _binding_evidence(lifecycle, "review_attempt")
+    if (
+        existing is not None
+        and existing.get("actor_session_id") == actor_session_id
+        and existing.get("consumed") is False
+        and isinstance(existing.get("attempt_id"), str)
+    ):
+        return {
+            "lane": lane,
+            "state": lane_state,
+            "review_attempt_id": existing["attempt_id"],
+            "idempotent": True,
+        }
+
+    attempt_payload = json.dumps({
+        "actor_session_id": actor_session_id,
+        "coordinator_session_id": session_id,
+        "generations": _generation_tuple(lifecycle),
+        "lane": lane,
+        "state_revision": observed_revision,
+    }, sort_keys=True, separators=(",", ":")).encode()
+    attempt_id = "sha256:" + hashlib.sha256(
+        b"codex-review-attempt-v1\0" + attempt_payload
+    ).hexdigest()
+    _bind_current_proof(lifecycle, "review_attempt", {
+        "actor_session_id": actor_session_id,
+        "attempt_id": attempt_id,
+        "consumed": False,
+        "created_at": int(time.time()),
+    })
+    write_state(session_id, state, expected_revision=observed_revision)
+    return {
+        "lane": lane,
+        "state": lane_state,
+        "review_attempt_id": attempt_id,
+        "idempotent": False,
+    }
+
+
+def bind_jiminy_ready(
+    session_id: str,
+    lane: str,
+    expected_revision: int,
+    packet: dict[str, Any],
+    runner_session_id: str,
+) -> dict[str, Any]:
+    """Persist an authorized, generation-bound expected merge set."""
+    from orchestration_packets import canonical_packet_digest, validate_packet
+
+    validate_packet("JIMINY_READY", packet)
+    state = load_state(session_id)
+    if state is None:
+        raise ValueError(f"no registered session: {session_id}")
+    if state.get("role") != "gepetto" or not state.get("active"):
+        raise ValueError(f"ready binding requires an active Gepetto coordinator: {session_id}")
+    observed_revision = int(state.get("state_revision", 0))
+    if observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
+    if packet["coordinator_thread_id"] != session_id:
+        raise ValueError("JIMINY_READY coordinator does not match the persisted coordinator")
+
+    ledger = _dict_container(state, "ledger")
+    lane = _safe_id(lane)
+    lane_state = ledger.get(lane)
+    if not isinstance(lane_state, dict) or lane_state.get("tombstone"):
+        raise ValueError(f"no active ledger lane: {lane}")
+    if lane_state.get("node") != "merge":
+        raise ValueError(f"JIMINY_READY can bind only at merge: {lane}")
+
+    runner_session_id = _safe_id(runner_session_id)
+    verify_registration(runner_session_id, "jiminy", coordinator_thread_id=session_id)
+    bound_runner = lane_state.get("jiminy_runner_session_id")
+    if not isinstance(bound_runner, str):
+        raise ValueError(f"Jiminy-owned lane is not bound to a runner: {lane}")
+    if (
+        runner_session_id != bound_runner
+        and not _is_continuation_successor(bound_runner, runner_session_id)
+    ):
+        raise ValueError(
+            f"lane is bound to Jiminy runner {bound_runner}; "
+            f"{runner_session_id} is not its checkpoint successor"
+        )
+
+    lifecycle = _proof_lifecycle(lane_state)
+    legacy_in_flight = not lifecycle["bindings"] and not lifecycle["invalidation_history"]
+    _require_current_proof(lifecycle, "JIMINY_READY")
+    pr_url = lane_state.get("pr")
+    if not isinstance(pr_url, str):
+        raise ValueError(f"ledger lane has no persisted PR URL: {lane}")
+    ready_entry = next(
+        (item for item in packet["pull_requests"] if item["pr_url"] == pr_url),
+        None,
+    )
+    if ready_entry is None:
+        raise ValueError(f"JIMINY_READY does not contain the lane PR: {pr_url}")
+    trusted_head = lifecycle["observations"].get("head")
+    if ready_entry["reviewed_head_sha"] != trusted_head:
+        raise ValueError("JIMINY_READY reviewed head does not match current proof")
+    if any(
+        item["gates"]["review_packet_verified"] is not True
+        or item["gates"]["required_checks_green"] is not True
+        or item["gates"]["approvals_satisfied"] is not True
+        or item["gates"]["mergeable"] is not True
+        or type(item["gates"]["unresolved_required_threads"]) is not int
+        or item["gates"]["unresolved_required_threads"] != 0
+        for item in packet["pull_requests"]
+    ):
+        raise ValueError("JIMINY_READY requires every merge gate to be satisfied")
+
+    packet_digest = canonical_packet_digest(packet)
+    existing = lifecycle["bindings"].get("expected_merge_set")
+    existing_evidence = existing.get("evidence") if isinstance(existing, dict) else None
+    if (
+        _binding_is_current(lifecycle, "expected_merge_set")
+        and isinstance(existing_evidence, dict)
+        and existing_evidence.get("packet_digest") == packet_digest
+    ):
+        return {"lane": lane, "state": lane_state, "idempotent": True}
+    if _binding_is_current(lifecycle, "merge_result"):
+        raise ValueError("cannot replace JIMINY_READY after accepting merge results")
+
+    lane_state["jiminy_runner_session_id"] = runner_session_id
+    if legacy_in_flight:
+        _bind_current_proof(lifecycle, "review", {
+            "migration_source": "JIMINY_READY",
+            "reviewed_head_sha": ready_entry["reviewed_head_sha"],
+        })
+        _bind_current_proof(lifecycle, "ci", {
+            "migration_source": "JIMINY_READY",
+            "required_checks_green": True,
+            "reviewed_head_sha": ready_entry["reviewed_head_sha"],
+        })
+        _bind_current_proof(lifecycle, "merge_ready", {
+            "migration_source": "JIMINY_READY",
+            "reviewed_head_sha": ready_entry["reviewed_head_sha"],
+        })
+    _bind_current_proof(lifecycle, "expected_merge_set", {
+        "packet_digest": packet_digest,
+        "merge_authority": packet["merge_authority"],
+        "expected_pr_urls": list(packet["expected_pr_urls"]),
+        "merge_order": list(packet["merge_order"]),
+        "reviewed_heads": {
+            item["pr_url"]: item["reviewed_head_sha"]
+            for item in packet["pull_requests"]
+        },
+    })
+    write_state(session_id, state, expected_revision=observed_revision)
+    return {"lane": lane, "state": lane_state, "idempotent": False}
+
+
 def apply_graph_transition(
     session_id: str,
     lane: str,
@@ -352,6 +833,7 @@ def apply_graph_transition(
     context: dict[str, Any],
     workflow: dict[str, Any],
     runner_session_id: str | None = None,
+    expected_revision: int | None = None,
 ) -> dict[str, Any]:
     from orchestration_graph import eligible_transitions, resolve_target
     from orchestration_packets import PACKET_TYPES
@@ -364,6 +846,12 @@ def apply_graph_transition(
     state = load_state(session_id)
     if state is None:
         raise ValueError(f"no registered session: {session_id}")
+    observed_revision = int(state.get("state_revision", 0))
+    if expected_revision is not None and observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
     ledger = _dict_container(state, "ledger")
     lane = _safe_id(lane)
     lane_state = ledger.get(lane)
@@ -373,9 +861,96 @@ def apply_graph_transition(
         raise ValueError(
             f"ledger node mismatch for {lane}: expected {current_node}, observed {lane_state.get('node')}"
         )
+    if event in INVALIDATION_EVENTS and expected_revision is None:
+        raise ValueError(f"{event} requires --expected-revision")
+    if event not in INVALIDATION_EVENTS and set(context) & PROTECTED_CONTEXT_KEYS:
+        protected = sorted(set(context) & PROTECTED_CONTEXT_KEYS)
+        raise ValueError(f"caller context cannot overwrite trusted state: {protected}")
+
+    lifecycle = _proof_lifecycle(lane_state)
+    recorded_replay = (
+        _recorded_invalidation_replay(lane_state, event, context, current_node)
+        if event in INVALIDATION_EVENTS
+        else None
+    )
+    if recorded_replay is not None:
+        transition = next(
+            (
+                candidate
+                for candidate in workflow["transitions"]
+                if candidate["id"] == recorded_replay["transition_id"]
+                and candidate["event"] == event
+                and recorded_replay["source_node"] in candidate["from"]
+                and candidate.get("to") == current_node
+            ),
+            None,
+        )
+        if transition is None:
+            raise ValueError("recorded invalidation retry no longer matches the workflow")
+        source_owner = workflow["nodes"][recorded_replay["source_node"]].get("owner")
+        target_owner = workflow["nodes"][current_node].get("owner")
+        if "jiminy" in {source_owner, target_owner}:
+            if not runner_session_id:
+                raise ValueError("Jiminy runner session ID is required for this transition")
+            verify_registration(
+                runner_session_id,
+                "jiminy",
+                coordinator_thread_id=session_id,
+            )
+            recorded_runner = recorded_replay.get("runner_session_id")
+            if not isinstance(recorded_runner, str) or (
+                runner_session_id != recorded_runner
+                and not _is_continuation_successor(recorded_runner, runner_session_id)
+            ):
+                raise ValueError(
+                    f"invalidation was authorized by Jiminy runner {recorded_runner}; "
+                    f"{runner_session_id} is not its checkpoint successor"
+                )
+            bound_runner = lane_state.get("jiminy_runner_session_id")
+            if not isinstance(bound_runner, str) or (
+                runner_session_id != bound_runner
+                and not _is_continuation_successor(bound_runner, runner_session_id)
+            ):
+                raise ValueError(
+                    f"lane is bound to Jiminy runner {bound_runner}; "
+                    f"{runner_session_id} is not its checkpoint successor"
+                )
+        return {
+            "transition_id": transition["id"],
+            "lane": lane,
+            "state": lane_state,
+            "idempotent": True,
+        }
+    if event == "MERGES_VERIFIED":
+        if set(context) != {"packet"}:
+            raise ValueError("MERGES_VERIFIED context must contain exactly packet")
+        if not _binding_is_current(lifecycle, "merge_result"):
+            raise ValueError("MERGES_VERIFIED requires current-generation merge results")
+        if not _binding_is_current(lifecycle, "expected_merge_set"):
+            raise ValueError("MERGES_VERIFIED requires an authorized expected merge set")
+        binding = lifecycle["bindings"]["expected_merge_set"]
+        evidence = binding.get("evidence") if isinstance(binding, dict) else None
+        expected = evidence.get("expected_pr_urls") if isinstance(evidence, dict) else None
+        packet = context.get("packet")
+        results = packet.get("merge_results") if isinstance(packet, dict) else None
+        if (
+            not isinstance(expected, list) or not expected
+            or not all(isinstance(url, str) and url for url in expected)
+            or not isinstance(results, dict)
+        ):
+            raise ValueError("MERGES_VERIFIED has invalid persisted merge authorization")
+        accepted_results = _accepted_merge_results(ledger, expected)
+        if results != accepted_results:
+            raise ValueError(
+                "MERGES_VERIFIED results must equal current accepted per-PR results"
+            )
+
     evaluation_context = dict(lane_state)
     evaluation_context.update(context)
+    if event == "MERGES_VERIFIED":
+        evaluation_context["ready"] = {"expected_pr_urls": list(expected)}
     evaluation_context["persisted"] = dict(lane_state)
+    evaluation_context["persisted"]["head_sha"] = lifecycle["observations"].get("head")
     matches = eligible_transitions(workflow, current_node, event, evaluation_context)
     if len(matches) != 1:
         raise ValueError(f"expected one eligible transition, found {len(matches)}")
@@ -403,6 +978,23 @@ def apply_graph_transition(
                 f"lane is bound to Jiminy runner {bound_runner}; "
                 f"{runner_session_id} is not its checkpoint successor"
             )
+    if event in INVALIDATION_EVENTS:
+        if not _apply_invalidation(
+            lane_state,
+            event,
+            context,
+            transition_id=transition["id"],
+            source_node=current_node,
+            target_node=target_node,
+            runner_session_id=runner_session_id,
+        ):
+            return {
+                "transition_id": transition["id"],
+                "lane": lane,
+                "state": lane_state,
+                "idempotent": True,
+            }
+    if "jiminy" in {source_owner, target_owner}:
         lane_state["jiminy_runner_session_id"] = runner_session_id
     for key, value in transition.get("set", {}).items():
         lane_state[key] = value
@@ -416,8 +1008,17 @@ def apply_graph_transition(
         if type(current) is not int:
             raise ValueError(f"transition counter is not an integer: {path}")
         lane_state[path] = current + amount
+    if workflow["nodes"][target_node].get("resumable") is True:
+        lane_state["resume_node"] = current_node
+    elif event == "RESUME_AUTHORIZED":
+        lane_state.pop("resume_node", None)
+    if event == "MERGES_VERIFIED":
+        _bind_current_proof(lifecycle, "merge_ready", {
+            "expected_pr_urls": list(expected),
+            "merge_results": dict(context["packet"]["merge_results"]),
+        })
     lane_state["node"] = target_node
-    write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
+    write_state(session_id, state, expected_revision=observed_revision)
     return {"transition_id": transition["id"], "lane": lane, "state": lane_state}
 
 
@@ -430,6 +1031,7 @@ def accept_graph_event(
     packet: dict[str, Any],
     observed_pr_head_sha: str | None,
     runner_session_id: str | None = None,
+    review_attempt_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate and persist one packet-driven transition as one coordinator revision."""
     from orchestration_graph import eligible_transitions, load_workflow, resolve_target
@@ -468,7 +1070,8 @@ def accept_graph_event(
     current_node = lane_state.get("node")
     if not isinstance(current_node, str) or current_node not in workflow["nodes"]:
         raise ValueError(f"ledger lane has no valid workflow node: {lane}")
-
+    lifecycle = _proof_lifecycle(lane_state)
+    packet_digest = canonical_packet_digest(packet)
     candidates = [
         transition
         for transition in workflow["transitions"]
@@ -554,10 +1157,40 @@ def accept_graph_event(
         runner_session_id = _safe_id(runner_session_id)
     if expected_role == "jiminy" and runner_session_id not in {None, actor_session_id}:
         raise ValueError("a Jiminy packet actor must also be the selected Jiminy runner")
+    review_attempt_evidence: dict[str, Any] | None = None
+    if event == "REVIEW_PACKET" and (
+        lifecycle["invalidation_history"] or review_attempt_id is not None
+    ):
+        if (
+            not isinstance(review_attempt_id, str)
+            or not REVIEW_ATTEMPT_PATTERN.fullmatch(review_attempt_id)
+        ):
+            raise ValueError(
+                "REVIEW_PACKET after invalidation requires a current review attempt"
+            )
+        review_attempt_evidence = _binding_evidence(lifecycle, "review_attempt")
+        if (
+            review_attempt_evidence is None
+            or review_attempt_evidence.get("attempt_id") != review_attempt_id
+            or review_attempt_evidence.get("actor_session_id") != actor_session_id
+            or review_attempt_evidence.get("consumed") is not False
+        ):
+            raise ValueError(
+                "REVIEW_PACKET review attempt is stale, altered, consumed, or unauthorized"
+            )
+    elif review_attempt_id is not None:
+        raise ValueError("review attempt ID is valid only for REVIEW_PACKET")
+    _reject_stale_packet_replay(
+        lane_state,
+        event,
+        packet_digest,
+        fresh_review_attempt=review_attempt_evidence is not None,
+    )
 
     evaluation_context = dict(lane_state)
     evaluation_context["packet"] = packet
     evaluation_context["persisted"] = dict(lane_state)
+    evaluation_context["persisted"]["head_sha"] = lifecycle["observations"].get("head")
     evaluation_context["live"] = (
         {"pr_head_sha": observed_pr_head_sha} if observed_pr_head_sha is not None else {}
     )
@@ -566,6 +1199,22 @@ def accept_graph_event(
         raise ValueError(f"expected one eligible transition, found {len(matches)}")
     transition = matches[0]
     target_node = resolve_target(transition, evaluation_context, workflow["nodes"])
+
+    if event == "RESEARCH_PACKET":
+        contract_observation = packet["artifact"]["content_ref"]
+        current_contract = lifecycle["observations"].get("contract")
+        if current_contract not in {None, contract_observation}:
+            raise ValueError(
+                "changed research contract requires MATERIAL_CONTRACT_CHANGED"
+            )
+        lifecycle["observations"]["contract"] = contract_observation
+    elif event == "IMPLEMENTATION_PACKET":
+        lifecycle["observations"]["head"] = packet["pr_head_sha"]
+    elif event == "REVIEW_PACKET":
+        trusted_head = lifecycle["observations"].get("head")
+        if trusted_head not in {None, packet["reviewed_head_sha"]}:
+            raise ValueError("changed PR head requires PR_HEAD_CHANGED")
+        lifecycle["observations"]["head"] = packet["reviewed_head_sha"]
 
     source_owner = workflow["nodes"][current_node].get("owner")
     target_owner = workflow["nodes"][target_node].get("owner")
@@ -597,6 +1246,26 @@ def accept_graph_event(
                 f"{selected_runner} is not its checkpoint successor"
             )
         lane_state["jiminy_runner_session_id"] = selected_runner
+    _require_current_proof(lifecycle, event)
+    if event == "JIMINY_PR_RESULT":
+        expected_binding = lifecycle["bindings"].get("expected_merge_set")
+        expected_evidence = (
+            expected_binding.get("evidence")
+            if isinstance(expected_binding, dict) else None
+        )
+        expected_urls = (
+            expected_evidence.get("expected_pr_urls")
+            if isinstance(expected_evidence, dict) else None
+        )
+        if (
+            not isinstance(expected_evidence, dict)
+            or expected_evidence.get("merge_authority") != "merge"
+        ):
+            raise ValueError("JIMINY_PR_RESULT requires persisted merge authority")
+        if not isinstance(expected_urls, list) or packet["pr_url"] not in expected_urls:
+            raise ValueError("JIMINY_PR_RESULT is outside the authorized expected merge set")
+        if lane_state.get("pr") != packet["pr_url"]:
+            raise ValueError("JIMINY_PR_RESULT does not match the persisted lane PR")
     for key, value in transition.get("set", {}).items():
         lane_state[key] = value
     increment = transition.get("increment")
@@ -611,19 +1280,65 @@ def accept_graph_event(
         lane_state[path] = current + amount
     lane_state["node"] = target_node
 
+    if event == "RESEARCH_PACKET":
+        _bind_current_proof(lifecycle, "research", {
+            "packet_digest": packet_digest,
+            "content_ref": packet["artifact"]["content_ref"],
+        })
+    elif event == "IMPLEMENTATION_PACKET":
+        implementation_evidence = {
+            "packet_digest": packet_digest,
+            "pr_head_sha": packet["pr_head_sha"],
+        }
+        _bind_current_proof(lifecycle, "implementation", implementation_evidence)
+        _bind_current_proof(lifecycle, "implementation_acceptance", implementation_evidence)
+    elif event == "REVIEW_PACKET":
+        review_evidence = {
+            "packet_digest": packet_digest,
+            "reviewed_head_sha": packet["reviewed_head_sha"],
+        }
+        if review_attempt_evidence is not None:
+            review_attempt_evidence["consumed"] = True
+            review_attempt_evidence["packet_digest"] = packet_digest
+            review_evidence["review_attempt_id"] = review_attempt_id
+        _bind_current_proof(lifecycle, "review", review_evidence)
+        _bind_current_proof(lifecycle, "ci", {
+            "checks": packet["ci_checks"],
+            "reviewed_head_sha": packet["reviewed_head_sha"],
+        })
+        _bind_current_proof(lifecycle, "merge_ready", {
+            "ready_for_jiminy": packet["ready_for_jiminy"],
+            "reviewed_head_sha": packet["reviewed_head_sha"],
+        })
+    elif event == "JIMINY_PR_RESULT":
+        _bind_current_proof(lifecycle, "merge_result", {
+            "packet_digest": packet_digest,
+            "pr_url": packet["pr_url"],
+            "reviewed_head_sha": packet["reviewed_head_sha"],
+            "merge_commit_sha": packet["merge_commit_sha"],
+        })
+    elif event == "JIMINY_COMPLETE":
+        _bind_current_proof(lifecycle, "integration", {
+            "packet_digest": packet_digest,
+            "verified_default_head_sha": packet["verified_default_head_sha"],
+        })
+
     receipts = lane_state.get("acceptance_receipts", [])
     if not isinstance(receipts, list):
         raise ValueError(f"invalid acceptance receipt container for lane: {lane}")
     receipt = {
-        "packet_digest": canonical_packet_digest(packet),
+        "packet_digest": packet_digest,
         "actor_session_id": actor_session_id,
         "timestamp": int(time.time()),
         "event": event,
         "transition_id": transition["id"],
         "resulting_node": target_node,
+        "generations": _generation_tuple(lifecycle),
     }
     if head_bound:
         receipt["observed_pr_head_sha"] = observed_pr_head_sha
+    if event == "REVIEW_PACKET" and review_attempt_id is not None:
+        receipt["review_attempt_id"] = review_attempt_id
     lane_state["acceptance_receipts"] = [*receipts, receipt]
 
     write_state(session_id, state, expected_revision=expected_revision)
@@ -837,12 +1552,24 @@ def _parser() -> argparse.ArgumentParser:
     graph_apply_parser.add_argument("--lane", required=True)
     graph_apply_parser.add_argument("--current-node", required=True)
     graph_apply_parser.add_argument("--event", required=True)
+    graph_apply_parser.add_argument("--expected-revision", type=int)
     graph_apply_parser.add_argument("--context-json", default="{}")
     graph_apply_parser.add_argument("--runner-session-id")
     graph_apply_parser.add_argument(
         "--workflow", type=Path,
         default=Path(__file__).parents[1] / "gepetto" / "references" / "workflow.json",
     )
+    graph_ready_parser = graph_actions.add_parser("ready")
+    graph_ready_parser.add_argument("--session-id", required=True)
+    graph_ready_parser.add_argument("--lane", required=True)
+    graph_ready_parser.add_argument("--expected-revision", type=int, required=True)
+    graph_ready_parser.add_argument("--packet-json", required=True)
+    graph_ready_parser.add_argument("--runner-session-id", required=True)
+    graph_attempt_parser = graph_actions.add_parser("review-attempt")
+    graph_attempt_parser.add_argument("--session-id", required=True)
+    graph_attempt_parser.add_argument("--lane", required=True)
+    graph_attempt_parser.add_argument("--actor-session-id", required=True)
+    graph_attempt_parser.add_argument("--expected-revision", type=int, required=True)
     graph_accept_parser = graph_actions.add_parser("accept")
     graph_accept_parser.add_argument("--session-id", required=True)
     graph_accept_parser.add_argument("--lane", required=True)
@@ -852,6 +1579,7 @@ def _parser() -> argparse.ArgumentParser:
     graph_accept_parser.add_argument("--packet-json", required=True)
     graph_accept_parser.add_argument("--observed-pr-head-sha")
     graph_accept_parser.add_argument("--runner-session-id")
+    graph_accept_parser.add_argument("--review-attempt-id")
 
     subparsers.add_parser("status")
     return parser
@@ -980,7 +1708,7 @@ def main() -> int:
                 context = json.loads(args.context_json)
                 if not isinstance(context, dict):
                     raise ValueError("--context-json must be a JSON object")
-            else:
+            elif args.graph_command in {"ready", "accept"}:
                 def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
                     value: dict[str, Any] = {}
                     for key, item in pairs:
@@ -1002,6 +1730,19 @@ def main() -> int:
                     result = apply_graph_transition(
                         args.session_id, args.lane, args.current_node, args.event,
                         context, workflow, runner_session_id=args.runner_session_id,
+                        expected_revision=args.expected_revision,
+                    )
+                elif args.graph_command == "ready":
+                    result = bind_jiminy_ready(
+                        args.session_id, args.lane, args.expected_revision, packet,
+                        args.runner_session_id,
+                    )
+                elif args.graph_command == "review-attempt":
+                    result = bind_review_attempt(
+                        args.session_id,
+                        args.lane,
+                        args.expected_revision,
+                        args.actor_session_id,
                     )
                 else:
                     result = accept_graph_event(
@@ -1009,6 +1750,7 @@ def main() -> int:
                         args.expected_revision, args.event, packet,
                         args.observed_pr_head_sha,
                         runner_session_id=args.runner_session_id,
+                        review_attempt_id=args.review_attempt_id,
                     )
             except (OSError, ValueError) as error:
                 print(f"orchestration_state: {error}", file=sys.stderr)

@@ -8,7 +8,7 @@ Every packet is exactly one `PACKET_TYPE:` header followed by one JSON object. `
 
 [`workflow.json`](workflow.json) is the canonical machine-readable topology for this protocol. Validate it with `python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_graph.py"` before dispatch. The skills remain the behavioral contracts for active tasks; the graph only records nodes, events, guards, invalidation routes, and terminal states.
 
-Maintain each live lane's current node, prior node as `resume_node` when blocked, review/fix cycle count, and last accepted packet/head in the persisted ledger (see Ledger). Apply these graph events explicitly:
+Maintain each live lane's current node, review/fix cycle count, and last accepted packet/head in the persisted ledger (see Ledger). The state runtime owns proof generations, proof bindings, invalidation history, and `resume_node`; callers must not write those fields directly. Apply these graph events explicitly:
 
 - `MATERIAL_CONTRACT_CHANGED` returns the affected work to research.
 - `MATERIAL_BASE_CHANGED` returns it to Pinocchio implementation.
@@ -17,7 +17,15 @@ Maintain each live lane's current node, prior node as `resume_node` when blocked
 - `REVIEW_FIX_LIMIT_EXCEEDED` enters `needs_decision` using the workflow policy limit.
 - `DELIVERY_CANCELLED` is terminal and does not imply destructive cleanup.
 
-`JIMINY_PR_RESULT.reviewed_head_sha` must equal the lane's persisted reviewed `head_sha`; caller-supplied context cannot replace that ledger value.
+`JIMINY_PR_RESULT.reviewed_head_sha` must equal the lane's trusted current head observation; caller-supplied context cannot replace that value.
+
+When an in-flight pre-F4 or earlier-F4 lane first enters the proof lifecycle, the runtime type-checks and backfills missing contract/base/head observations from `research_content_ref`, `base_sha`, and `head_sha`. Existing non-null lifecycle observations remain authoritative.
+
+Contract, base, and head invalidations require the current coordinator revision plus a typed new observation and non-empty reason. Contract observations are `sha256:` content refs; base and head observations are full lowercase SHAs. The state runtime advances the matching generation once, preserves history, clears affected current proof, and treats an exact event/observation/reason replay as a no-op:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph apply --session-id <gepetto-task-id> --lane <lane-task-id> --current-node <node> --event <MATERIAL_CONTRACT_CHANGED|MATERIAL_BASE_CHANGED|PR_HEAD_CHANGED> --expected-revision <current-coordinator-revision> --context-json '{"observation":"<content-ref-or-sha>","reason":"<reason>"}' [--runner-session-id <jiminy-task-id>]
+```
 
 Resolve `project_id` from the live Codex project list. Resolve completion scope from the user's request plus the current issue graph; stop for direction only when those conflict materially.
 
@@ -63,8 +71,10 @@ Jiminy does not run `complete` before its final response. Its valid exactly-once
 Persist lane state mechanically after registering each lane and after each accepted packet or node change; the JSON deep-merges into the coordinator session file:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger set --session-id <gepetto-task-id> --lane <lane-task-id> --json '{"role": "<role>", "issue": "<url>", "pr": "<url>", "head_sha": "<sha>", "node": "<node>", "resume_node": "<node-or-null>", "review_fix_cycles": <n>}'
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" ledger set --session-id <gepetto-task-id> --lane <lane-task-id> --json '{"role": "<role>", "issue": "<url>", "pr": "<url>", "base_sha": "<sha>", "head_sha": "<sha>", "node": "<node>", "review_fix_cycles": <n>}'
 ```
+
+`proof_lifecycle`, acceptance receipts, `resume_node`, reviewed-head bindings, expected merge sets, and merge readiness are coordinator-owned state. Packet acceptance and administrative transitions update them atomically; `ledger set` rejects direct writes.
 
 Read it back on resume or checkpoint:
 
@@ -186,6 +196,14 @@ python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_st
 
 If the command reports no eligible transition, emit `REVIEW_FIX_LIMIT_EXCEEDED`, set `ready_for_jiminy: false`, include `review_fix_limit_exceeded` in `blockers`, and return control to Gepetto for a user decision. `PR_HEAD_CHANGED` from a fixer invalidates that fixer pass and returns to review.
 
+After any contract, base, or head invalidation, bind one authenticated review attempt at the current generation immediately before dispatching the fresh review. The command returns a trusted `review_attempt_id`; pass that exact value when accepting the resulting `REVIEW_PACKET`:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph review-attempt --session-id <gepetto-task-id> --lane <review-task-id> --actor-session-id <review-task-id> --expected-revision <current-coordinator-revision>
+```
+
+The binding is CAS-protected, current-generation proof owned by the authenticated review lane. Invalidation clears it, acceptance consumes it, the same reviewer may create a fresh attempt, and changing reviewer tasks does not make an old packet or attempt current.
+
 ## REVIEW_PACKET
 
 ```text
@@ -221,7 +239,7 @@ REVIEW_PACKET:
 After every required review packet is ready, create or reuse and authoritatively register the single Jiminy task. Only then move each ready review lane into the Jiminy-owned graph with the live runner bound mechanically:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph accept --session-id <gepetto-task-id> --lane <review-task-id> --actor-session-id <review-task-id> --expected-revision <current-coordinator-revision> --event REVIEW_PACKET --packet-json '<packet-json>' --observed-pr-head-sha <live-pr-head-sha> --runner-session-id <jiminy-task-id>
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph accept --session-id <gepetto-task-id> --lane <review-task-id> --actor-session-id <review-task-id> --expected-revision <current-coordinator-revision> --event REVIEW_PACKET --packet-json '<packet-json>' --observed-pr-head-sha <live-pr-head-sha> --review-attempt-id <trusted-review-attempt-id> --runner-session-id <jiminy-task-id>
 ```
 
 The state CLI verifies that the runner is an active `jiminy` registration resolving to this Gepetto coordinator and records its task ID on the lane. Pass the same current runner ID to every later graph transition whose source or target node is Jiminy-owned. After a Jiminy checkpoint, use the verified successor ID.
@@ -283,6 +301,12 @@ JIMINY_READY:
 
 Every listed PR must have a verified persisted implementation artifact and a `REVIEW_PACKET` bound to `reviewed_head_sha`. Any false or unknown required gate keeps the PR out of merge-ready state and must be reported as a blocker.
 
+Before accepting any merge result, persist the validated `JIMINY_READY` packet on every included merge lane. This binds the authorized expected PR set to the lane's current contract/base/head generations and bound Jiminy runner:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" graph ready --session-id <gepetto-task-id> --lane <review-task-id> --expected-revision <current-coordinator-revision> --packet-json '<JIMINY_READY-json>' --runner-session-id <jiminy-task-id>
+```
+
 ## JIMINY_PR_RESULT
 
 ```text
@@ -298,7 +322,7 @@ JIMINY_PR_RESULT:
 }
 ```
 
-Each result is intermediate and advances no phase by itself. Accept it with `graph accept`, the current coordinator revision, the bound Jiminy actor, and the exact packet JSON; this records the same-node acceptance receipt atomically. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public administrative `graph apply` command with `ready.expected_pr_urls` and `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. It is eligible only when the result-map keys exactly equal `JIMINY_READY.expected_pr_urls` and every value is a full SHA; missing, extra, or malformed PR/commit results block integration verification.
+Each result is intermediate and advances no phase by itself. Accept it with `graph accept`, the current coordinator revision, the bound Jiminy actor, and the exact packet JSON; acceptance requires the persisted current-generation `JIMINY_READY` binding and records the same-node receipt atomically. Persist results as an exact PR URL → verified full merge commit SHA map. Apply `MERGES_VERIFIED` through the public administrative `graph apply` command with only `packet.merge_results` in `--context-json`, plus `--runner-session-id <jiminy-task-id>`. The runtime compares the supplied map with the unique current-generation `JIMINY_PR_RESULT` binding on every expected PR lane, as well as the persisted authorized expected set; caller-supplied `ready.expected_pr_urls` is rejected. Missing, extra, fabricated, malformed, duplicate-lane, or stale-generation results block integration verification.
 
 ## JIMINY_INTEGRATION_FAILED
 
