@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "fixture_id": "low-risk-existing-tests-v1",
+  "fixture_version": 1,
+  "scenario_kind": "low_risk_existing_tests",
+  "prompt": "payload/prompt.md",
+  "acceptance_criteria": "payload/acceptance.md",
+  "seed_repository": "payload/seed",
+  "initial_repository": {
+    "default_branch": "main",
+    "initial_ref": "fixture-v1",
+    "clean_worktree": true
+  },
+  "grader": {
+    "id": "low-risk-existing-tests-grader",
+    "version": 1,
+    "digest": "sha256:bca2958b1a7e6e88fb9fa99d2990b8e2896a6a5bb98cdfafaff9c49dace459d5"
+  }
+}

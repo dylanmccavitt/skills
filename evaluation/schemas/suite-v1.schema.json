@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dylanmccavitt/skills/evaluation/schemas/suite-v1.schema.json",
+  "title": "Evaluation suite index version 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "suite_id", "suite_version", "fixtures"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "suite_id": {"type": "string", "minLength": 1},
+    "suite_version": {"const": 1},
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["fixture_id", "fixture_version", "manifest", "public_manifest_sha256", "public_payload_tree_sha256", "seed_repository_tree_sha256", "grader_contract_sha256"],
+        "properties": {
+          "fixture_id": {"type": "string", "minLength": 1},
+          "fixture_version": {"const": 1},
+          "manifest": {"type": "string", "minLength": 1},
+          "public_manifest_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "public_payload_tree_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "seed_repository_tree_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "grader_contract_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}
