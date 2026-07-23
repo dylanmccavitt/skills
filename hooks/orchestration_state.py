@@ -28,6 +28,7 @@ INVALIDATION_EVENTS = {
 PROTECTED_CONTEXT_KEYS = {
     "acceptance_receipts", "expected_pr_urls", "merge_ready",
     "proof_lifecycle", "ready", "resume_node", "reviewed_head_sha",
+    "validated_delivery_spec_digest",
 }
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 CONTENT_REF_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -503,6 +504,8 @@ def _apply_invalidation(
     }[domain]
     for name in clear:
         lifecycle["bindings"].pop(name, None)
+    if domain == "contract":
+        lane_state.pop("validated_delivery_spec_digest", None)
     return True
 
 
@@ -1030,6 +1033,7 @@ def accept_graph_event(
     event: str,
     packet: dict[str, Any],
     observed_pr_head_sha: str | None,
+    research_artifact_file: Path | None = None,
     runner_session_id: str | None = None,
     review_attempt_id: str | None = None,
 ) -> dict[str, Any]:
@@ -1048,6 +1052,22 @@ def accept_graph_event(
     validate_packet(event, packet)
     if observed_pr_head_sha is not None and not FULL_SHA.fullmatch(observed_pr_head_sha):
         raise ValueError("observed PR head must be a full 40-character SHA")
+    validated_spec_digest = None
+    if event == "RESEARCH_PACKET":
+        if research_artifact_file is None:
+            raise ValueError("RESEARCH_PACKET requires --research-artifact-file")
+        artifact_bytes = research_artifact_file.read_bytes()
+        artifact_ref = f"sha256:{_context_digest_contents([artifact_bytes])}"
+        if artifact_ref != packet["artifact"]["content_ref"]:
+            raise ValueError("research artifact file does not match packet content_ref")
+        from orchestration_contract import (
+            validate_delivery_artifact_bytes,
+            validate_delivery_packet_binding,
+        )
+        specification, validated_spec_digest = validate_delivery_artifact_bytes(artifact_bytes)
+        validate_delivery_packet_binding(specification, packet)
+    elif research_artifact_file is not None:
+        raise ValueError("--research-artifact-file is only valid for RESEARCH_PACKET")
 
     state = load_state(session_id)
     if state is None:
@@ -1186,6 +1206,12 @@ def accept_graph_event(
         packet_digest,
         fresh_review_attempt=review_attempt_evidence is not None,
     )
+    if event == "RESEARCH_PACKET":
+        contract_observation = packet["artifact"]["content_ref"]
+        current_contract = lifecycle["observations"].get("contract")
+        if current_contract not in {None, contract_observation}:
+            raise ValueError("changed research contract requires MATERIAL_CONTRACT_CHANGED")
+        lane_state["validated_delivery_spec_digest"] = validated_spec_digest
 
     evaluation_context = dict(lane_state)
     evaluation_context["packet"] = packet
@@ -1202,11 +1228,6 @@ def accept_graph_event(
 
     if event == "RESEARCH_PACKET":
         contract_observation = packet["artifact"]["content_ref"]
-        current_contract = lifecycle["observations"].get("contract")
-        if current_contract not in {None, contract_observation}:
-            raise ValueError(
-                "changed research contract requires MATERIAL_CONTRACT_CHANGED"
-            )
         lifecycle["observations"]["contract"] = contract_observation
     elif event == "IMPLEMENTATION_PACKET":
         lifecycle["observations"]["head"] = packet["pr_head_sha"]
@@ -1284,6 +1305,7 @@ def accept_graph_event(
         _bind_current_proof(lifecycle, "research", {
             "packet_digest": packet_digest,
             "content_ref": packet["artifact"]["content_ref"],
+            "validated_delivery_spec_digest": validated_spec_digest,
         })
     elif event == "IMPLEMENTATION_PACKET":
         implementation_evidence = {
@@ -1337,6 +1359,8 @@ def accept_graph_event(
     }
     if head_bound:
         receipt["observed_pr_head_sha"] = observed_pr_head_sha
+    if event == "RESEARCH_PACKET":
+        receipt["validated_delivery_spec_digest"] = validated_spec_digest
     if event == "REVIEW_PACKET" and review_attempt_id is not None:
         receipt["review_attempt_id"] = review_attempt_id
     lane_state["acceptance_receipts"] = [*receipts, receipt]
@@ -1385,13 +1409,7 @@ def context_digest(files: list[Path]) -> dict[str, Any]:
         raise ValueError("at least one context file is required")
     resolved = sorted(path.expanduser().resolve() for path in files)
     contents = [path.read_bytes() for path in resolved]
-    hasher = hashlib.sha256()
-    hasher.update(b"codex-orchestration-context\x00v1\x00")
-    hasher.update(len(contents).to_bytes(8, "big"))
-    for content in contents:
-        hasher.update(len(content).to_bytes(8, "big"))
-        hasher.update(content)
-    digest = hasher.hexdigest()
+    digest = _context_digest_contents(contents)
     return {
         "digest": digest,
         "ref": f"sha256:{digest}",
@@ -1399,6 +1417,16 @@ def context_digest(files: list[Path]) -> dict[str, Any]:
         "arity": len(contents),
         "files": [str(path) for path in resolved],
     }
+
+
+def _context_digest_contents(contents: list[bytes]) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(b"codex-orchestration-context\x00v1\x00")
+    hasher.update(len(contents).to_bytes(8, "big"))
+    for content in contents:
+        hasher.update(len(content).to_bytes(8, "big"))
+        hasher.update(content)
+    return hasher.hexdigest()
 
 
 def verify_registration(
@@ -1578,6 +1606,7 @@ def _parser() -> argparse.ArgumentParser:
     graph_accept_parser.add_argument("--event", required=True)
     graph_accept_parser.add_argument("--packet-json", required=True)
     graph_accept_parser.add_argument("--observed-pr-head-sha")
+    graph_accept_parser.add_argument("--research-artifact-file", type=Path)
     graph_accept_parser.add_argument("--runner-session-id")
     graph_accept_parser.add_argument("--review-attempt-id")
 
@@ -1749,6 +1778,7 @@ def main() -> int:
                         args.session_id, args.lane, args.actor_session_id,
                         args.expected_revision, args.event, packet,
                         args.observed_pr_head_sha,
+                        research_artifact_file=args.research_artifact_file,
                         runner_session_id=args.runner_session_id,
                         review_attempt_id=args.review_attempt_id,
                     )

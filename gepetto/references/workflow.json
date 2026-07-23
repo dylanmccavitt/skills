@@ -67,7 +67,8 @@
       "to": "implementation",
       "all": [
         {"path": "packet.artifact.status", "equals": "persisted"},
-        {"path": "packet.delivery_issue_urls", "non_empty": true}
+        {"path": "packet.delivery_issue_urls", "non_empty": true},
+        {"path": "persisted.validated_delivery_spec_digest", "content_ref": true}
       ]
     },
     {

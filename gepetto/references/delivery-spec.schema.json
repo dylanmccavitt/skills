@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dylanmccavitt.github.io/skills/delivery-spec/v1.schema.json",
+  "title": "Gepetto delivery specification version 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "intent",
+    "observable_outcome",
+    "non_goals",
+    "invariants",
+    "architecture_decisions",
+    "decision_owners",
+    "leaves",
+    "acceptance_criteria",
+    "external_effect_gates"
+  ],
+  "properties": {
+    "version": {"const": 1, "type": "integer"},
+    "intent": {"type": "string", "minLength": 1},
+    "observable_outcome": {"type": "string", "minLength": 1},
+    "non_goals": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "invariants": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "architecture_decisions": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/architecture_decision"}},
+    "decision_owners": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/decision_owner"}},
+    "leaves": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/leaf"}},
+    "acceptance_criteria": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/acceptance_criterion"}},
+    "external_effect_gates": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/external_effect_gate"}}
+  },
+  "$defs": {
+    "architecture_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["domain", "decision"],
+      "properties": {
+        "domain": {"type": "string", "minLength": 1},
+        "decision": {"type": "string", "minLength": 1}
+      }
+    },
+    "decision_owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["domain", "owner", "constraint"],
+      "properties": {
+        "domain": {"type": "string", "minLength": 1},
+        "owner": {"type": "string", "minLength": 1},
+        "constraint": {"type": "string", "minLength": 1}
+      }
+    },
+    "leaf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "issue_url", "dependencies", "owned_path_prefixes", "shared_paths"],
+      "properties": {
+        "id": {"type": "string", "pattern": "[A-Za-z0-9][A-Za-z0-9._-]*"},
+        "issue_url": {"type": "string", "minLength": 1},
+        "dependencies": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "[A-Za-z0-9][A-Za-z0-9._-]*"}},
+        "owned_path_prefixes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "shared_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "acceptance_criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "criterion", "validation"],
+      "properties": {
+        "id": {"type": "string", "pattern": "[A-Za-z0-9][A-Za-z0-9._-]*"},
+        "criterion": {"type": "string", "minLength": 1},
+        "validation": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "external_effect_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effect", "authority"],
+      "properties": {
+        "effect": {"type": "string", "minLength": 1},
+        "authority": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}
