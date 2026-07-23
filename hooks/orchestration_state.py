@@ -32,6 +32,7 @@ PROTECTED_CONTEXT_KEYS = {
 }
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 CONTENT_REF_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+REVIEW_ATTEMPT_PATTERN = CONTENT_REF_PATTERN
 
 
 def state_root() -> Path:
@@ -438,7 +439,14 @@ def _validate_invalidation_observation(domain: str, observation: Any) -> str:
 
 
 def _apply_invalidation(
-    lane_state: dict[str, Any], event: str, context: dict[str, Any]
+    lane_state: dict[str, Any],
+    event: str,
+    context: dict[str, Any],
+    *,
+    transition_id: str,
+    source_node: str,
+    target_node: str,
+    runner_session_id: str | None,
 ) -> bool:
     """Advance one proof generation. Return False for an exact idempotent replay."""
     if set(context) != {"observation", "reason"}:
@@ -467,6 +475,10 @@ def _apply_invalidation(
     history.append({
         **fingerprint,
         "domain": domain,
+        "transition_id": transition_id,
+        "source_node": source_node,
+        "target_node": target_node,
+        "runner_session_id": runner_session_id,
         "old_observation": old_observation,
         "new_observation": observation,
         "generations": _generation_tuple(lifecycle),
@@ -476,15 +488,18 @@ def _apply_invalidation(
     clear = {
         "contract": {
             "research", "implementation", "implementation_acceptance", "review", "ci",
-            "expected_merge_set", "merge_result", "merge_ready", "integration",
+            "review_attempt", "expected_merge_set", "merge_result", "merge_ready",
+            "integration",
         },
         "base": {
             "implementation", "implementation_acceptance", "review", "ci",
-            "expected_merge_set", "merge_result", "merge_ready", "integration",
+            "review_attempt", "expected_merge_set", "merge_result", "merge_ready",
+            "integration",
         },
         "head": {
             "implementation", "implementation_acceptance", "review", "ci",
-            "expected_merge_set", "merge_result", "merge_ready", "integration",
+            "review_attempt", "expected_merge_set", "merge_result", "merge_ready",
+            "integration",
         },
     }[domain]
     for name in clear:
@@ -494,8 +509,43 @@ def _apply_invalidation(
     return True
 
 
+def _recorded_invalidation_replay(
+    lane_state: dict[str, Any], event: str, context: dict[str, Any], current_node: str
+) -> dict[str, Any] | None:
+    """Return a current exact retry recorded as producing the current node."""
+    if set(context) != {"observation", "reason"}:
+        raise ValueError(
+            f"{event} context must contain exactly observation and reason"
+        )
+    reason = context.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("invalidation reason must be a non-empty string")
+    domain = INVALIDATION_EVENTS[event]
+    observation = _validate_invalidation_observation(domain, context.get("observation"))
+    lifecycle = _proof_lifecycle(lane_state)
+    if lifecycle["observations"].get(domain) != observation:
+        return None
+    current_generations = _generation_tuple(lifecycle)
+    for entry in reversed(lifecycle["invalidation_history"]):
+        if (
+            isinstance(entry, dict)
+            and entry.get("event") == event
+            and entry.get("observation") == observation
+            and entry.get("reason") == reason
+            and entry.get("target_node") == current_node
+            and entry.get("generations") == current_generations
+            and isinstance(entry.get("source_node"), str)
+            and isinstance(entry.get("transition_id"), str)
+        ):
+            return entry
+    return None
+
+
 def _reject_stale_packet_replay(
-    lane_state: dict[str, Any], event: str, packet_digest: str
+    lane_state: dict[str, Any],
+    event: str,
+    packet_digest: str,
+    fresh_review_attempt: bool,
 ) -> None:
     current = _generation_tuple(_proof_lifecycle(lane_state))
     receipts = lane_state.get("acceptance_receipts", [])
@@ -505,6 +555,7 @@ def _reject_stale_packet_replay(
         isinstance(receipt, dict)
         and receipt.get("event") == event
         and receipt.get("packet_digest") == packet_digest
+        and not (event == "REVIEW_PACKET" and fresh_review_attempt)
         and receipt.get("generations") != current
         for receipt in receipts
     ):
@@ -587,6 +638,82 @@ def _is_continuation_successor(source_id: str, successor_id: str) -> bool:
     return False
 
 
+def bind_review_attempt(
+    session_id: str,
+    lane: str,
+    expected_revision: int,
+    actor_session_id: str,
+) -> dict[str, Any]:
+    """Persist one authenticated review attempt for the current proof generation."""
+    state = load_state(session_id)
+    if state is None:
+        raise ValueError(f"no registered session: {session_id}")
+    if state.get("role") != "gepetto" or not state.get("active"):
+        raise ValueError(
+            f"review-attempt binding requires an active Gepetto coordinator: {session_id}"
+        )
+    observed_revision = int(state.get("state_revision", 0))
+    if observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
+    ledger = _dict_container(state, "ledger")
+    lane = _safe_id(lane)
+    actor_session_id = _safe_id(actor_session_id)
+    lane_state = ledger.get(lane)
+    if not isinstance(lane_state, dict) or lane_state.get("tombstone"):
+        raise ValueError(f"no active ledger lane: {lane}")
+    if lane_state.get("node") != "review":
+        raise ValueError(f"review attempt can bind only at review: {lane}")
+    if actor_session_id != lane:
+        raise ValueError(f"actor {actor_session_id} does not own ledger lane {lane}")
+    verify_registration(
+        actor_session_id,
+        "review",
+        coordinator_thread_id=session_id,
+    )
+
+    lifecycle = _proof_lifecycle(lane_state)
+    existing = _binding_evidence(lifecycle, "review_attempt")
+    if (
+        existing is not None
+        and existing.get("actor_session_id") == actor_session_id
+        and existing.get("consumed") is False
+        and isinstance(existing.get("attempt_id"), str)
+    ):
+        return {
+            "lane": lane,
+            "state": lane_state,
+            "review_attempt_id": existing["attempt_id"],
+            "idempotent": True,
+        }
+
+    attempt_payload = json.dumps({
+        "actor_session_id": actor_session_id,
+        "coordinator_session_id": session_id,
+        "generations": _generation_tuple(lifecycle),
+        "lane": lane,
+        "state_revision": observed_revision,
+    }, sort_keys=True, separators=(",", ":")).encode()
+    attempt_id = "sha256:" + hashlib.sha256(
+        b"codex-review-attempt-v1\0" + attempt_payload
+    ).hexdigest()
+    _bind_current_proof(lifecycle, "review_attempt", {
+        "actor_session_id": actor_session_id,
+        "attempt_id": attempt_id,
+        "consumed": False,
+        "created_at": int(time.time()),
+    })
+    write_state(session_id, state, expected_revision=observed_revision)
+    return {
+        "lane": lane,
+        "state": lane_state,
+        "review_attempt_id": attempt_id,
+        "idempotent": False,
+    }
+
+
 def bind_jiminy_ready(
     session_id: str,
     lane: str,
@@ -652,9 +779,13 @@ def bind_jiminy_ready(
     if any(
         item["gates"]["review_packet_verified"] is not True
         or item["gates"]["required_checks_green"] is not True
+        or item["gates"]["approvals_satisfied"] is not True
+        or item["gates"]["mergeable"] is not True
+        or type(item["gates"]["unresolved_required_threads"]) is not int
+        or item["gates"]["unresolved_required_threads"] != 0
         for item in packet["pull_requests"]
     ):
-        raise ValueError("JIMINY_READY requires verified review and CI gates")
+        raise ValueError("JIMINY_READY requires every merge gate to be satisfied")
 
     packet_digest = canonical_packet_digest(packet)
     existing = lifecycle["bindings"].get("expected_merge_set")
@@ -740,6 +871,59 @@ def apply_graph_transition(
         raise ValueError(f"caller context cannot overwrite trusted state: {protected}")
 
     lifecycle = _proof_lifecycle(lane_state)
+    recorded_replay = (
+        _recorded_invalidation_replay(lane_state, event, context, current_node)
+        if event in INVALIDATION_EVENTS
+        else None
+    )
+    if recorded_replay is not None:
+        transition = next(
+            (
+                candidate
+                for candidate in workflow["transitions"]
+                if candidate["id"] == recorded_replay["transition_id"]
+                and candidate["event"] == event
+                and recorded_replay["source_node"] in candidate["from"]
+                and candidate.get("to") == current_node
+            ),
+            None,
+        )
+        if transition is None:
+            raise ValueError("recorded invalidation retry no longer matches the workflow")
+        source_owner = workflow["nodes"][recorded_replay["source_node"]].get("owner")
+        target_owner = workflow["nodes"][current_node].get("owner")
+        if "jiminy" in {source_owner, target_owner}:
+            if not runner_session_id:
+                raise ValueError("Jiminy runner session ID is required for this transition")
+            verify_registration(
+                runner_session_id,
+                "jiminy",
+                coordinator_thread_id=session_id,
+            )
+            recorded_runner = recorded_replay.get("runner_session_id")
+            if not isinstance(recorded_runner, str) or (
+                runner_session_id != recorded_runner
+                and not _is_continuation_successor(recorded_runner, runner_session_id)
+            ):
+                raise ValueError(
+                    f"invalidation was authorized by Jiminy runner {recorded_runner}; "
+                    f"{runner_session_id} is not its checkpoint successor"
+                )
+            bound_runner = lane_state.get("jiminy_runner_session_id")
+            if not isinstance(bound_runner, str) or (
+                runner_session_id != bound_runner
+                and not _is_continuation_successor(bound_runner, runner_session_id)
+            ):
+                raise ValueError(
+                    f"lane is bound to Jiminy runner {bound_runner}; "
+                    f"{runner_session_id} is not its checkpoint successor"
+                )
+        return {
+            "transition_id": transition["id"],
+            "lane": lane,
+            "state": lane_state,
+            "idempotent": True,
+        }
     if event == "MERGES_VERIFIED":
         if set(context) != {"packet"}:
             raise ValueError("MERGES_VERIFIED context must contain exactly packet")
@@ -798,7 +982,15 @@ def apply_graph_transition(
                 f"{runner_session_id} is not its checkpoint successor"
             )
     if event in INVALIDATION_EVENTS:
-        if not _apply_invalidation(lane_state, event, context):
+        if not _apply_invalidation(
+            lane_state,
+            event,
+            context,
+            transition_id=transition["id"],
+            source_node=current_node,
+            target_node=target_node,
+            runner_session_id=runner_session_id,
+        ):
             return {
                 "transition_id": transition["id"],
                 "lane": lane,
@@ -843,6 +1035,7 @@ def accept_graph_event(
     observed_pr_head_sha: str | None,
     research_artifact_file: Path | None = None,
     runner_session_id: str | None = None,
+    review_attempt_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate and persist one packet-driven transition as one coordinator revision."""
     from orchestration_graph import eligible_transitions, load_workflow, resolve_target
@@ -899,14 +1092,6 @@ def accept_graph_event(
         raise ValueError(f"ledger lane has no valid workflow node: {lane}")
     lifecycle = _proof_lifecycle(lane_state)
     packet_digest = canonical_packet_digest(packet)
-    _reject_stale_packet_replay(lane_state, event, packet_digest)
-    if event == "RESEARCH_PACKET":
-        contract_observation = packet["artifact"]["content_ref"]
-        current_contract = lifecycle["observations"].get("contract")
-        if current_contract not in {None, contract_observation}:
-            raise ValueError("changed research contract requires MATERIAL_CONTRACT_CHANGED")
-        lane_state["validated_delivery_spec_digest"] = validated_spec_digest
-
     candidates = [
         transition
         for transition in workflow["transitions"]
@@ -992,6 +1177,41 @@ def accept_graph_event(
         runner_session_id = _safe_id(runner_session_id)
     if expected_role == "jiminy" and runner_session_id not in {None, actor_session_id}:
         raise ValueError("a Jiminy packet actor must also be the selected Jiminy runner")
+    review_attempt_evidence: dict[str, Any] | None = None
+    if event == "REVIEW_PACKET" and (
+        lifecycle["invalidation_history"] or review_attempt_id is not None
+    ):
+        if (
+            not isinstance(review_attempt_id, str)
+            or not REVIEW_ATTEMPT_PATTERN.fullmatch(review_attempt_id)
+        ):
+            raise ValueError(
+                "REVIEW_PACKET after invalidation requires a current review attempt"
+            )
+        review_attempt_evidence = _binding_evidence(lifecycle, "review_attempt")
+        if (
+            review_attempt_evidence is None
+            or review_attempt_evidence.get("attempt_id") != review_attempt_id
+            or review_attempt_evidence.get("actor_session_id") != actor_session_id
+            or review_attempt_evidence.get("consumed") is not False
+        ):
+            raise ValueError(
+                "REVIEW_PACKET review attempt is stale, altered, consumed, or unauthorized"
+            )
+    elif review_attempt_id is not None:
+        raise ValueError("review attempt ID is valid only for REVIEW_PACKET")
+    _reject_stale_packet_replay(
+        lane_state,
+        event,
+        packet_digest,
+        fresh_review_attempt=review_attempt_evidence is not None,
+    )
+    if event == "RESEARCH_PACKET":
+        contract_observation = packet["artifact"]["content_ref"]
+        current_contract = lifecycle["observations"].get("contract")
+        if current_contract not in {None, contract_observation}:
+            raise ValueError("changed research contract requires MATERIAL_CONTRACT_CHANGED")
+        lane_state["validated_delivery_spec_digest"] = validated_spec_digest
 
     evaluation_context = dict(lane_state)
     evaluation_context["packet"] = packet
@@ -1095,10 +1315,15 @@ def accept_graph_event(
         _bind_current_proof(lifecycle, "implementation", implementation_evidence)
         _bind_current_proof(lifecycle, "implementation_acceptance", implementation_evidence)
     elif event == "REVIEW_PACKET":
-        _bind_current_proof(lifecycle, "review", {
+        review_evidence = {
             "packet_digest": packet_digest,
             "reviewed_head_sha": packet["reviewed_head_sha"],
-        })
+        }
+        if review_attempt_evidence is not None:
+            review_attempt_evidence["consumed"] = True
+            review_attempt_evidence["packet_digest"] = packet_digest
+            review_evidence["review_attempt_id"] = review_attempt_id
+        _bind_current_proof(lifecycle, "review", review_evidence)
         _bind_current_proof(lifecycle, "ci", {
             "checks": packet["ci_checks"],
             "reviewed_head_sha": packet["reviewed_head_sha"],
@@ -1136,6 +1361,8 @@ def accept_graph_event(
         receipt["observed_pr_head_sha"] = observed_pr_head_sha
     if event == "RESEARCH_PACKET":
         receipt["validated_delivery_spec_digest"] = validated_spec_digest
+    if event == "REVIEW_PACKET" and review_attempt_id is not None:
+        receipt["review_attempt_id"] = review_attempt_id
     lane_state["acceptance_receipts"] = [*receipts, receipt]
 
     write_state(session_id, state, expected_revision=expected_revision)
@@ -1366,6 +1593,11 @@ def _parser() -> argparse.ArgumentParser:
     graph_ready_parser.add_argument("--expected-revision", type=int, required=True)
     graph_ready_parser.add_argument("--packet-json", required=True)
     graph_ready_parser.add_argument("--runner-session-id", required=True)
+    graph_attempt_parser = graph_actions.add_parser("review-attempt")
+    graph_attempt_parser.add_argument("--session-id", required=True)
+    graph_attempt_parser.add_argument("--lane", required=True)
+    graph_attempt_parser.add_argument("--actor-session-id", required=True)
+    graph_attempt_parser.add_argument("--expected-revision", type=int, required=True)
     graph_accept_parser = graph_actions.add_parser("accept")
     graph_accept_parser.add_argument("--session-id", required=True)
     graph_accept_parser.add_argument("--lane", required=True)
@@ -1376,6 +1608,7 @@ def _parser() -> argparse.ArgumentParser:
     graph_accept_parser.add_argument("--observed-pr-head-sha")
     graph_accept_parser.add_argument("--research-artifact-file", type=Path)
     graph_accept_parser.add_argument("--runner-session-id")
+    graph_accept_parser.add_argument("--review-attempt-id")
 
     subparsers.add_parser("status")
     return parser
@@ -1504,7 +1737,7 @@ def main() -> int:
                 context = json.loads(args.context_json)
                 if not isinstance(context, dict):
                     raise ValueError("--context-json must be a JSON object")
-            else:
+            elif args.graph_command in {"ready", "accept"}:
                 def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
                     value: dict[str, Any] = {}
                     for key, item in pairs:
@@ -1533,6 +1766,13 @@ def main() -> int:
                         args.session_id, args.lane, args.expected_revision, packet,
                         args.runner_session_id,
                     )
+                elif args.graph_command == "review-attempt":
+                    result = bind_review_attempt(
+                        args.session_id,
+                        args.lane,
+                        args.expected_revision,
+                        args.actor_session_id,
+                    )
                 else:
                     result = accept_graph_event(
                         args.session_id, args.lane, args.actor_session_id,
@@ -1540,6 +1780,7 @@ def main() -> int:
                         args.observed_pr_head_sha,
                         research_artifact_file=args.research_artifact_file,
                         runner_session_id=args.runner_session_id,
+                        review_attempt_id=args.review_attempt_id,
                     )
             except (OSError, ValueError) as error:
                 print(f"orchestration_state: {error}", file=sys.stderr)
