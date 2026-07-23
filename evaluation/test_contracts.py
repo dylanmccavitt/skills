@@ -4,7 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from validate import ContractError, load_json, validate
+from validate import (
+    ContractError,
+    document_digest,
+    load_json,
+    public_fixture_digest,
+    tree_digest,
+    validate,
+)
 
 
 HERE = Path(__file__).resolve().parent
@@ -30,6 +37,42 @@ class EvaluationContractTests(unittest.TestCase):
     def assert_invalid(self, message):
         with self.assertRaisesRegex(ContractError, message):
             validate(self.root)
+
+    def reset_corpus(self):
+        shutil.rmtree(self.root)
+        shutil.copytree(HERE, self.root, ignore=shutil.ignore_patterns("__pycache__"))
+
+    def rebind_fixture(self, fixture_id):
+        suite_path = self.root / "suite-v1.json"
+        suite = load_json(suite_path)
+        entry = next(
+            item for item in suite["fixtures"] if item["fixture_id"] == fixture_id
+        )
+        fixture_root = self.root / "fixtures" / fixture_id
+        manifest_path = fixture_root / "public/manifest-v1.json"
+        grader_path = fixture_root / "grader/grader-v1.json"
+        manifest = load_json(manifest_path)
+        grader = load_json(grader_path)
+        payload_digest = tree_digest(fixture_root / "public/payload")
+        seed_digest = tree_digest(fixture_root / "public/payload/seed")
+        grader["public_fixture_sha256"] = public_fixture_digest(
+            fixture_id, entry["fixture_version"], payload_digest, seed_digest
+        )
+        grader_path.write_text(json.dumps(grader, indent=2) + "\n", encoding="utf-8")
+        grader_digest = document_digest(grader)
+        manifest["grader"]["digest"] = grader_digest
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        entry.update(
+            {
+                "public_manifest_sha256": document_digest(manifest),
+                "public_payload_tree_sha256": payload_digest,
+                "seed_repository_tree_sha256": seed_digest,
+                "grader_contract_sha256": grader_digest,
+            }
+        )
+        suite_path.write_text(json.dumps(suite, indent=2) + "\n", encoding="utf-8")
 
     def test_checked_in_corpus_is_valid(self):
         result = validate(self.root)
@@ -59,8 +102,7 @@ class EvaluationContractTests(unittest.TestCase):
         )
         self.assert_invalid("non-blank|invalid identifier")
 
-        shutil.rmtree(self.root)
-        shutil.copytree(HERE, self.root, ignore=shutil.ignore_patterns("__pycache__"))
+        self.reset_corpus()
         (self.root / f"fixtures/{LOW}/public/payload/prompt.md").write_text(
             " \n", encoding="utf-8"
         )
@@ -80,8 +122,7 @@ class EvaluationContractTests(unittest.TestCase):
         )
         self.assert_invalid("duplicate fixture ID")
 
-        shutil.rmtree(self.root)
-        shutil.copytree(HERE, self.root, ignore=shutil.ignore_patterns("__pycache__"))
+        self.reset_corpus()
         self.rewrite_json(
             f"fixtures/{REVIEW}/grader/grader-v1.json",
             lambda value: value["checks"].append(dict(value["checks"][0])),
@@ -97,8 +138,7 @@ class EvaluationContractTests(unittest.TestCase):
         )
         self.assert_invalid("dangling manifest reference")
 
-        shutil.rmtree(self.root)
-        shutil.copytree(HERE, self.root, ignore=shutil.ignore_patterns("__pycache__"))
+        self.reset_corpus()
         self.rewrite_json(
             f"fixtures/{LOW}/public/manifest-v1.json",
             lambda value: value["grader"].update({"id": "wrong-grader"}),
@@ -110,8 +150,7 @@ class EvaluationContractTests(unittest.TestCase):
         prompt.write_text(prompt.read_text() + "tamper\n", encoding="utf-8")
         self.assert_invalid("tampering or binding drift")
 
-        shutil.rmtree(self.root)
-        shutil.copytree(HERE, self.root, ignore=shutil.ignore_patterns("__pycache__"))
+        self.reset_corpus()
         self.rewrite_json(
             f"fixtures/{LOW}/grader/grader-v1.json",
             lambda value: value.update(
@@ -142,9 +181,64 @@ class EvaluationContractTests(unittest.TestCase):
         self.assert_invalid("missing or extra version 1 schema documents")
 
     def test_held_out_details_cannot_leak_into_public_content(self):
-        prompt = self.root / f"fixtures/{LOW}/public/payload/prompt.md"
-        prompt.write_text("Run grader_tools/private.py\n", encoding="utf-8")
-        self.assert_invalid("held-out grader detail leaked")
+        cases = (
+            ("grader_tools/grade_review.py", "private command path"),
+            ("blocking_finding_detected=true", "private expected result"),
+            ("correctness-defect-found", "private check inventory"),
+            ("private rubric: award credit", "private rubric"),
+            ("seeded defect inventory", "private defect inventory"),
+        )
+        for leaked_text, label in cases:
+            with self.subTest(label=label):
+                prompt = self.root / f"fixtures/{REVIEW}/public/payload/prompt.md"
+                prompt.write_text(leaked_text + "\n", encoding="utf-8")
+                self.rebind_fixture(REVIEW)
+                self.assert_invalid("held-out grader detail leaked")
+                self.reset_corpus()
+
+    def test_non_utf8_public_assets_are_rejected_even_when_rebound(self):
+        leak = self.root / f"fixtures/{REVIEW}/public/payload/private.bin"
+        leak.write_bytes(b"\xffgrader_tools/grade_review.py")
+        self.rebind_fixture(REVIEW)
+        self.assert_invalid("public assets must be UTF-8 text")
+
+    def test_required_grading_categories_cannot_be_diagnostic_only(self):
+        grader_path = self.root / f"fixtures/{LOW}/grader/grader-v1.json"
+        grader = load_json(grader_path)
+        for check in grader["checks"]:
+            check["required"] = False
+        grader_path.write_text(json.dumps(grader, indent=2) + "\n", encoding="utf-8")
+        self.rebind_fixture(LOW)
+        self.assert_invalid("missing required grading categories")
+
+        self.reset_corpus()
+        grader_path = self.root / f"fixtures/{REVIEW}/grader/grader-v1.json"
+        grader = load_json(grader_path)
+        for check in grader["checks"]:
+            if check["category"] == "seeded_defect_detection":
+                check["required"] = False
+        grader_path.write_text(json.dumps(grader, indent=2) + "\n", encoding="utf-8")
+        self.rebind_fixture(REVIEW)
+        self.assert_invalid("missing required grading categories")
+
+    def test_non_json_numeric_constants_are_rejected(self):
+        grader_path = self.root / f"fixtures/{LOW}/grader/grader-v1.json"
+        text = grader_path.read_text(encoding="utf-8")
+        grader_path.write_text(
+            text.replace('"value": 0', '"value": NaN', 1), encoding="utf-8"
+        )
+        self.assert_invalid("non-JSON numeric constant")
+
+        for constant in ("Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                self.reset_corpus()
+                grader_path = self.root / f"fixtures/{LOW}/grader/grader-v1.json"
+                text = grader_path.read_text(encoding="utf-8")
+                grader_path.write_text(
+                    text.replace('"value": 0', f'"value": {constant}', 1),
+                    encoding="utf-8",
+                )
+                self.assert_invalid("non-JSON numeric constant")
 
     def test_symlink_assets_are_rejected(self):
         target = self.root / f"fixtures/{LOW}/public/payload/prompt.md"

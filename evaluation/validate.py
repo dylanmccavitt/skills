@@ -18,6 +18,9 @@ FORBIDDEN_PUBLIC_TEXT = (
     "grader_tools/",
     "grader_tests.",
     "private rubric",
+    "rubric:",
+    "defect inventory",
+    "seeded defect inventory",
     "expected observation",
     "seeded-defect inventory",
 )
@@ -36,11 +39,16 @@ def _pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
+def _reject_non_json_constant(value: str) -> None:
+    raise ContractError(f"non-JSON numeric constant: {value}")
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(
             path.read_text(encoding="utf-8"),
             object_pairs_hook=_pairs_no_duplicates,
+            parse_constant=_reject_non_json_constant,
         )
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ContractError(f"{path}: invalid JSON: {error}") from error
@@ -285,7 +293,7 @@ def validate_grader_shape(value: dict[str, Any], label: str) -> None:
     if not isinstance(checks, list) or not checks:
         raise ContractError(f"{label}.checks: must be a non-empty array")
     seen: set[str] = set()
-    categories: set[str] = set()
+    required_categories: set[str] = set()
     for index, check in enumerate(checks):
         check_label = f"{label}.checks[{index}]"
         _exact_keys(
@@ -303,9 +311,10 @@ def validate_grader_shape(value: dict[str, Any], label: str) -> None:
             "seeded_defect_detection",
         }:
             raise ContractError(f"{check_label}.category: unsupported category")
-        categories.add(check["category"])
         if not isinstance(check["required"], bool):
             raise ContractError(f"{check_label}.required: must be boolean")
+        if check["required"]:
+            required_categories.add(check["category"])
         execution = _exact_keys(
             check["execution"],
             f"{check_label}.execution",
@@ -329,16 +338,32 @@ def validate_grader_shape(value: dict[str, Any], label: str) -> None:
             {"observation", "value"},
         )
         _nonblank(expected["observation"], f"{check_label}.expected.observation")
-    required_categories = {"contract_fidelity"}
+    expected_required_categories = {"contract_fidelity"}
     if value["fixture_id"] == "low-risk-existing-tests-v1":
-        required_categories.add("functional_outcome")
+        expected_required_categories.add("functional_outcome")
     if value["fixture_id"] == "seeded-review-defects-v1":
-        required_categories.add("seeded_defect_detection")
-    if not required_categories <= categories:
+        expected_required_categories.add("seeded_defect_detection")
+    if not expected_required_categories <= required_categories:
         raise ContractError(f"{label}.checks: missing required grading categories")
 
 
-def _assert_public_boundary(public_root: Path) -> None:
+def _grader_sensitive_text(grader: dict[str, Any]) -> set[str]:
+    sensitive = set(FORBIDDEN_PUBLIC_TEXT)
+    for check in grader["checks"]:
+        sensitive.add(check["id"].lower())
+        sensitive.add(check["expected"]["observation"].lower())
+        argv = check["execution"]["argv"]
+        sensitive.add(" ".join(argv).lower())
+        sensitive.update(
+            arg.lower()
+            for arg in argv
+            if "/" in arg or "\\" in arg or "grader" in arg.lower()
+        )
+    return sensitive
+
+
+def _assert_public_boundary(public_root: Path, grader: dict[str, Any]) -> None:
+    forbidden_text = _grader_sensitive_text(grader)
     for path in public_root.rglob("*"):
         relative = path.relative_to(public_root).as_posix().lower()
         if "grader" in PurePosixPath(relative).parts:
@@ -346,9 +371,11 @@ def _assert_public_boundary(public_root: Path) -> None:
         if path.is_file():
             try:
                 text = path.read_text(encoding="utf-8").lower()
-            except UnicodeDecodeError:
-                continue
-            for forbidden in FORBIDDEN_PUBLIC_TEXT:
+            except UnicodeDecodeError as error:
+                raise ContractError(
+                    f"{path}: public assets must be UTF-8 text"
+                ) from error
+            for forbidden in forbidden_text:
                 if forbidden in text:
                     raise ContractError(
                         f"{path}: held-out grader detail leaked into public content"
@@ -444,7 +471,7 @@ def validate(root: Path = ROOT) -> dict[str, str]:
             _nonblank(asset.read_text(encoding="utf-8"), f"{fixture_id}.{field}")
         if public_root / manifest["seed_repository"] != seed_root:
             raise ContractError(f"{fixture_id}: seed repository reference drift")
-        _assert_public_boundary(public_root)
+        _assert_public_boundary(public_root, grader)
 
         manifest_digest = document_digest(manifest)
         payload_digest = tree_digest(payload_root)

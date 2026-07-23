@@ -17,6 +17,8 @@ better.
 
 An indexed fixture version is immutable. Any incompatible schema or fixture
 change requires a new schema or fixture version and new digests.
+Version 1 public assets are UTF-8 text; validation fails closed on undecodable
+content so binary files cannot bypass the grader-leakage checks.
 
 ## Canonical bytes and digests
 
@@ -39,7 +41,9 @@ Public manifests expose only an opaque grader ID, version, and grader-contract
 digest. They never expose grader paths, commands, expected observations,
 seeded-defect inventories, or private rubric text. A future runner must
 materialize only `public/payload/` for delivery, then stage the matching grader
-after delivery has stopped.
+after delivery has stopped. Validation derives private check IDs, command paths,
+commands, and expected-observation names from each grader contract and rejects
+them anywhere in the public tree.
 
 Validate the checked-in corpus without network access:
 
