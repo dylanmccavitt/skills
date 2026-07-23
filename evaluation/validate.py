@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import replay
+import compare
 
 
 ROOT = Path(__file__).resolve().parent
@@ -430,6 +431,7 @@ def _validate_schema_documents(root: Path) -> None:
         "run-manifest-v1.schema.json",
         "event-record-v1.schema.json",
         "run-result-v1.schema.json",
+        "comparison-model-v1.schema.json",
     }
     actual = {
         path.name for path in schema_root.iterdir() if path.is_file()
@@ -545,10 +547,33 @@ def validate(root: Path = ROOT) -> dict[str, str]:
         if manifest["grader"]["digest"] != grader_digest:
             raise ContractError(f"{fixture_id}: grader digest binding drift")
 
+    baseline_root = root / "baseline-v1"
+    comparison_path = baseline_root / "comparison-v1.json"
+    if not comparison_path.is_file():
+        raise ContractError("baseline-v1: missing comparison model")
+    try:
+        comparison = replay.load_json(comparison_path)
+        if replay.canonical_bytes(comparison) != comparison_path.read_bytes():
+            raise ContractError("baseline-v1: comparison model must be canonical")
+        compare.validate_model(comparison, baseline_root)
+        run_dirs = [
+            (baseline_root / source["evidence"]["manifest"]).parent
+            for source in comparison["sources"]
+        ]
+        compare.compare_runs(
+            run_dirs,
+            baseline_root,
+            comparison["comparison_reference_run_id"],
+            check=True,
+        )
+    except (compare.ComparisonError, replay.ReplayError) as error:
+        raise ContractError(f"baseline-v1: {error}") from error
+
     return {
         "suite": document_digest(suite),
         "fixtures": str(len(entries)),
         "trace": replay.digest_bytes(trace_bytes),
+        "comparison": replay.digest_bytes(comparison_path.read_bytes()),
     }
 
 
@@ -560,7 +585,8 @@ def main() -> int:
         return 1
     print(
         f"evaluation validation passed: {result['fixtures']} fixtures, "
-        f"suite {result['suite']}, trace {result['trace']}"
+        f"suite {result['suite']}, trace {result['trace']}, "
+        f"comparison {result['comparison']}"
     )
     return 0
 

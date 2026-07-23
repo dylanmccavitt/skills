@@ -142,10 +142,15 @@ python3 -m unittest discover -s evaluation -p "test_*.py"
 The versioned baseline corpus defines frozen inputs and held-out graders.
 `evaluation/replay.py` replays a canonical trace against multiple exact local
 workflow refs without checkout, network access, or historical-code execution,
-emitting strict run-manifest, JSONL event, and result evidence. It does not run
-agents, aggregate trials, or establish that one workflow version is better. See
+emitting strict run-manifest, JSONL event, and result evidence.
+`evaluation/compare.py` validates complete comparable runs and deterministically
+renders one normalized comparison model as synchronized Markdown and static
+HTML. The checked-in four-ref dashboard describes deterministic protocol
+behavior only; it does not measure live-agent quality, cost, latency, model
+performance, production safety, rank workflows, or select a winner. See
 [`evaluation/README.md`](evaluation/README.md) for canonical-byte rules,
-supported workflow-v1 vocabulary, comparability keys, and the trust boundary.
+supported workflow-v1 vocabulary, baseline regeneration, comparison semantics,
+and the trust boundary.
 
 ### Releases
 
