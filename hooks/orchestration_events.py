@@ -8,7 +8,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from orchestration_packets import parse_packet_message
+from orchestration_packets import canonical_packet_digest, parse_packet_message
 from orchestration_state import write_state
 
 
@@ -262,9 +262,10 @@ def stop(context: HookContext) -> JsonObject:
     receipt = LANE_RECEIPTS.get(context.role)
     valid = receipt is None
     packet_error = ""
+    packet: JsonObject | None = None
     if receipt is not None:
         try:
-            parse_packet_message(
+            _, packet = parse_packet_message(
                 context.payload.get("last_assistant_message"), expected_type=receipt
             )
             valid = True
@@ -282,6 +283,10 @@ def stop(context: HookContext) -> JsonObject:
         )
 
     if receipt:
+        if packet is None:
+            raise ValueError("validated terminal packet is missing")
+        context.state["terminal_packet_type"] = receipt
+        context.state["terminal_packet_digest"] = canonical_packet_digest(packet)
         context.state["active"] = False
         context.state["checkpoint_on_compact"] = False
         context.save()

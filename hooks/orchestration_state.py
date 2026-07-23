@@ -150,7 +150,10 @@ def write_state(
     expected_revision: int | None = None,
 ) -> Path:
     path, temporary = _stage_state(session_id, value, expected_revision)
-    temporary.replace(path)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
     return path
 
@@ -351,6 +354,12 @@ def apply_graph_transition(
     runner_session_id: str | None = None,
 ) -> dict[str, Any]:
     from orchestration_graph import eligible_transitions, resolve_target
+    from orchestration_packets import PACKET_TYPES
+
+    if event in PACKET_TYPES:
+        raise ValueError(
+            f"packet event {event} must use graph accept, not administrative graph apply"
+        )
 
     state = load_state(session_id)
     if state is None:
@@ -410,6 +419,220 @@ def apply_graph_transition(
     lane_state["node"] = target_node
     write_state(session_id, state, expected_revision=int(state.get("state_revision", 0)))
     return {"transition_id": transition["id"], "lane": lane, "state": lane_state}
+
+
+def accept_graph_event(
+    session_id: str,
+    lane: str,
+    actor_session_id: str,
+    expected_revision: int,
+    event: str,
+    packet: dict[str, Any],
+    observed_pr_head_sha: str | None,
+    runner_session_id: str | None = None,
+) -> dict[str, Any]:
+    """Validate and persist one packet-driven transition as one coordinator revision."""
+    from orchestration_graph import eligible_transitions, load_workflow, resolve_target
+    from orchestration_packets import (
+        FULL_SHA,
+        PACKET_TYPES,
+        canonical_packet_digest,
+        validate_packet,
+    )
+
+    workflow = load_workflow()
+    if event not in PACKET_TYPES:
+        raise ValueError(f"graph accept requires a supported packet event: {event}")
+    validate_packet(event, packet)
+    if observed_pr_head_sha is not None and not FULL_SHA.fullmatch(observed_pr_head_sha):
+        raise ValueError("observed PR head must be a full 40-character SHA")
+
+    state = load_state(session_id)
+    if state is None:
+        raise ValueError(f"no registered session: {session_id}")
+    if state.get("role") != "gepetto" or not state.get("active"):
+        raise ValueError(f"event acceptance requires an active Gepetto coordinator: {session_id}")
+    observed_revision = int(state.get("state_revision", 0))
+    if observed_revision != expected_revision:
+        raise ValueError(
+            f"state revision conflict for {session_id}: expected {expected_revision}, "
+            f"observed {observed_revision}"
+        )
+
+    ledger = _dict_container(state, "ledger")
+    lane = _safe_id(lane)
+    actor_session_id = _safe_id(actor_session_id)
+    lane_state = ledger.get(lane)
+    if not isinstance(lane_state, dict) or lane_state.get("tombstone"):
+        raise ValueError(f"no active ledger lane: {lane}")
+    current_node = lane_state.get("node")
+    if not isinstance(current_node, str) or current_node not in workflow["nodes"]:
+        raise ValueError(f"ledger lane has no valid workflow node: {lane}")
+
+    candidates = [
+        transition
+        for transition in workflow["transitions"]
+        if current_node in transition["from"] and transition["event"] == event
+    ]
+    if not candidates or any(transition.get("packet_type") != event for transition in candidates):
+        raise ValueError(f"no packet-driven transition for {event} from {current_node}")
+    head_bound = any(
+        condition.get("equals_path") == "live.pr_head_sha"
+        for transition in candidates
+        for condition in transition.get("all", [])
+    )
+    if head_bound and observed_pr_head_sha is None:
+        raise ValueError(f"event {event} requires an observed PR head")
+
+    expected_role = workflow["nodes"][current_node].get("lane_role")
+    if expected_role not in ROLES:
+        raise ValueError(f"packet event {event} has no supported actor role at {current_node}")
+    artifact = packet.get("artifact")
+    inline_research = (
+        workflow.get("policies", {}).get("inline_research") == "single_leaf_keep"
+        and event == "RESEARCH_PACKET"
+        and current_node == "research"
+        and expected_role == "research"
+        and actor_session_id == session_id
+        and lane == session_id
+        and packet.get("decision") == "keep"
+        and len(packet.get("delivery_issue_urls", [])) == 1
+        and isinstance(artifact, dict)
+        and artifact.get("kind") == "github_issue"
+        and artifact.get("status") == "persisted"
+    )
+    terminal_actor = False
+    if not inline_research:
+        actor_state = load_state(actor_session_id)
+        if actor_state is None:
+            raise ValueError(f"no registered session: {actor_session_id}")
+        if actor_state.get("active"):
+            verify_registration(
+                actor_session_id,
+                expected_role,
+                coordinator_thread_id=session_id,
+            )
+        else:
+            if actor_state.get("role") != expected_role:
+                raise ValueError(
+                    f"role mismatch for {actor_session_id}: expected {expected_role}, "
+                    f"registered {actor_state.get('role')}"
+                )
+            registered_coordinator = actor_state.get("coordinator_thread_id")
+            candidate = registered_coordinator
+            visited: set[str] = set()
+            resolved_coordinator = None
+            while isinstance(candidate, str) and candidate not in visited:
+                visited.add(candidate)
+                observed = load_state(candidate)
+                if observed and observed.get("role") == "gepetto" and observed.get("active"):
+                    resolved_coordinator = candidate
+                    break
+                candidate = observed.get("successor_id") if observed else None
+            if resolved_coordinator != session_id:
+                raise ValueError(
+                    f"coordinator mismatch for {actor_session_id}: expected {session_id}, "
+                    f"registered {registered_coordinator}"
+                )
+            if actor_state.get("successor_id"):
+                raise ValueError(
+                    f"checkpoint predecessor cannot accept a packet: {actor_session_id}"
+                )
+            if actor_state.get("forced_stop_without_receipt"):
+                raise ValueError(f"forced stop cannot authorize a packet: {actor_session_id}")
+            if (
+                actor_state.get("terminal_packet_type") != event
+                or actor_state.get("terminal_packet_digest") != canonical_packet_digest(packet)
+            ):
+                raise ValueError(
+                    f"inactive actor has no matching terminal receipt: {actor_session_id}"
+                )
+            terminal_actor = True
+    if expected_role != "jiminy" and actor_session_id != lane:
+        raise ValueError(f"actor {actor_session_id} does not own ledger lane {lane}")
+    if runner_session_id is not None:
+        runner_session_id = _safe_id(runner_session_id)
+    if expected_role == "jiminy" and runner_session_id not in {None, actor_session_id}:
+        raise ValueError("a Jiminy packet actor must also be the selected Jiminy runner")
+
+    evaluation_context = dict(lane_state)
+    evaluation_context["packet"] = packet
+    evaluation_context["persisted"] = dict(lane_state)
+    evaluation_context["live"] = (
+        {"pr_head_sha": observed_pr_head_sha} if observed_pr_head_sha is not None else {}
+    )
+    matches = eligible_transitions(workflow, current_node, event, evaluation_context)
+    if len(matches) != 1:
+        raise ValueError(f"expected one eligible transition, found {len(matches)}")
+    transition = matches[0]
+    target_node = resolve_target(transition, evaluation_context, workflow["nodes"])
+
+    source_owner = workflow["nodes"][current_node].get("owner")
+    target_owner = workflow["nodes"][target_node].get("owner")
+    selected_runner = runner_session_id
+    if "jiminy" in {source_owner, target_owner}:
+        selected_runner = selected_runner or (
+            actor_session_id if expected_role == "jiminy" else None
+        )
+        if selected_runner is None:
+            raise ValueError("Jiminy runner session ID is required for this transition")
+        if not (
+            terminal_actor
+            and expected_role == "jiminy"
+            and selected_runner == actor_session_id
+        ):
+            verify_registration(selected_runner, "jiminy", coordinator_thread_id=session_id)
+        bound_runner = lane_state.get("jiminy_runner_session_id")
+        if source_owner == "jiminy" and bound_runner is None:
+            raise ValueError(f"Jiminy-owned lane is not bound to a runner: {lane}")
+        if bound_runner is not None and (
+            not isinstance(bound_runner, str)
+            or (
+                selected_runner != bound_runner
+                and not _is_continuation_successor(bound_runner, selected_runner)
+            )
+        ):
+            raise ValueError(
+                f"lane is bound to Jiminy runner {bound_runner}; "
+                f"{selected_runner} is not its checkpoint successor"
+            )
+        lane_state["jiminy_runner_session_id"] = selected_runner
+    for key, value in transition.get("set", {}).items():
+        lane_state[key] = value
+    increment = transition.get("increment")
+    if increment:
+        path = increment.get("path")
+        amount = increment.get("by")
+        if not isinstance(path, str) or "." in path or not isinstance(amount, int):
+            raise ValueError(f"unsupported transition increment: {increment}")
+        current = lane_state.get(path, 0)
+        if type(current) is not int:
+            raise ValueError(f"transition counter is not an integer: {path}")
+        lane_state[path] = current + amount
+    lane_state["node"] = target_node
+
+    receipts = lane_state.get("acceptance_receipts", [])
+    if not isinstance(receipts, list):
+        raise ValueError(f"invalid acceptance receipt container for lane: {lane}")
+    receipt = {
+        "packet_digest": canonical_packet_digest(packet),
+        "actor_session_id": actor_session_id,
+        "timestamp": int(time.time()),
+        "event": event,
+        "transition_id": transition["id"],
+        "resulting_node": target_node,
+    }
+    if head_bound:
+        receipt["observed_pr_head_sha"] = observed_pr_head_sha
+    lane_state["acceptance_receipts"] = [*receipts, receipt]
+
+    write_state(session_id, state, expected_revision=expected_revision)
+    return {
+        "transition_id": transition["id"],
+        "lane": lane,
+        "state": lane_state,
+        "acceptance_receipt": receipt,
+    }
 
 
 def context_bind(
@@ -620,6 +843,15 @@ def _parser() -> argparse.ArgumentParser:
         "--workflow", type=Path,
         default=Path(__file__).parents[1] / "gepetto" / "references" / "workflow.json",
     )
+    graph_accept_parser = graph_actions.add_parser("accept")
+    graph_accept_parser.add_argument("--session-id", required=True)
+    graph_accept_parser.add_argument("--lane", required=True)
+    graph_accept_parser.add_argument("--actor-session-id", required=True)
+    graph_accept_parser.add_argument("--expected-revision", type=int, required=True)
+    graph_accept_parser.add_argument("--event", required=True)
+    graph_accept_parser.add_argument("--packet-json", required=True)
+    graph_accept_parser.add_argument("--observed-pr-head-sha")
+    graph_accept_parser.add_argument("--runner-session-id")
 
     subparsers.add_parser("status")
     return parser
@@ -743,20 +975,41 @@ def main() -> int:
     if args.command == "graph":
         from orchestration_graph import load_workflow
         try:
-            context = json.loads(args.context_json)
-            if not isinstance(context, dict):
-                raise ValueError("--context-json must be a JSON object")
-            workflow = load_workflow(args.workflow)
+            if args.graph_command == "apply":
+                workflow = load_workflow(args.workflow)
+                context = json.loads(args.context_json)
+                if not isinstance(context, dict):
+                    raise ValueError("--context-json must be a JSON object")
+            else:
+                def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                    value: dict[str, Any] = {}
+                    for key, item in pairs:
+                        if key in value:
+                            raise ValueError(f"--packet-json contains duplicate key: {key}")
+                        value[key] = item
+                    return value
+
+                packet = json.loads(args.packet_json, object_pairs_hook=unique_object)
+                if not isinstance(packet, dict):
+                    raise ValueError("--packet-json must be a JSON object")
         except (json.JSONDecodeError, OSError, ValueError) as error:
             print(f"orchestration_state: {error}", file=sys.stderr)
             return 1
         with registry_lock():
             recover_transactions()
             try:
-                result = apply_graph_transition(
-                    args.session_id, args.lane, args.current_node, args.event,
-                    context, workflow, runner_session_id=args.runner_session_id,
-                )
+                if args.graph_command == "apply":
+                    result = apply_graph_transition(
+                        args.session_id, args.lane, args.current_node, args.event,
+                        context, workflow, runner_session_id=args.runner_session_id,
+                    )
+                else:
+                    result = accept_graph_event(
+                        args.session_id, args.lane, args.actor_session_id,
+                        args.expected_revision, args.event, packet,
+                        args.observed_pr_head_sha,
+                        runner_session_id=args.runner_session_id,
+                    )
             except (OSError, ValueError) as error:
                 print(f"orchestration_state: {error}", file=sys.stderr)
                 return 1
