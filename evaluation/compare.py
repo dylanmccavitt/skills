@@ -448,9 +448,15 @@ def validate_model(model: dict[str, Any], output_root: Path) -> dict[str, Any]:
             "flows",
         },
     )
-    if model["schema_version"] != MODEL_VERSION:
+    if (
+        _integer(model["schema_version"], "comparison.schema_version", 1)
+        != MODEL_VERSION
+    ):
         raise ComparisonError("comparison.schema_version: unsupported version")
-    if model["vocabulary_version"] != VOCABULARY_VERSION:
+    if (
+        _integer(model["vocabulary_version"], "comparison.vocabulary_version", 1)
+        != VOCABULARY_VERSION
+    ):
         raise ComparisonError("comparison.vocabulary_version: unsupported version")
     if model["interpretation"] != DISCLAIMER:
         raise ComparisonError("comparison.interpretation: required disclaimer drift")
@@ -462,6 +468,22 @@ def validate_model(model: dict[str, Any], output_root: Path) -> dict[str, Any]:
     for path in replay.COMPARABILITY_PATHS:
         if comparability[path] is None:
             raise ComparisonError(f"comparison.comparability.{path}: missing value")
+        if path in {
+            "suite.version",
+            "fixture.version",
+            "trace.version",
+            "evaluator.version",
+        }:
+            if _integer(
+                comparability[path], f"comparison.comparability.{path}", 1
+            ) != 1:
+                raise ComparisonError(
+                    f"comparison.comparability.{path}: unsupported version"
+                )
+        elif path == "execution.time_budget_seconds":
+            _integer(
+                comparability[path], f"comparison.comparability.{path}", 1
+            )
     order = model["source_order"]
     if (
         not isinstance(order, list)
@@ -513,6 +535,7 @@ def validate_model(model: dict[str, Any], output_root: Path) -> dict[str, Any]:
             "result_sha256",
         ):
             replay._digest(item[field], f"{label}.{field}")
+        event_count = _integer(item["event_count"], f"{label}.event_count", 1)
         evidence = _exact_keys(
             item["evidence"], f"{label}.evidence", {"manifest", "events", "result"}
         )
@@ -545,8 +568,8 @@ def validate_model(model: dict[str, Any], output_root: Path) -> dict[str, Any]:
             manifest["requested_ref"] != item["workflow"]["raw"]
             or manifest["workflow"]["commit_sha"] != item["workflow_commit_sha"]
             or manifest["workflow"]["content_sha256"] != item["workflow_content_sha256"]
-            or result["event_count"] != item["event_count"]
-            or len(events) != item["event_count"]
+            or result["event_count"] != event_count
+            or len(events) != event_count
         ):
             raise ComparisonError(f"{label}: source artifact binding mismatch")
         replay.validate_run_directory((output_root / evidence["manifest"]).parent)
@@ -554,13 +577,14 @@ def validate_model(model: dict[str, Any], output_root: Path) -> dict[str, Any]:
             if replay._lookup_required(manifest, path) != comparability[path]:
                 raise ComparisonError(f"{label}: comparability binding mismatch: {path}")
         source_by_id[item["run_id"]] = item
-    reference_summary = summaries[order.index(model["comparison_reference_run_id"])]
-    reference_counts: dict[str, int] = {}
-    for count in reference_summary.get("counts", []):
-        if isinstance(count, dict):
-            metric = count.get("metric")
-            if isinstance(metric, dict) and isinstance(metric.get("raw"), str):
-                reference_counts[metric["raw"]] = count.get("value")
+    reference_source = source_by_id[model["comparison_reference_run_id"]]
+    reference_result = replay.load_json(
+        output_root / reference_source["evidence"]["result"]
+    )
+    reference_counts = {
+        "events": reference_result["event_count"],
+        **reference_result["counts"],
+    }
     for index, summary in enumerate(summaries):
         label = f"comparison.summaries[{index}]"
         item = _exact_keys(
@@ -575,7 +599,11 @@ def validate_model(model: dict[str, Any], output_root: Path) -> dict[str, Any]:
             item["status"], f"{label}.status", STATUS_VOCABULARY, expected_status
         )
         counts = item["counts"]
-        if not isinstance(counts, list) or len(counts) != len(COUNT_ORDER):
+        if (
+            not isinstance(counts, list)
+            or len(counts) != len(COUNT_ORDER)
+            or not all(isinstance(row, dict) for row in counts)
+        ):
             raise ComparisonError(f"{label}.counts: invalid count rows")
         if [row.get("metric", {}).get("raw") for row in counts] != list(COUNT_ORDER):
             raise ComparisonError(f"{label}.counts: inconsistent metric ordering")
@@ -667,7 +695,10 @@ def validate_model(model: dict[str, Any], output_root: Path) -> dict[str, Any]:
                     "error",
                 },
             )
-            if event["sequence"] != sequence or sequence != raw_event["sequence"]:
+            event_sequence = _integer(
+                event["sequence"], f"{row_label}.sequence", 0
+            )
+            if event_sequence != sequence or sequence != raw_event["sequence"]:
                 raise ComparisonError(f"{row_label}.sequence: inconsistent ordering")
             for field, vocabulary in (
                 ("event", EVENT_VOCABULARY),
@@ -698,8 +729,14 @@ def _delta_text(delta: dict[str, Any]) -> str:
 
 def _display_markdown(value: dict[str, Any]) -> str:
     if value["label"] == "Unknown" and value["raw"] is not None:
-        raw = str(value["raw"]).replace("`", "\\`").replace("|", "\\|")
-        return f"Unknown (`{raw}`)"
+        markdown_controls = set("\\`|[]()*_#!\r\n")
+        raw = "".join(
+            f"&#{ord(character)};"
+            if character in markdown_controls
+            else html.escape(character, quote=True)
+            for character in str(value["raw"])
+        )
+        return f"Unknown (<code>{raw}</code>)"
     return value["label"]
 
 
@@ -768,9 +805,9 @@ def render_markdown(model: dict[str, Any]) -> bytes:
                 "",
                 f"- Commit: `{source['workflow_commit_sha']}`",
                 f"- Workflow digest: `{source['workflow_content_sha256']}`",
-                f"- Raw evidence: [manifest]({source['evidence']['manifest']}), "
-                f"[events]({source['evidence']['events']}), "
-                f"[result]({source['evidence']['result']})",
+                f"- Raw evidence: [manifest]({_href(source['evidence']['manifest'])}), "
+                f"[events]({_href(source['evidence']['events'])}), "
+                f"[result]({_href(source['evidence']['result'])})",
                 "",
                 "| Seq | Event | From | To | Disposition | Technical detail |",
                 "|---:|---|---|---|---|---|",
@@ -949,6 +986,37 @@ def _atomic_replace(path: Path, content: bytes) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def _replace_output_set(output_root: Path, outputs: dict[str, bytes]) -> None:
+    previous = {
+        name: (output_root / name).read_bytes()
+        if (output_root / name).exists()
+        else None
+        for name in OUTPUT_NAMES
+    }
+    replaced: list[str] = []
+    try:
+        for name in OUTPUT_NAMES:
+            _atomic_replace(output_root / name, outputs[name])
+            replaced.append(name)
+    except OSError as error:
+        try:
+            for name in reversed(replaced):
+                path = output_root / name
+                prior = previous[name]
+                if prior is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _atomic_replace(path, prior)
+        except OSError as rollback_error:
+            raise ComparisonError(
+                "generated output write failed and rollback was incomplete: "
+                f"{rollback_error}"
+            ) from error
+        raise ComparisonError(
+            f"generated output write failed; previous output set restored: {error}"
+        ) from error
+
+
 def compare_runs(
     run_dirs: list[Path],
     output_path: Path,
@@ -974,8 +1042,7 @@ def compare_runs(
         path = output_root / name
         if path.exists() and (path.is_symlink() or not path.is_file()):
             raise ComparisonError(f"unsafe generated output path: {path}")
-    for name in OUTPUT_NAMES:
-        _atomic_replace(output_root / name, outputs[name])
+    _replace_output_set(output_root, outputs)
     validate_model(replay.loads_json(outputs["comparison-v1.json"], "comparison"), output_root)
     return model
 

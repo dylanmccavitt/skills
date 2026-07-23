@@ -158,6 +158,45 @@ class ComparisonTests(unittest.TestCase):
         tampered["sources"][0]["manifest_sha256"] = "sha256:" + ("0" * 64)
         with self.assertRaisesRegex(compare.ComparisonError, "source digest mismatch"):
             compare.validate_model(tampered, self.output)
+        for field in ("schema_version", "vocabulary_version"):
+            boolean = copy.deepcopy(model)
+            boolean[field] = True
+            with self.assertRaisesRegex(compare.ComparisonError, "must be an integer"):
+                compare.validate_model(boolean, self.output)
+        boolean = copy.deepcopy(model)
+        boolean["comparability"]["suite.version"] = True
+        with self.assertRaisesRegex(compare.ComparisonError, "must be an integer"):
+            compare.validate_model(boolean, self.output)
+        boolean = copy.deepcopy(model)
+        boolean["comparability"]["execution.time_budget_seconds"] = True
+        with self.assertRaisesRegex(compare.ComparisonError, "must be an integer"):
+            compare.validate_model(boolean, self.output)
+        boolean = copy.deepcopy(model)
+        boolean["sources"][0]["event_count"] = True
+        with self.assertRaisesRegex(compare.ComparisonError, "must be an integer"):
+            compare.validate_model(boolean, self.output)
+        boolean = copy.deepcopy(model)
+        boolean["flows"][0]["events"][0]["sequence"] = False
+        with self.assertRaisesRegex(compare.ComparisonError, "must be an integer"):
+            compare.validate_model(boolean, self.output)
+
+    def test_malformed_reference_summary_is_a_contract_error(self) -> None:
+        model = self._generate()
+        reference = model["source_order"].index(
+            model["comparison_reference_run_id"]
+        )
+        missing_metric = copy.deepcopy(model)
+        missing_metric["summaries"][reference]["counts"][0]["metric"]["raw"] = None
+        with self.assertRaisesRegex(compare.ComparisonError, "metric ordering"):
+            compare.validate_model(missing_metric, self.output)
+        invalid_value = copy.deepcopy(model)
+        invalid_value["summaries"][reference]["counts"][0]["value"] = "5"
+        with self.assertRaisesRegex(compare.ComparisonError, "must be an integer"):
+            compare.validate_model(invalid_value, self.output)
+        invalid_row = copy.deepcopy(model)
+        invalid_row["summaries"][reference]["counts"][0] = None
+        with self.assertRaisesRegex(compare.ComparisonError, "invalid count rows"):
+            compare.validate_model(invalid_row, self.output)
 
     def test_counts_labels_units_statuses_and_deltas_are_source_bound(self) -> None:
         model = self._generate()
@@ -225,7 +264,9 @@ class ComparisonTests(unittest.TestCase):
         )
         markdown = compare.render_markdown(model).decode()
         dashboard = compare.render_html(model).decode()
-        self.assertIn("Unknown (`FUTURE_PROTOCOL_EVENT`)", markdown)
+        self.assertIn(
+            "Unknown (<code>FUTURE&#95;PROTOCOL&#95;EVENT</code>)", markdown
+        )
         self.assertIn("Unknown (FUTURE_PROTOCOL_EVENT)", dashboard)
         changed = copy.deepcopy(model)
         changed["flows"][0]["events"][0]["event"]["label"] = "Future Protocol Event"
@@ -235,7 +276,7 @@ class ComparisonTests(unittest.TestCase):
             compare.validate_model(changed, self.output)
 
     def test_renderers_are_synchronized_static_and_safely_escape_content(self) -> None:
-        hostile = '\"><script>alert(1)</script>&'
+        hostile = 'prefix`)\n<script>alert(1)</script>\n### injected|&'
         self.runs[0] = self._rebind(
             self.runs[0],
             manifest_mutator=lambda manifest: manifest.__setitem__(
@@ -247,6 +288,9 @@ class ComparisonTests(unittest.TestCase):
         dashboard = (self.output / "dashboard-v1.html").read_text()
         self.assertIn(hostile, model["sources"][0]["workflow"]["raw"])
         self.assertIn("Unknown", markdown)
+        self.assertIn("&lt;script&gt;", markdown)
+        self.assertNotIn("<script", markdown)
+        self.assertNotIn("\n### injected", markdown)
         self.assertIn("&lt;script&gt;", dashboard)
         self.assertNotIn("<script", dashboard)
         self.assertNotIn("http://", dashboard)
@@ -257,6 +301,20 @@ class ComparisonTests(unittest.TestCase):
             self.assertIn(source["workflow"]["label"], dashboard)
         self.assertIn("<details>", dashboard)
         self.assertIn("Raw evidence:", dashboard)
+
+    def test_markdown_evidence_links_are_url_encoded(self) -> None:
+        special_parent = self.output / "raw folder (review)"
+        special_run = special_parent / self.runs[0].name
+        shutil.copytree(self.runs[0], special_run)
+        run_id = replay.load_json(special_run / "manifest.json")["run_id"]
+        model = compare.build_model([special_run], self.output, run_id)
+        markdown = compare.render_markdown(model).decode()
+        self.assertIn(
+            "raw%20folder%20%28review%29/"
+            f"{special_run.name}/manifest.json",
+            markdown,
+        )
+        self.assertNotIn("raw folder (review)", markdown)
 
     def test_path_traversal_symlinks_and_remote_links_fail_closed(self) -> None:
         model = self._generate()
@@ -302,6 +360,43 @@ class ComparisonTests(unittest.TestCase):
         unsafe_output.symlink_to(self.output, target_is_directory=True)
         with self.assertRaisesRegex(compare.ComparisonError, "must not be a symlink"):
             compare.compare_runs(self.runs, unsafe_output, self.reference)
+
+    def test_output_set_is_restored_when_replacement_fails(self) -> None:
+        self._generate()
+        original = {}
+        for name in compare.OUTPUT_NAMES:
+            path = self.output / name
+            path.write_bytes(b"stale:" + name.encode())
+            original[name] = path.read_bytes()
+        replace = compare._atomic_replace
+        calls = 0
+
+        def fail_second(path: Path, content: bytes) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("simulated replacement failure")
+            replace(path, content)
+
+        with mock.patch.object(compare, "_atomic_replace", side_effect=fail_second):
+            with self.assertRaisesRegex(
+                compare.ComparisonError, "previous output set restored"
+            ):
+                self._generate()
+        self.assertEqual(
+            original,
+            {
+                name: (self.output / name).read_bytes()
+                for name in compare.OUTPUT_NAMES
+            },
+        )
+        self.assertFalse(
+            [
+                path
+                for path in self.output.iterdir()
+                if path.name.startswith(tuple(f".{name}." for name in compare.OUTPUT_NAMES))
+            ]
+        )
 
 
 if __name__ == "__main__":
