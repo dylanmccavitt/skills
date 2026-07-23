@@ -131,17 +131,21 @@ Inspect the files that will be published:
 npm pack --dry-run
 ```
 
-Validate the repository-only evaluation fixture contracts:
+Validate the repository-only evaluation fixtures and deterministic protocol
+replay contracts:
 
 ```sh
 python3 evaluation/validate.py
 python3 -m unittest discover -s evaluation -p "test_*.py"
 ```
 
-The versioned baseline corpus defines frozen evaluation inputs and held-out
-grader contracts; it does not run agents or establish that one workflow version
-is better. See [`evaluation/README.md`](evaluation/README.md) for the trust
-boundary and versioning rules.
+The versioned baseline corpus defines frozen inputs and held-out graders.
+`evaluation/replay.py` replays a canonical trace against multiple exact local
+workflow refs without checkout, network access, or historical-code execution,
+emitting strict run-manifest, JSONL event, and result evidence. It does not run
+agents, aggregate trials, or establish that one workflow version is better. See
+[`evaluation/README.md`](evaluation/README.md) for canonical-byte rules,
+supported workflow-v1 vocabulary, comparability keys, and the trust boundary.
 
 ### Releases
 
