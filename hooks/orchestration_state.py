@@ -437,7 +437,14 @@ def _validate_invalidation_observation(domain: str, observation: Any) -> str:
 
 
 def _apply_invalidation(
-    lane_state: dict[str, Any], event: str, context: dict[str, Any]
+    lane_state: dict[str, Any],
+    event: str,
+    context: dict[str, Any],
+    *,
+    transition_id: str,
+    source_node: str,
+    target_node: str,
+    runner_session_id: str | None,
 ) -> bool:
     """Advance one proof generation. Return False for an exact idempotent replay."""
     if set(context) != {"observation", "reason"}:
@@ -466,6 +473,10 @@ def _apply_invalidation(
     history.append({
         **fingerprint,
         "domain": domain,
+        "transition_id": transition_id,
+        "source_node": source_node,
+        "target_node": target_node,
+        "runner_session_id": runner_session_id,
         "old_observation": old_observation,
         "new_observation": observation,
         "generations": _generation_tuple(lifecycle),
@@ -491,8 +502,43 @@ def _apply_invalidation(
     return True
 
 
+def _recorded_invalidation_replay(
+    lane_state: dict[str, Any], event: str, context: dict[str, Any], current_node: str
+) -> dict[str, Any] | None:
+    """Return a current exact retry recorded as producing the current node."""
+    if set(context) != {"observation", "reason"}:
+        raise ValueError(
+            f"{event} context must contain exactly observation and reason"
+        )
+    reason = context.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("invalidation reason must be a non-empty string")
+    domain = INVALIDATION_EVENTS[event]
+    observation = _validate_invalidation_observation(domain, context.get("observation"))
+    lifecycle = _proof_lifecycle(lane_state)
+    if lifecycle["observations"].get(domain) != observation:
+        return None
+    current_generations = _generation_tuple(lifecycle)
+    for entry in reversed(lifecycle["invalidation_history"]):
+        if (
+            isinstance(entry, dict)
+            and entry.get("event") == event
+            and entry.get("observation") == observation
+            and entry.get("reason") == reason
+            and entry.get("target_node") == current_node
+            and entry.get("generations") == current_generations
+            and isinstance(entry.get("source_node"), str)
+            and isinstance(entry.get("transition_id"), str)
+        ):
+            return entry
+    return None
+
+
 def _reject_stale_packet_replay(
-    lane_state: dict[str, Any], event: str, packet_digest: str
+    lane_state: dict[str, Any],
+    event: str,
+    packet_digest: str,
+    actor_session_id: str,
 ) -> None:
     current = _generation_tuple(_proof_lifecycle(lane_state))
     receipts = lane_state.get("acceptance_receipts", [])
@@ -502,6 +548,10 @@ def _reject_stale_packet_replay(
         isinstance(receipt, dict)
         and receipt.get("event") == event
         and receipt.get("packet_digest") == packet_digest
+        and (
+            event != "REVIEW_PACKET"
+            or receipt.get("actor_session_id") == actor_session_id
+        )
         and receipt.get("generations") != current
         for receipt in receipts
     ):
@@ -649,9 +699,13 @@ def bind_jiminy_ready(
     if any(
         item["gates"]["review_packet_verified"] is not True
         or item["gates"]["required_checks_green"] is not True
+        or item["gates"]["approvals_satisfied"] is not True
+        or item["gates"]["mergeable"] is not True
+        or type(item["gates"]["unresolved_required_threads"]) is not int
+        or item["gates"]["unresolved_required_threads"] != 0
         for item in packet["pull_requests"]
     ):
-        raise ValueError("JIMINY_READY requires verified review and CI gates")
+        raise ValueError("JIMINY_READY requires every merge gate to be satisfied")
 
     packet_digest = canonical_packet_digest(packet)
     existing = lifecycle["bindings"].get("expected_merge_set")
@@ -737,6 +791,59 @@ def apply_graph_transition(
         raise ValueError(f"caller context cannot overwrite trusted state: {protected}")
 
     lifecycle = _proof_lifecycle(lane_state)
+    recorded_replay = (
+        _recorded_invalidation_replay(lane_state, event, context, current_node)
+        if event in INVALIDATION_EVENTS
+        else None
+    )
+    if recorded_replay is not None:
+        transition = next(
+            (
+                candidate
+                for candidate in workflow["transitions"]
+                if candidate["id"] == recorded_replay["transition_id"]
+                and candidate["event"] == event
+                and recorded_replay["source_node"] in candidate["from"]
+                and candidate.get("to") == current_node
+            ),
+            None,
+        )
+        if transition is None:
+            raise ValueError("recorded invalidation retry no longer matches the workflow")
+        source_owner = workflow["nodes"][recorded_replay["source_node"]].get("owner")
+        target_owner = workflow["nodes"][current_node].get("owner")
+        if "jiminy" in {source_owner, target_owner}:
+            if not runner_session_id:
+                raise ValueError("Jiminy runner session ID is required for this transition")
+            verify_registration(
+                runner_session_id,
+                "jiminy",
+                coordinator_thread_id=session_id,
+            )
+            recorded_runner = recorded_replay.get("runner_session_id")
+            if not isinstance(recorded_runner, str) or (
+                runner_session_id != recorded_runner
+                and not _is_continuation_successor(recorded_runner, runner_session_id)
+            ):
+                raise ValueError(
+                    f"invalidation was authorized by Jiminy runner {recorded_runner}; "
+                    f"{runner_session_id} is not its checkpoint successor"
+                )
+            bound_runner = lane_state.get("jiminy_runner_session_id")
+            if not isinstance(bound_runner, str) or (
+                runner_session_id != bound_runner
+                and not _is_continuation_successor(bound_runner, runner_session_id)
+            ):
+                raise ValueError(
+                    f"lane is bound to Jiminy runner {bound_runner}; "
+                    f"{runner_session_id} is not its checkpoint successor"
+                )
+        return {
+            "transition_id": transition["id"],
+            "lane": lane,
+            "state": lane_state,
+            "idempotent": True,
+        }
     if event == "MERGES_VERIFIED":
         if set(context) != {"packet"}:
             raise ValueError("MERGES_VERIFIED context must contain exactly packet")
@@ -795,7 +902,15 @@ def apply_graph_transition(
                 f"{runner_session_id} is not its checkpoint successor"
             )
     if event in INVALIDATION_EVENTS:
-        if not _apply_invalidation(lane_state, event, context):
+        if not _apply_invalidation(
+            lane_state,
+            event,
+            context,
+            transition_id=transition["id"],
+            source_node=current_node,
+            target_node=target_node,
+            runner_session_id=runner_session_id,
+        ):
             return {
                 "transition_id": transition["id"],
                 "lane": lane,
@@ -879,8 +994,6 @@ def accept_graph_event(
         raise ValueError(f"ledger lane has no valid workflow node: {lane}")
     lifecycle = _proof_lifecycle(lane_state)
     packet_digest = canonical_packet_digest(packet)
-    _reject_stale_packet_replay(lane_state, event, packet_digest)
-
     candidates = [
         transition
         for transition in workflow["transitions"]
@@ -966,6 +1079,9 @@ def accept_graph_event(
         runner_session_id = _safe_id(runner_session_id)
     if expected_role == "jiminy" and runner_session_id not in {None, actor_session_id}:
         raise ValueError("a Jiminy packet actor must also be the selected Jiminy runner")
+    _reject_stale_packet_replay(
+        lane_state, event, packet_digest, actor_session_id
+    )
 
     evaluation_context = dict(lane_state)
     evaluation_context["packet"] = packet

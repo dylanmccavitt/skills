@@ -28,6 +28,13 @@ def packet_message(packet_type: str) -> str:
     return f"{packet_type}:\n{json.dumps(valid_packets()[packet_type])}"
 
 
+def merge_ready_packet() -> dict[str, object]:
+    packet = valid_packets()["JIMINY_READY"]
+    for item in packet["pull_requests"]:
+        item["gates"]["approvals_satisfied"] = True
+    return packet
+
+
 class OrchestrationHookTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -886,7 +893,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), before)
 
         self.state_command("continue", "--source-id", "jiminy-1", "--successor-id", "jiminy-3")
-        ready = valid_packets()["JIMINY_READY"]
+        ready = merge_ready_packet()
         ready["coordinator_thread_id"] = "session-1"
         revision = int(self.session_state()["state_revision"])
         self.state_command(
@@ -990,6 +997,7 @@ class OrchestrationHookTest(unittest.TestCase):
             "graph", "apply", "--session-id", "session-1", "--lane", "review-1",
             "--current-node", "review", "--event", "PR_HEAD_CHANGED",
             "--expected-revision", str(replay_revision), "--context-json", invalidation,
+            "--runner-session-id", "jiminy-1",
         ).stdout)
         self.assertTrue(replay["idempotent"])
         self.assertEqual(int(self.session_state()["state_revision"]), replay_revision)
@@ -1069,7 +1077,7 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertIn("expected_merge_set", unauthorized_result.stderr)
         self.assertEqual(state_path.read_bytes(), before_ready)
 
-        ready = valid_packets()["JIMINY_READY"]
+        ready = merge_ready_packet()
         ready["coordinator_thread_id"] = "session-1"
         ready["pull_requests"][0]["reviewed_head_sha"] = new_head
         revision = int(self.session_state()["state_revision"])
@@ -1156,6 +1164,72 @@ class OrchestrationHookTest(unittest.TestCase):
             {"contract": 0, "base": 0, "head": 1},
         )
 
+    def test_contract_invalidation_accepts_identical_review_from_new_authenticated_attempt(self) -> None:
+        self.register("gepetto")
+        for reviewer in ("review-old", "review-new"):
+            self.register(
+                "review", "--coordinator-thread-id", "session-1",
+                session_id=reviewer,
+            )
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        review = valid_packets()["REVIEW_PACKET"]
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-old",
+            "--json", json.dumps({
+                "node": "review",
+                "head_sha": SHA,
+                "pr": "https://github.com/owner/repo/pull/2",
+                "research_content_ref": "sha256:" + ("c" * 64),
+            }),
+        )
+        self.accept_command(
+            "REVIEW_PACKET", review, lane="review-old", actor="review-old",
+            observed_head=SHA, runner="jiminy-1",
+        )
+        revision = int(self.session_state()["state_revision"])
+        self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "review-old",
+            "--current-node", "merge", "--event", "MATERIAL_CONTRACT_CHANGED",
+            "--expected-revision", str(revision), "--runner-session-id", "jiminy-1",
+            "--context-json", json.dumps({
+                "observation": "sha256:" + ("d" * 64),
+                "reason": "acceptance contract changed",
+            }),
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "review-old",
+            "--json", '{"node":"review"}',
+        )
+        self.state_command(
+            "ledger", "move", "--session-id", "session-1",
+            "--from-lane", "review-old", "--to-lane", "review-new",
+        )
+
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        before = state_path.read_bytes()
+        unauthenticated = self.accept_command(
+            "REVIEW_PACKET", review, lane="review-new", actor="not-registered",
+            observed_head=SHA, runner="jiminy-1", check=False,
+        )
+        self.assertEqual(unauthenticated.returncode, 1)
+        self.assertIn("no registered session", unauthenticated.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        accepted = json.loads(self.accept_command(
+            "REVIEW_PACKET", review, lane="review-new", actor="review-new",
+            observed_head=SHA, runner="jiminy-1",
+        ).stdout)
+        self.assertEqual(accepted["state"]["node"], "merge")
+        self.assertEqual(
+            accepted["acceptance_receipt"]["generations"],
+            {"contract": 1, "base": 0, "head": 0},
+        )
+        self.assertEqual(
+            accepted["acceptance_receipt"]["actor_session_id"], "review-new"
+        )
+
     def test_base_and_contract_invalidations_clear_scoped_current_proof(self) -> None:
         lane = {
             "node": "merge",
@@ -1208,6 +1282,30 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(lifecycle["bindings"], {})
         self.assertEqual(base_change["state"]["node"], "implementation")
 
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        replay_revision = int(self.session_state()["state_revision"])
+        before_replay = state_path.read_bytes()
+        missing_authority = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "implementation", "--event", "MATERIAL_BASE_CHANGED",
+            "--expected-revision", str(replay_revision), "--context-json",
+            json.dumps({"observation": "d" * 40, "reason": "stack base moved"}),
+            check=False,
+        )
+        self.assertEqual(missing_authority.returncode, 1)
+        self.assertIn("Jiminy runner", missing_authority.stderr)
+        self.assertEqual(state_path.read_bytes(), before_replay)
+        base_replay = json.loads(self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "implementation", "--event", "MATERIAL_BASE_CHANGED",
+            "--expected-revision", str(replay_revision), "--context-json",
+            json.dumps({"observation": "d" * 40, "reason": "stack base moved"}),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertTrue(base_replay["idempotent"])
+        self.assertEqual(int(self.session_state()["state_revision"]), replay_revision)
+        self.assertEqual(state_path.read_bytes(), before_replay)
+
         # Restore a current implementation proof, then invalidate the contract.
         lifecycle["bindings"]["implementation"] = {
             "generations": dict(lifecycle["generations"]), "evidence": {"fresh": True},
@@ -1237,6 +1335,86 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(len(lifecycle["invalidation_history"]), 2)
         self.assertEqual(contract_change["state"]["node"], "research")
 
+        replay_revision = int(self.session_state()["state_revision"])
+        before_replay = state_path.read_bytes()
+        contract_context = json.dumps({
+            "observation": "sha256:" + ("e" * 64),
+            "reason": "acceptance contract changed",
+        })
+        contract_replay = json.loads(self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "research", "--event", "MATERIAL_CONTRACT_CHANGED",
+            "--expected-revision", str(replay_revision),
+            "--context-json", contract_context,
+        ).stdout)
+        self.assertTrue(contract_replay["idempotent"])
+        self.assertEqual(int(self.session_state()["state_revision"]), replay_revision)
+        self.assertEqual(state_path.read_bytes(), before_replay)
+
+        changed_reason = self.state_command(
+            "graph", "apply", "--session-id", "session-1", "--lane", "lane-1",
+            "--current-node", "research", "--event", "MATERIAL_CONTRACT_CHANGED",
+            "--expected-revision", str(replay_revision), "--context-json",
+            json.dumps({
+                "observation": "sha256:" + ("e" * 64),
+                "reason": "different reason",
+            }), check=False,
+        )
+        self.assertEqual(changed_reason.returncode, 1)
+        self.assertEqual(state_path.read_bytes(), before_replay)
+
+    def test_jiminy_ready_requires_every_gate_without_mutation(self) -> None:
+        self.register("gepetto")
+        self.register(
+            "jiminy", "--coordinator-thread-id", "session-1", session_id="jiminy-1"
+        )
+        self.state_command(
+            "ledger", "set", "--session-id", "session-1", "--lane", "lane-1",
+            "--json", json.dumps({
+                "node": "merge",
+                "head_sha": SHA,
+                "pr": "https://github.com/owner/repo/pull/2",
+                "jiminy_runner_session_id": "jiminy-1",
+            }),
+        )
+        state_path = Path(self.temporary.name) / "sessions" / "session-1.json"
+        cases = (
+            ("review_packet_verified", False),
+            ("required_checks_green", False),
+            ("approvals_satisfied", False),
+            ("approvals_satisfied", "unknown"),
+            ("mergeable", False),
+            ("mergeable", "unknown"),
+            ("unresolved_required_threads", 1),
+            ("unresolved_required_threads", "unknown"),
+        )
+        for gate, value in cases:
+            with self.subTest(gate=gate, value=value):
+                ready = merge_ready_packet()
+                ready["coordinator_thread_id"] = "session-1"
+                ready["pull_requests"][0]["gates"][gate] = value
+                revision = int(self.session_state()["state_revision"])
+                before = state_path.read_bytes()
+                rejected = self.state_command(
+                    "graph", "ready", "--session-id", "session-1",
+                    "--lane", "lane-1", "--expected-revision", str(revision),
+                    "--packet-json", json.dumps(ready),
+                    "--runner-session-id", "jiminy-1", check=False,
+                )
+                self.assertEqual(rejected.returncode, 1)
+                self.assertIn("every merge gate", rejected.stderr)
+                self.assertEqual(state_path.read_bytes(), before)
+
+        ready = merge_ready_packet()
+        ready["coordinator_thread_id"] = "session-1"
+        accepted = json.loads(self.state_command(
+            "graph", "ready", "--session-id", "session-1", "--lane", "lane-1",
+            "--expected-revision", str(self.session_state()["state_revision"]),
+            "--packet-json", json.dumps(ready),
+            "--runner-session-id", "jiminy-1",
+        ).stdout)
+        self.assertFalse(accepted["idempotent"])
+
     def test_merge_set_requires_current_accepted_result_for_every_expected_pr(self) -> None:
         self.register("gepetto")
         self.register(
@@ -1255,7 +1433,7 @@ class OrchestrationHookTest(unittest.TestCase):
                 }),
             )
 
-        ready = valid_packets()["JIMINY_READY"]
+        ready = merge_ready_packet()
         ready["coordinator_thread_id"] = "session-1"
         second = json.loads(json.dumps(ready["pull_requests"][0]))
         second["pr_url"] = pr_two
