@@ -52,16 +52,13 @@ def _graph(
         "initial_node": "research",
         "policies": {"max_review_fix_cycles": 3},
         "nodes": {
-            name: {}
-            for name in (
-                "research",
-                "implementation",
-                "review",
-                "fixer",
-                "merge",
-                "blocked",
-                "complete",
-            )
+            "research": {"owner": "gepetto"},
+            "implementation": {"owner": "pinocchio"},
+            "review": {"owner": "reviewer"},
+            "fixer": {"owner": "reviewer"},
+            "merge": {"owner": "jiminy"},
+            "blocked": {"owner": "gepetto", "resumable": True},
+            "complete": {"terminal": True},
         },
         "transitions": [
             {
@@ -218,6 +215,27 @@ class ReplayTests(unittest.TestCase):
         path = self.root / "trace.json"
         path.write_bytes(replay.canonical_bytes(trace))
         return path
+
+    def _rewrite_events(
+        self,
+        run_dir: Path,
+        mutate,
+    ) -> None:
+        event_path = run_dir / "events.jsonl"
+        result_path = run_dir / "result.json"
+        records = replay.parse_jsonl(event_path.read_bytes(), "events")
+        mutate(records)
+        event_bytes = replay._jsonl_bytes(records)
+        event_path.write_bytes(event_bytes)
+        result = replay.load_json(result_path)
+        result["event_trace_sha256"] = replay.digest_bytes(event_bytes)
+        result["counts"] = {
+            disposition: sum(
+                record["disposition"] == disposition for record in records
+            )
+            for disposition in sorted(replay.DISPOSITIONS)
+        }
+        result_path.write_bytes(replay.canonical_bytes(result))
 
     def test_trace_contract_rejects_duplicates_unknowns_and_bad_identity(self) -> None:
         with self.assertRaisesRegex(replay.ReplayError, "duplicate JSON key"):
@@ -422,6 +440,19 @@ class ReplayTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(replay.ReplayError, "unsupported condition"):
             replay.validate_workflow(graph)
+        graph = _graph()
+        graph["nodes"]["research"]["owner"] = "attacker"
+        with self.assertRaisesRegex(replay.ReplayError, "unsupported value"):
+            replay.validate_workflow(graph)
+        graph = _graph()
+        graph["nodes"]["blocked"]["resumable"] = False
+        with self.assertRaisesRegex(replay.ReplayError, "must equal true"):
+            replay.validate_workflow(graph)
+        graph = _graph()
+        graph["packet_types"] = ["RESEARCH_PACKET"]
+        graph["transitions"][0]["event"] = "RESEARCH_PACKET"
+        with self.assertRaisesRegex(replay.ReplayError, "missing or inconsistent"):
+            replay.validate_workflow(graph)
 
     def test_evaluator_commit_must_bind_running_bytes(self) -> None:
         evaluator = self.repo / "evaluation/replay.py"
@@ -497,6 +528,98 @@ class ReplayTests(unittest.TestCase):
             replay.run_replay(
                 self.repo, trace_path, symlink, ["v0.4.0"], "frozen-candidate"
             )
+
+    def test_duplicate_resolved_refs_fail_before_output_creation(self) -> None:
+        trace_path = self._write_trace(
+            _trace([_event("block", "FLOW_BLOCKED", "research")])
+        )
+        output = self.root / "output"
+        with self.assertRaisesRegex(replay.ReplayError, "duplicate run identity"):
+            replay.run_replay(
+                self.repo,
+                trace_path,
+                output,
+                ["frozen-candidate", self.refs["frozen-candidate"]],
+                "frozen-candidate",
+            )
+        self.assertFalse(output.exists())
+
+    def test_multi_run_conflict_is_preflighted_before_any_new_run(self) -> None:
+        trace_path = self._write_trace(
+            _trace([_event("block", "FLOW_BLOCKED", "research")])
+        )
+        output = self.root / "output"
+        [existing] = replay.run_replay(
+            self.repo, trace_path, output, ["v0.4.0"], "frozen-candidate"
+        )
+        manifest_path = existing / "manifest.json"
+        manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+        with self.assertRaisesRegex(replay.ReplayError, "refusing to overwrite"):
+            replay.run_replay(
+                self.repo,
+                trace_path,
+                output,
+                ["v0.2.0", "v0.4.0"],
+                "frozen-candidate",
+            )
+        self.assertEqual(
+            [path.name for path in output.iterdir() if path.is_dir()],
+            [existing.name],
+        )
+
+    def test_event_validation_rejects_semantic_tampering(self) -> None:
+        trace_path = self._write_trace(
+            _trace(
+                [
+                    _event("block", "FLOW_BLOCKED", "research"),
+                    _event(
+                        "resume",
+                        "RESUME_AUTHORIZED",
+                        "blocked",
+                        {"resume_node": "research"},
+                    ),
+                    _event("unsupported", "NOT_IN_GRAPH", "research"),
+                ]
+            )
+        )
+
+        def generate(name: str) -> Path:
+            [run_dir] = replay.run_replay(
+                self.repo,
+                trace_path,
+                self.root / name,
+                ["v0.4.0"],
+                "frozen-candidate",
+            )
+            return run_dir
+
+        duplicate = generate("duplicate-output")
+        self._rewrite_events(
+            duplicate,
+            lambda records: records[1].__setitem__(
+                "input_event_id", records[0]["input_event_id"]
+            ),
+        )
+        with self.assertRaisesRegex(replay.ReplayError, "duplicate event ID"):
+            replay.validate_run_directory(duplicate)
+
+        broken_chain = generate("chain-output")
+        self._rewrite_events(
+            broken_chain,
+            lambda records: records[1].__setitem__("source_node", "merge"),
+        )
+        with self.assertRaisesRegex(replay.ReplayError, "dangling node binding"):
+            replay.validate_run_directory(broken_chain)
+
+        relabeled = generate("disposition-output")
+        self._rewrite_events(
+            relabeled,
+            lambda records: records[2].__setitem__("disposition", "rejected"),
+        )
+        with self.assertRaisesRegex(
+            replay.ReplayError, "invalid non-accepted state/disposition"
+        ):
+            replay.validate_run_directory(relabeled)
 
     def test_malformed_jsonl_and_dangling_counts_are_rejected(self) -> None:
         with self.assertRaisesRegex(replay.ReplayError, "must end with one newline"):

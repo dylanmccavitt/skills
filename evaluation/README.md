@@ -90,6 +90,9 @@ Each event records its source and target node, semantic disposition, unique
 transition ID when accepted, normalized error code otherwise, and before/after
 state digests. Accepted events apply graph mutations. Rejected guards,
 unsupported events, and evaluator errors retain the exact before-state digest.
+Validation rejects duplicate input event IDs, broken target-to-source node
+chains, and any disposition/error/transition combination outside the evaluator's
+normalized outcome matrix.
 Optional expected fields in the input trace are assertions: a mismatch fails the
 run before evidence is persisted.
 
@@ -112,7 +115,10 @@ Evidence is written beneath a derived `run-<digest>` directory as
 in that directory, flushed, and atomically replaced. An exact rerun is
 byte-idempotent. A matching partial run can be completed after interruption, but
 an existing conflicting artifact, unsafe symlink, or different completed run is
-never overwritten.
+never overwritten. The complete requested batch is preflighted before the output
+root or any run is changed. Distinct ref spellings that resolve to the same run
+identity are rejected during that preflight because requested ref names are
+provenance rather than identity.
 
 With the named refs already present locally, run the four-way smoke comparison:
 

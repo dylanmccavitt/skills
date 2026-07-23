@@ -33,7 +33,17 @@
     },
     "transition_id": {"type": ["string", "null"], "minLength": 1},
     "target_node": {"type": ["string", "null"], "minLength": 1},
-    "error_code": {"type": ["string", "null"], "minLength": 1},
+    "error_code": {
+      "enum": [
+        null,
+        "current-node-mismatch",
+        "unsupported-event",
+        "guard-rejected",
+        "ambiguous-transition",
+        "invalid-target",
+        "state-mutation-error"
+      ]
+    },
     "before_state_sha256": {"$ref": "#/$defs/digest"},
     "after_state_sha256": {"$ref": "#/$defs/digest"}
   },
@@ -55,6 +65,52 @@
           "target_node": {"type": "null"},
           "error_code": {"type": "string", "minLength": 1}
         }
+      }
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "rejected"}}},
+      "then": {
+        "properties": {
+          "transition_id": {"type": "null"},
+          "error_code": {"const": "guard-rejected"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "unsupported"}}},
+      "then": {
+        "properties": {
+          "transition_id": {"type": "null"},
+          "error_code": {"const": "unsupported-event"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "error"}}},
+      "then": {
+        "properties": {
+          "error_code": {
+            "enum": [
+              "current-node-mismatch",
+              "ambiguous-transition",
+              "invalid-target",
+              "state-mutation-error"
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "error_code": {
+                  "enum": ["invalid-target", "state-mutation-error"]
+                }
+              }
+            },
+            "then": {"properties": {"transition_id": {"type": "string"}}},
+            "else": {"properties": {"transition_id": {"type": "null"}}}
+          }
+        ]
       }
     }
   ]

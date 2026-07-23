@@ -65,6 +65,15 @@ CONDITION_OPERATORS = {
     "content_ref",
 }
 DISPOSITIONS = {"accepted", "rejected", "unsupported", "error"}
+ERROR_DISPOSITIONS = {
+    "current-node-mismatch": "error",
+    "unsupported-event": "unsupported",
+    "guard-rejected": "rejected",
+    "ambiguous-transition": "error",
+    "invalid-target": "error",
+    "state-mutation-error": "error",
+}
+ERRORS_WITH_TRANSITIONS = {"invalid-target", "state-mutation-error"}
 COMPARABILITY_PATHS = (
     "suite.id",
     "suite.version",
@@ -378,13 +387,45 @@ def validate_workflow(workflow: dict[str, Any]) -> dict[str, Any]:
     for name, node in nodes.items():
         if not isinstance(name, str) or not NODE_RE.fullmatch(name):
             raise ReplayError(f"workflow.nodes: invalid node name: {name!r}")
-        if not isinstance(node, dict):
-            raise ReplayError(f"workflow.nodes.{name}: must be an object")
+        if not isinstance(node, dict) or not node:
+            raise ReplayError(f"workflow.nodes.{name}: must be a non-empty object")
         node_unknown = node.keys() - NODE_KEYS
         if node_unknown:
             raise ReplayError(
                 f"workflow.nodes.{name}: unsupported fields: "
                 + ", ".join(sorted(node_unknown))
+            )
+        if "owner" in node and node["owner"] not in {
+            "gepetto",
+            "pinocchio",
+            "reviewer",
+            "jiminy",
+        }:
+            raise ReplayError(f"workflow.nodes.{name}.owner: unsupported value")
+        if "lane_role" in node and node["lane_role"] not in {
+            "research",
+            "implementation",
+            "review",
+            "fixer",
+            "jiminy",
+        }:
+            raise ReplayError(f"workflow.nodes.{name}.lane_role: unsupported value")
+        if "fanout" in node and node["fanout"] not in {
+            "approved_leaves",
+            "pull_requests",
+        }:
+            raise ReplayError(f"workflow.nodes.{name}.fanout: unsupported value")
+        for key in (
+            "serial_per_pull_request",
+            "dependency_ordered",
+            "resumable",
+            "terminal",
+        ):
+            if key in node and node[key] is not True:
+                raise ReplayError(f"workflow.nodes.{name}.{key}: must equal true")
+        if ("owner" in node) == (node.get("terminal") is True):
+            raise ReplayError(
+                f"workflow.nodes.{name}: must be either owned or terminal"
             )
     if workflow["initial_node"] not in nodes:
         raise ReplayError("workflow.initial_node: unknown node")
@@ -393,6 +434,7 @@ def validate_workflow(workflow: dict[str, Any]) -> dict[str, Any]:
         if (
             not isinstance(packet_types, list)
             or not all(isinstance(item, str) and item for item in packet_types)
+            or not all(EVENT_RE.fullmatch(item) for item in packet_types)
             or len(packet_types) != len(set(packet_types))
         ):
             raise ReplayError("workflow.packet_types: invalid packet type list")
@@ -435,12 +477,22 @@ def validate_workflow(workflow: dict[str, Any]) -> dict[str, Any]:
             raise ReplayError(f"{label}.to: unknown target node")
         if "to_path" in transition:
             _dotted_path(transition["to_path"], f"{label}.to_path")
-        if "packet_type" in transition:
-            if (
-                transition["packet_type"] != transition["event"]
-                or transition["packet_type"] not in workflow.get("packet_types", [])
-            ):
+        packet_types = workflow.get("packet_types")
+        packet_type = transition.get("packet_type")
+        if packet_types is not None:
+            if transition["event"] in packet_types:
+                if packet_type != transition["event"]:
+                    raise ReplayError(
+                        f"{label}.packet_type: missing or inconsistent declaration"
+                    )
+            elif packet_type is not None:
                 raise ReplayError(f"{label}.packet_type: inconsistent declaration")
+            elif transition["event"].endswith("_PACKET") or transition[
+                "event"
+            ].startswith("JIMINY_"):
+                raise ReplayError(f"{label}.event: undeclared packet event")
+        elif packet_type is not None:
+            raise ReplayError(f"{label}.packet_type: packet_types is absent")
         conditions = transition.get("all", [])
         if not isinstance(conditions, list):
             raise ReplayError(f"{label}.all: must be an array")
@@ -940,6 +992,8 @@ def validate_event_records(
     if not records:
         raise ReplayError("event trace: must contain at least one record")
     previous_after: str | None = None
+    expected_source: str | None = None
+    event_ids: set[str] = set()
     for index, record in enumerate(records):
         label = f"event trace record {index}"
         _exact_keys(
@@ -965,11 +1019,16 @@ def validate_event_records(
             raise ReplayError(f"{label}.run_id: dangling manifest binding")
         if record["sequence"] != index:
             raise ReplayError(f"{label}.sequence: inconsistent sequence")
-        _identifier(record["input_event_id"], f"{label}.input_event_id")
+        event_id = _identifier(record["input_event_id"], f"{label}.input_event_id")
+        if event_id in event_ids:
+            raise ReplayError(f"{label}.input_event_id: duplicate event ID: {event_id}")
+        event_ids.add(event_id)
         if not isinstance(record["source_node"], str) or not NODE_RE.fullmatch(
             record["source_node"]
         ):
             raise ReplayError(f"{label}.source_node: invalid node")
+        if expected_source is not None and record["source_node"] != expected_source:
+            raise ReplayError(f"{label}.source_node: dangling node binding")
         if not isinstance(record["event"], str) or not EVENT_RE.fullmatch(
             record["event"]
         ):
@@ -1000,12 +1059,21 @@ def validate_event_records(
                 or record["error_code"] is not None
             ):
                 raise ReplayError(f"{label}: invalid accepted disposition fields")
-        elif (
-            record["target_node"] is not None
-            or record["error_code"] is None
-            or before != after
-        ):
-            raise ReplayError(f"{label}: invalid non-accepted state/disposition")
+            expected_source = record["target_node"]
+        else:
+            error_code = record["error_code"]
+            if (
+                record["target_node"] is not None
+                or error_code is None
+                or before != after
+                or error_code not in ERROR_DISPOSITIONS
+                or ERROR_DISPOSITIONS[error_code] != record["disposition"]
+            ):
+                raise ReplayError(f"{label}: invalid non-accepted state/disposition")
+            has_transition = record["transition_id"] is not None
+            if has_transition != (error_code in ERRORS_WITH_TRANSITIONS):
+                raise ReplayError(f"{label}: invalid error transition binding")
+            expected_source = record["source_node"]
     return records
 
 
@@ -1094,7 +1162,7 @@ def validate_run_directory(run_dir: Path) -> None:
     validate_result(result, manifest, records, manifest_bytes, event_bytes)
 
 
-def _validate_output_root(path: Path) -> Path:
+def _validate_output_root(path: Path, *, create: bool = True) -> Path:
     if path.exists() and path.is_symlink():
         raise ReplayError(f"output path must not be a symlink: {path}")
     resolved = path.resolve()
@@ -1104,7 +1172,8 @@ def _validate_output_root(path: Path) -> Path:
         raise ReplayError(f"unsafe output path: {path}")
     if resolved.exists() and not resolved.is_dir():
         raise ReplayError(f"output path is not a directory: {path}")
-    resolved.mkdir(parents=True, exist_ok=True)
+    if create:
+        resolved.mkdir(parents=True, exist_ok=True)
     return resolved
 
 
@@ -1121,22 +1190,31 @@ def _atomic_replace(path: Path, content: bytes) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def _persist_run(
-    output_root: Path,
+def _expected_run_artifacts(
     manifest: dict[str, Any],
     event_bytes: bytes,
     result: dict[str, Any],
-) -> Path:
+) -> dict[str, bytes]:
     validate_manifest(manifest)
-    run_dir = output_root / manifest["run_id"]
-    if run_dir.exists() and (run_dir.is_symlink() or not run_dir.is_dir()):
-        raise ReplayError(f"unsafe run directory: {run_dir}")
-    run_dir.mkdir(mode=0o755, exist_ok=True)
-    expected = {
+    return {
         "manifest.json": canonical_bytes(manifest),
         "events.jsonl": event_bytes,
         "result.json": canonical_bytes(result),
     }
+
+
+def _preflight_run(
+    output_root: Path,
+    manifest: dict[str, Any],
+    event_bytes: bytes,
+    result: dict[str, Any],
+) -> None:
+    run_dir = output_root / manifest["run_id"]
+    expected = _expected_run_artifacts(manifest, event_bytes, result)
+    if not run_dir.exists():
+        return
+    if run_dir.exists() and (run_dir.is_symlink() or not run_dir.is_dir()):
+        raise ReplayError(f"unsafe run directory: {run_dir}")
     unexpected = {path.name for path in run_dir.iterdir()} - expected.keys()
     if unexpected:
         raise ReplayError(
@@ -1152,6 +1230,18 @@ def _persist_run(
                 raise ReplayError(
                     f"refusing to overwrite conflicting evidence: {path}"
                 )
+
+
+def _persist_run(
+    output_root: Path,
+    manifest: dict[str, Any],
+    event_bytes: bytes,
+    result: dict[str, Any],
+) -> Path:
+    _preflight_run(output_root, manifest, event_bytes, result)
+    run_dir = output_root / manifest["run_id"]
+    run_dir.mkdir(mode=0o755, exist_ok=True)
+    expected = _expected_run_artifacts(manifest, event_bytes, result)
     for name, content in expected.items():
         path = run_dir / name
         if not path.exists():
@@ -1230,7 +1320,20 @@ def run_replay(
         for ref in refs
     ]
     require_comparable(item[0] for item in planned)
-    output_root = _validate_output_root(output_path)
+    run_ids: dict[str, str] = {}
+    for manifest, _, _ in planned:
+        run_id = manifest["run_id"]
+        previous_ref = run_ids.get(run_id)
+        if previous_ref is not None:
+            raise ReplayError(
+                "workflow refs resolve to duplicate run identity "
+                f"{run_id}: {previous_ref!r}, {manifest['requested_ref']!r}"
+            )
+        run_ids[run_id] = manifest["requested_ref"]
+    output_root = _validate_output_root(output_path, create=False)
+    for manifest, events, result in planned:
+        _preflight_run(output_root, manifest, events, result)
+    output_root.mkdir(parents=True, exist_ok=True)
     return [
         _persist_run(output_root, manifest, events, result)
         for manifest, events, result in planned
