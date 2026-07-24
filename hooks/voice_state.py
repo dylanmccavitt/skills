@@ -186,9 +186,9 @@ def validate_lanes(lanes: list[dict], approved: bool) -> list[dict]:
 
 def _validated_commands(contract: dict) -> dict[str, list[str]]:
     commands = contract.get("commands")
-    if not isinstance(commands, dict) or set(commands) != {"implement"}:
-        raise StateError("contract commands must define only implement")
-    approved = commands["implement"]
+    if not isinstance(commands, dict) or set(commands) != {"painter"}:
+        raise StateError("contract commands must define only Painter")
+    approved = commands["painter"]
     if (
         not isinstance(approved, list)
         or any(
@@ -201,11 +201,11 @@ def _validated_commands(contract: dict) -> dict[str, list[str]]:
         )
         or len(set(approved)) != len(approved)
     ):
-        raise StateError("implement commands must be unique exact command strings")
+        raise StateError("Painter commands must be unique exact command strings")
     for command in approved:
         if re.search(r"""[\\'"`$;&|<>\n\r()]""", command):
             raise StateError(
-                "implement commands cannot use shell composition or indirection"
+                "Painter commands cannot use shell composition or indirection"
             )
         words = shlex.split(command)
         if (
@@ -235,16 +235,16 @@ def _validated_commands(contract: dict) -> dict[str, list[str]]:
             or words[0] in {"curl", "wget"}
         ):
             raise StateError(
-                "implement command is outside the scoped command policy"
+                "Painter command is outside the scoped command policy"
             )
-    return {"implement": list(approved)}
+    return {"painter": list(approved)}
 
 
 def _validated_actors(contract: dict) -> dict[str, list[str]]:
     actors = contract.get("actors")
     if not isinstance(actors, dict):
         raise StateError("contract actors must be an object")
-    required_roles = {"implement", "review_gate"}
+    required_roles = {"painter", "vigil"}
     missing_roles = required_roles - set(actors)
     if missing_roles:
         raise StateError(f"contract actors missing: {', '.join(sorted(missing_roles))}")
@@ -264,17 +264,17 @@ def _validated_actors(contract: dict) -> dict[str, list[str]]:
             raise StateError(f"contract actor role is invalid: {role}")
         normalized[role] = list(members)
 
-    implementers = set(normalized["implement"])
-    reviewers = set(normalized["review_gate"])
+    painters = set(normalized["painter"])
+    reviewers = set(normalized["vigil"])
     decision_actors = set(normalized.get("coordinator", [])) | set(
         normalized.get("user", [])
     )
-    if implementers & reviewers:
-        raise StateError("implement and review_gate actors must be independent")
-    if implementers & decision_actors:
-        raise StateError("implement actors cannot hold delivery authority")
+    if painters & reviewers:
+        raise StateError("Painter and Vigil actors must be independent")
+    if painters & decision_actors:
+        raise StateError("Painter actors cannot hold delivery authority")
     if reviewers & decision_actors:
-        raise StateError("review_gate actors must remain read-only")
+        raise StateError("Vigil actors must remain read-only")
     if contract["owner"] not in decision_actors:
         raise StateError("task owner must be a registered coordinator or user actor")
     return normalized
@@ -396,8 +396,8 @@ def _claim(
     worktree: str,
 ) -> None:
     def change(candidate: dict) -> None:
-        if not _actor_has_role(candidate, actor, "implement"):
-            raise StateError("writer is not registered for the implement role")
+        if not _actor_has_role(candidate, actor, "painter"):
+            raise StateError("writer is not registered for the Painter role")
         if candidate["state"] != "approved" or candidate["writer"]:
             raise StateError("task already has a writer")
         if branch != candidate["contract"]["branch"]:
@@ -409,13 +409,13 @@ def _claim(
             "branch": branch,
             "worktree": worktree,
         }
-        candidate["state"] = "implementing"
-        candidate["next_action"] = "implement approved scope"
+        candidate["state"] = "painting"
+        candidate["next_action"] = "paint approved scope"
 
     _transition(task, expected_revision, change)
 
 
-def _set_implemented(
+def _set_painted(
     task: dict,
     expected_revision: int,
     actor: str,
@@ -424,21 +424,21 @@ def _set_implemented(
 ) -> None:
     def change(candidate: dict) -> None:
         if (
-            candidate["state"] not in {"implementing", "changes_requested"}
+            candidate["state"] not in {"painting", "changes_requested"}
             or not candidate["writer"]
             or candidate["writer"]["actor"] != actor
         ):
-            raise StateError("only the claimed writer may implement")
+            raise StateError("only the claimed writer may paint")
         if not FULL_SHA.fullmatch(head):
-            raise StateError("implementation head must be a full commit SHA")
+            raise StateError("painted head must be a full commit SHA")
         if not isinstance(checks, list) or any(
             not isinstance(check, str) or not check for check in checks
         ):
-            raise StateError("implementation checks must be a list of non-empty strings")
+            raise StateError("Painter checks must be a list of non-empty strings")
         _archive_authority(candidate, "invalidated")
         candidate.update(
             {
-                "state": "implemented",
+                "state": "painted",
                 "head": head,
                 "review": None,
                 "next_action": "independent review",
@@ -446,8 +446,8 @@ def _set_implemented(
         )
         _receipt(
             candidate,
-            "implemented",
-            f"Implemented {head[:12]}; {len(checks)} checks passed.",
+            "painted",
+            f"Painted {head[:12]}; {len(checks)} checks passed.",
             actor,
         )
 
@@ -463,12 +463,12 @@ def _review(
     finding_count: int = 0,
 ) -> None:
     def change(candidate: dict) -> None:
-        if not _actor_has_role(candidate, actor, "review_gate"):
-            raise StateError("reviewer is not registered for the review_gate role")
+        if not _actor_has_role(candidate, actor, "vigil"):
+            raise StateError("reviewer is not registered for the Vigil role")
         if not candidate["writer"] or candidate["writer"]["actor"] == actor:
             raise StateError("reviewer must be independent from writer")
-        if candidate["state"] != "implemented" or candidate["head"] != head:
-            raise StateError("review must bind the current implemented head")
+        if candidate["state"] != "painted" or candidate["head"] != head:
+            raise StateError("review must bind the current painted head")
         if not isinstance(passed, bool):
             raise StateError("review result must be explicit")
         if (
@@ -574,8 +574,8 @@ def _grant_delivery(
             candidate["contract"]["repo"],
             str(candidate["contract"]["pr"]),
         )
-        if _actor_has_role(candidate, actor, "implement"):
-            raise StateError("implement actors cannot grant delivery authority")
+        if _actor_has_role(candidate, actor, "painter"):
+            raise StateError("Painter actors cannot grant delivery authority")
         if origin not in {"coordinator", "user"} or not _actor_has_role(
             candidate, actor, origin
         ):
@@ -653,7 +653,7 @@ def _invalidate(task: dict, reason: str) -> None:
         attempt["invalidated_reason"] = reason
     task["review"] = None
     _archive_authority(task, "invalidated")
-    task["state"] = "implementing"
+    task["state"] = "painting"
     task["next_action"] = "refresh proof and independent review"
     _receipt(task, "invalidated", f"Proof invalidated: {reason}.", "kernel")
 
@@ -831,17 +831,17 @@ def _checkpoint(
         writer = candidate.get("writer")
         if (
             candidate["state"]
-            not in {"implementing", "implemented", "changes_requested", "review_passed"}
+            not in {"painting", "painted", "changes_requested", "review_passed"}
             or not writer
             or writer["actor"] != actor
         ):
             raise StateError("only the claimed writer may checkpoint")
         if (
-            not _actor_has_role(candidate, successor, "implement")
+            not _actor_has_role(candidate, successor, "painter")
             or successor == actor
         ):
             raise StateError(
-                "checkpoint requires one distinct registered implement successor"
+                "checkpoint requires one distinct registered Painter successor"
             )
         if not next_action:
             raise StateError("checkpoint requires an exact next action")
@@ -882,7 +882,7 @@ def _resume_checkpoint(
             or not saved
             or saved.get("status") != "pending"
             or saved.get("successor") != actor
-            or not _actor_has_role(candidate, actor, "implement")
+            or not _actor_has_role(candidate, actor, "painter")
         ):
             raise StateError("only the pending checkpoint successor may resume")
         previous_writer = saved["previous_writer"]
@@ -893,7 +893,7 @@ def _resume_checkpoint(
         }
         saved["status"] = "resumed"
         saved["resumed_at_revision"] = candidate["revision"]
-        candidate["state"] = "implementing"
+        candidate["state"] = "painting"
         candidate["next_action"] = saved["next_action"]
         _receipt(
             candidate,
@@ -1050,17 +1050,17 @@ def mutate_task(
             raise StateError(f"unknown task: {record_id}") from error
         try:
             if operation == "claim":
-                _authenticate(task, arguments.get("actor", ""), credential, "implement")
+                _authenticate(task, arguments.get("actor", ""), credential, "painter")
                 _claim(task, expected_revision, **arguments)
-            elif operation == "implemented":
-                _authenticate(task, arguments.get("actor", ""), credential, "implement")
-                _set_implemented(task, expected_revision, **arguments)
+            elif operation == "painted":
+                _authenticate(task, arguments.get("actor", ""), credential, "painter")
+                _set_painted(task, expected_revision, **arguments)
             elif operation == "review":
                 _authenticate(
                     task,
                     arguments.get("actor", ""),
                     credential,
-                    "review_gate",
+                    "vigil",
                 )
                 _review(task, expected_revision, **arguments)
             elif operation == "approve-lanes":
@@ -1115,10 +1115,10 @@ def mutate_task(
             elif operation == "finish-delivery":
                 _finish_delivery(task, expected_revision, **arguments)
             elif operation == "checkpoint":
-                _authenticate(task, arguments.get("actor", ""), credential, "implement")
+                _authenticate(task, arguments.get("actor", ""), credential, "painter")
                 _checkpoint(task, expected_revision, **arguments)
             elif operation == "resume-checkpoint":
-                _authenticate(task, arguments.get("actor", ""), credential, "implement")
+                _authenticate(task, arguments.get("actor", ""), credential, "painter")
                 _resume_checkpoint(task, expected_revision, **arguments)
             else:
                 raise StateError(f"unknown operation: {operation}")
@@ -1280,7 +1280,7 @@ def _validate_control_actor(
         return
     roles = [
         role
-        for role in ("coordinator", "user", "implement", "review_gate")
+        for role in ("coordinator", "user", "painter", "vigil")
         if _actor_has_role(task, actor, role)
     ]
     if not roles:
@@ -1326,26 +1326,26 @@ def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
             return
         _validate_control_actor(task, operation, actor, credential)
         return
-    if _actor_has_role(task, actor, "review_gate"):
-        _authenticate(task, actor, credential, "review_gate")
-        raise StateError("Review Gate cannot use Bash or write-capable tools")
-    _authenticate(task, actor, credential, "implement")
+    if _actor_has_role(task, actor, "vigil"):
+        _authenticate(task, actor, credential, "vigil")
+        raise StateError("Vigil cannot use Bash or write-capable tools")
+    _authenticate(task, actor, credential, "painter")
     writer = task.get("writer")
     recorded_worktree = (
         str(Path(writer.get("worktree", "")).resolve()) if writer else ""
     )
     if (
-        task["state"] not in {"implementing", "changes_requested"}
+        task["state"] not in {"painting", "changes_requested"}
         or not writer
         or writer.get("actor") != present["actor"]
         or recorded_worktree != context_worktree
     ):
         raise StateError("write tool requires the active credentialed writer lease")
     if _shell_capable_tool(payload):
-        approved = task["contract"]["commands"]["implement"]
+        approved = task["contract"]["commands"]["painter"]
         if command not in approved:
             raise StateError(
-                "Bash command is not an exact contract-approved implement command"
+                "Bash command is not an exact contract-approved Painter command"
             )
 
 
@@ -1506,7 +1506,7 @@ def main(arguments: list[str] | None = None) -> int:
             operation = payload["operation"]
             if operation not in {
                 "claim",
-                "implemented",
+                "painted",
                 "review",
                 "approve-lanes",
                 "grant-delivery",

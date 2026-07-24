@@ -20,9 +20,9 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_NAME = "@dylanmccavitt/skills";
-const SKILLS = ["gepetto", "implement", "review-gate", "checkpoint", "orchestrate"];
-const LEGACY_SKILLS = ["pinocchio", "jiminy"];
-const ALL_PACKAGE_SKILLS = [...new Set([...SKILLS, ...LEGACY_SKILLS])];
+const SKILLS = ["gepetto", "painter", "vigil", "checkpoint", "orchestrate"];
+const RETIRED_SKILLS = ["pinocchio", "jiminy", "implement", "review-gate"];
+const ALL_PACKAGE_SKILLS = [...new Set([...SKILLS, ...RETIRED_SKILLS])];
 const MANAGED_DIRECTORIES = [...SKILLS, "hooks"];
 const LEGACY_HOOK_PATH = "/orchestration-skills/hooks/orchestration_hook.py";
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -187,7 +187,7 @@ export function installSuite({ codexHome, sourceRoot = packageRoot } = {}) {
     if (pathExists(installRoot)) renameSync(installRoot, previous);
     renameSync(staging, installRoot);
 
-    for (const skill of LEGACY_SKILLS) {
+    for (const skill of RETIRED_SKILLS) {
       const linkPath = join(skillsRoot, skill);
       if (managedLink(linkPath, join(installRoot, skill))) rmSync(linkPath);
     }

@@ -10,7 +10,7 @@
   "type": "module",
   "bin": { "skills": "bin/install.mjs" },
   "publishConfig": { "access": "public" },
-  "files": ["bin/", "checkpoint/", "gepetto/", "implement/", "orchestrate/", "review-gate/", "hooks/hooks.json", "hooks/voice_state.py", "LICENSE", "README.md"],
+  "files": ["bin/", "checkpoint/", "gepetto/", "orchestrate/", "painter/", "vigil/", "hooks/hooks.json", "hooks/voice_state.py", "LICENSE", "README.md"],
   "scripts": { "test": "node --test test/*.test.mjs && python3 -m unittest discover -s hooks -p 'test_*.py'", "prepack": "npm test" },
   "engines": { "node": ">=18" },
   "keywords": ["codex", "codex-skills", "voice", "orchestration"]

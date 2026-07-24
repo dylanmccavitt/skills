@@ -7,14 +7,14 @@ This package keeps repository work safe after a voice conversation moves on. It 
 | Path | Use | Flow |
 | --- | --- | --- |
 | Ordinary | small, local, low-risk work | coordinator → result |
-| Durable | branch, PR, handoff, external effect, or meaningful risk | coordinator → Implement → Review Gate → explicit delivery authority |
-| Complex | approved dependent lanes | coordinator → Orchestrate → per-lane Implement/Review Gate |
+| Durable | branch, PR, handoff, external effect, or meaningful risk | coordinator → Painter → Vigil → explicit delivery authority |
+| Complex | approved dependent lanes | coordinator → Orchestrate → per-lane Painter/Vigil |
 
 ## Skills
 
 - `gepetto`: optional, read-only issue/lane research and recommendation.
-- `implement`: sole writer for one approved durable task.
-- `review-gate`: independent, read-only exact-head review and delivery gate.
+- `painter`: sole writer for one approved durable task.
+- `vigil`: independent, zero-execution, read-only exact-head review and delivery gate.
 - `checkpoint`: atomic durable handoff.
 - `orchestrate`: optional approved complex-lane coordination.
 
@@ -22,11 +22,11 @@ The coordinator/user approves scope, revisions, stops, and every external delive
 
 ## Safety kernel
 
-The kernel records compact task contracts, exact Implement command permissions, credential hashes, registered role owners, writer ownership, receipts, proof, and authority. Persisted transitions use locked compare-and-swap updates and atomic replacement. Review Gate is credentialed separately from Implement and decision actors; checkpoint freezes the outgoing writer before transferring ownership to a confirmed successor.
+The kernel records compact task contracts, exact Painter command permissions, credential hashes, registered role owners, writer ownership, receipts, proof, and authority. Persisted transitions use locked compare-and-swap updates and atomic replacement. Vigil is credentialed separately from Painter and decision actors; checkpoint freezes the outgoing writer before transferring ownership to a confirmed successor.
 
 `voice_state.py create` provisions a task and one capability per actor. `transition` applies credentialed state changes. `deliver` also requires the exact granting decision actor and capability; it is the only supported external-action path, refreshes the approved PR head, journals the prepared attempt, consumes the grant once, and invokes `gh pr merge` with `--match-head-commit`. `recover-delivery` re-observes the exact PR after interruption and either records an already-completed merge or safely retries the still-open exact-head action. `classify` distinguishes ordinary, durable, and complex work; `orchestrate` accepts only a lane map previously approved through a credentialed coordinator/user transition.
 
-Durable tasks carry state, task, actor, capability, and worktree context in `CODEX_ORCHESTRATION_*`. The installed hook checks the live lease before Bash, namespaced shell/exec, or file writes, permits durable writers only exact contract-listed commands, and denies Review Gate all shell and write-capable tools except the canonical locked-kernel transition command. Ordinary tasks omit that context: structured local edits remain available, while shell execution is limited to literal read-only inspection. Delivery, protected-branch push, issue closure, publishing, and production deployment cannot ride through unregistered or composed shell commands.
+Durable tasks carry state, task, actor, capability, and worktree context in `CODEX_ORCHESTRATION_*`. The installed hook checks the live lease before Bash, namespaced shell/exec, or file writes, permits Painter only exact contract-listed commands, and denies Vigil all shell and write-capable tools except the canonical locked-kernel transition command. Ordinary tasks omit that context: structured local edits remain available, while shell execution is limited to literal read-only inspection. Delivery, protected-branch push, issue closure, publishing, and production deployment cannot ride through unregistered or composed shell commands.
 
 ## Install
 
@@ -34,7 +34,7 @@ Durable tasks carry state, task, actor, capability, and worktree context in `COD
 npx @dylanmccavitt/skills@latest
 ```
 
-The installer adds only managed skills and hooks, preserves unrelated hooks, and refuses unmanaged replacement. Remove it with `npx @dylanmccavitt/skills@latest uninstall`.
+The installer adds only managed skills and hooks, preserves unrelated hooks, and refuses unmanaged replacement. On upgrade, package-owned `implement` and `review-gate` links are retired in favor of `painter` and `vigil`; unrelated same-named links are left untouched. Remove the package with `npx @dylanmccavitt/skills@latest uninstall`.
 
 ## Development
 

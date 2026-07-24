@@ -43,7 +43,7 @@ def contract():
         "branch": "feature",
         "acceptance": ["test"],
         "commands": {
-            "implement": [
+            "painter": [
                 "npm test",
                 "git diff --check",
                 "git push origin feature",
@@ -52,8 +52,8 @@ def contract():
         "actors": {
             "coordinator": ["coordinator"],
             "user": ["user"],
-            "implement": ["writer", "successor"],
-            "review_gate": ["reviewer"],
+            "painter": ["writer", "successor"],
+            "vigil": ["reviewer"],
         },
     }
 
@@ -96,7 +96,7 @@ def create_reviewed_task(path):
     transition(
         path,
         2,
-        "implemented",
+        "painted",
         actor="writer",
         head=HEAD,
         checks=["npm test"],
@@ -178,13 +178,24 @@ class VoiceStateTests(unittest.TestCase):
     def test_contract_requires_independent_roles_and_credentials(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
+            retired = contract()
+            retired["actors"]["implement"] = retired["actors"].pop("painter")
+            retired["actors"]["review_gate"] = retired["actors"].pop("vigil")
+            with self.assertRaisesRegex(StateError, "painter|vigil"):
+                create_task(path, "retired-roles", retired, TOKENS)
+
+            retired = contract()
+            retired["commands"]["implement"] = retired["commands"].pop("painter")
+            with self.assertRaisesRegex(StateError, "only Painter"):
+                create_task(path, "retired-command", retired, TOKENS)
+
             invalid = contract()
-            invalid["actors"]["review_gate"] = ["writer"]
+            invalid["actors"]["vigil"] = ["writer"]
             with self.assertRaisesRegex(StateError, "must be independent"):
                 create_task(path, "task-1", invalid, TOKENS)
 
             invalid = contract()
-            invalid["actors"]["review_gate"] = ["coordinator"]
+            invalid["actors"]["vigil"] = ["coordinator"]
             with self.assertRaisesRegex(StateError, "must remain read-only"):
                 create_task(path, "task-1", invalid, TOKENS)
 
@@ -199,7 +210,7 @@ class VoiceStateTests(unittest.TestCase):
                 "bash deploy.sh",
             ]:
                 invalid = contract()
-                invalid["commands"]["implement"] = [command]
+                invalid["commands"]["painter"] = [command]
                 with self.subTest(command=command):
                     with self.assertRaisesRegex(
                         StateError,
@@ -272,12 +283,12 @@ class VoiceStateTests(unittest.TestCase):
             transition(
                 path,
                 2,
-                "implemented",
+                "painted",
                 actor="writer",
                 head=HEAD,
                 checks=["npm test"],
             )
-            with self.assertRaisesRegex(StateError, "review_gate"):
+            with self.assertRaisesRegex(StateError, "vigil"):
                 transition(
                     path,
                     3,
@@ -542,7 +553,7 @@ class VoiceStateTests(unittest.TestCase):
                 )
             recovered = load_task(path, "task-1")
             self.assertEqual(recovered["revision"], 6)
-            self.assertEqual(recovered["state"], "implementing")
+            self.assertEqual(recovered["state"], "painting")
             self.assertIsNone(recovered["review"])
             self.assertIsNone(recovered["authority"])
 
@@ -571,7 +582,7 @@ class VoiceStateTests(unittest.TestCase):
                 transition(
                     path,
                     3,
-                    "implemented",
+                    "painted",
                     actor="writer",
                     head=HEAD,
                     checks=[],

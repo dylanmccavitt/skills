@@ -8,8 +8,15 @@ const root = resolve(new URL("..", import.meta.url).pathname);
 
 test("publishes only the voice-first skill surface", () => {
   const pkg = JSON.parse(readFileSync(resolve(root, "package.json")));
-  assert.deepEqual(pkg.files.filter((item) => item.endsWith("/")), ["bin/", "checkpoint/", "gepetto/", "implement/", "orchestrate/", "review-gate/"]);
-  assert.equal(pkg.files.some((item) => item.includes("pinocchio") || item.includes("jiminy")), false);
+  assert.deepEqual(pkg.files.filter((item) => item.endsWith("/")), ["bin/", "checkpoint/", "gepetto/", "orchestrate/", "painter/", "vigil/"]);
+  assert.equal(
+    pkg.files.some((item) =>
+      ["pinocchio", "jiminy", "implement", "review-gate"].some((name) =>
+        item.includes(`${name}/`)
+      )
+    ),
+    false,
+  );
 });
 
 test("packed artifact contains every runtime control-plane file", () => {
@@ -26,12 +33,20 @@ test("packed artifact contains every runtime control-plane file", () => {
     "hooks/hooks.json",
     "hooks/voice_state.py",
     "checkpoint/SKILL.md",
+    "checkpoint/agents/openai.yaml",
     "gepetto/SKILL.md",
-    "implement/SKILL.md",
+    "gepetto/agents/openai.yaml",
     "orchestrate/SKILL.md",
-    "review-gate/SKILL.md",
+    "orchestrate/agents/openai.yaml",
+    "painter/SKILL.md",
+    "painter/agents/openai.yaml",
+    "vigil/SKILL.md",
+    "vigil/agents/openai.yaml",
   ]) {
     assert.equal(files.has(path), true, `missing from tarball: ${path}`);
   }
-  assert.equal([...files].some((path) => /(?:pinocchio|jiminy)\//.test(path)), false);
+  assert.equal(
+    [...files].some((path) => /(?:pinocchio|jiminy|implement|review-gate)\//.test(path)),
+    false,
+  );
 });

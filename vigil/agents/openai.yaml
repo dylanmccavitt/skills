@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vigil"
+  short_description: "Independently review one exact head"
+  default_prompt: "Use $vigil to independently review this exact change head."

@@ -28,7 +28,7 @@ def contract():
         "branch": "feature",
         "acceptance": ["tests"],
         "commands": {
-            "implement": [
+            "painter": [
                 "npm test",
                 "git diff --check",
                 "git push origin feature",
@@ -36,8 +36,8 @@ def contract():
         },
         "actors": {
             "coordinator": ["coordinator"],
-            "implement": ["writer", "successor"],
-            "review_gate": ["reviewer"],
+            "painter": ["writer", "successor"],
+            "vigil": ["reviewer"],
         },
     }
 
@@ -136,7 +136,7 @@ class VoiceHookTests(unittest.TestCase):
                 path,
                 "task-1",
                 2,
-                "implemented",
+                "painted",
                 credential=TOKENS["writer"],
                 actor="writer",
                 head=HEAD,

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Painter"
+  short_description: "Paint one approved task"
+  default_prompt: "Use $painter to deliver this approved task as its sole writer."

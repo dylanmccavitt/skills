@@ -25,7 +25,7 @@ test("installs all skills and preserves existing hooks", () => {
   const result = installSuite({ codexHome, sourceRoot: repositoryRoot });
 
   assert.equal(result.codexHome, codexHome);
-  for (const skill of ["gepetto", "implement", "review-gate", "checkpoint", "orchestrate"]) {
+  for (const skill of ["gepetto", "painter", "vigil", "checkpoint", "orchestrate"]) {
     const path = join(codexHome, "skills", skill);
     assert.equal(lstatSync(path).isSymbolicLink(), true);
     assert.equal(existsSync(join(path, "SKILL.md")), true);
@@ -73,7 +73,7 @@ test("runs through an npm-style binary symlink", () => {
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Installed gepetto, implement, review-gate, checkpoint, orchestrate/);
+  assert.match(result.stdout, /Installed gepetto, painter, vigil, checkpoint, orchestrate/);
 });
 
 test("repeated installation is idempotent", () => {
@@ -85,18 +85,20 @@ test("repeated installation is idempotent", () => {
   assert.equal(second, first);
 });
 
-test("upgrades a package-owned legacy install as an intentional clean swap", () => {
+test("upgrades package-owned retired skill names as an intentional clean swap", () => {
   const codexHome = temporaryCodexHome();
   const installRoot = join(codexHome, "orchestration-skills");
   const skillsRoot = join(codexHome, "skills");
   mkdirSync(skillsRoot, { recursive: true });
   mkdirSync(join(installRoot, "pinocchio"), { recursive: true });
   mkdirSync(join(installRoot, "jiminy"), { recursive: true });
+  mkdirSync(join(installRoot, "implement"), { recursive: true });
+  mkdirSync(join(installRoot, "review-gate"), { recursive: true });
   writeFileSync(
     join(installRoot, ".codex-orchestration-install.json"),
     `${JSON.stringify({ package: "@dylanmccavitt/skills", version: "0.4.0" })}\n`,
   );
-  for (const skill of ["pinocchio", "jiminy"]) {
+  for (const skill of ["pinocchio", "jiminy", "implement", "review-gate"]) {
     symlinkSync(join(installRoot, skill), join(skillsRoot, skill), "dir");
   }
   const legacyCommand =
@@ -125,8 +127,11 @@ test("upgrades a package-owned legacy install as an intentional clean swap", () 
 
   installSuite({ codexHome, sourceRoot: repositoryRoot });
 
-  for (const skill of ["pinocchio", "jiminy"]) {
+  for (const skill of ["pinocchio", "jiminy", "implement", "review-gate"]) {
     assert.throws(() => lstatSync(join(skillsRoot, skill)), { code: "ENOENT" });
+  }
+  for (const skill of ["painter", "vigil"]) {
+    assert.equal(lstatSync(join(skillsRoot, skill)).isSymbolicLink(), true);
   }
   const hooks = JSON.parse(readFileSync(join(codexHome, "hooks.json"), "utf8"));
   const serialized = JSON.stringify(hooks);
@@ -138,7 +143,7 @@ test("upgrades a package-owned legacy install as an intentional clean swap", () 
   }
 });
 
-test("upgrade preserves legacy-named links not owned by this package", () => {
+test("upgrade preserves retired-name links not owned by this package", () => {
   const codexHome = temporaryCodexHome();
   const installRoot = join(codexHome, "orchestration-skills");
   const skillsRoot = join(codexHome, "skills");
@@ -148,15 +153,22 @@ test("upgrade preserves legacy-named links not owned by this package", () => {
     join(installRoot, ".codex-orchestration-install.json"),
     `${JSON.stringify({ package: "@dylanmccavitt/skills", version: "0.4.0" })}\n`,
   );
-  const external = join(codexHome, "external-pinocchio");
-  mkdirSync(external);
-  symlinkSync(external, join(skillsRoot, "pinocchio"), "dir");
+  const retiredSkills = ["pinocchio", "jiminy", "implement", "review-gate"];
+  const externalTargets = new Map();
+  for (const skill of retiredSkills) {
+    const external = join(codexHome, `external-${skill}`);
+    mkdirSync(external);
+    symlinkSync(external, join(skillsRoot, skill), "dir");
+    externalTargets.set(skill, external);
+  }
 
   installSuite({ codexHome, sourceRoot: repositoryRoot });
 
-  const link = join(skillsRoot, "pinocchio");
-  assert.equal(lstatSync(link).isSymbolicLink(), true);
-  assert.equal(resolve(skillsRoot, readlinkSync(link)), external);
+  for (const skill of retiredSkills) {
+    const link = join(skillsRoot, skill);
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(resolve(skillsRoot, readlinkSync(link)), externalTargets.get(skill));
+  }
 });
 
 test("repair install removes an orphan package legacy hook without a marker", () => {
@@ -227,7 +239,7 @@ test("uninstall removes managed pieces and preserves foreign entries", () => {
   const result = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
 
   assert.equal(result.removed.length > 0, true);
-  for (const skill of ["gepetto", "implement", "review-gate", "checkpoint", "orchestrate"]) {
+  for (const skill of ["gepetto", "painter", "vigil", "checkpoint", "orchestrate"]) {
     assert.equal(existsSync(join(codexHome, "skills", skill)), false);
   }
   assert.equal(lstatSync(foreignLink).isSymbolicLink(), true);

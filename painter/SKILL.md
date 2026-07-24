@@ -1,13 +1,13 @@
 ---
-name: implement
-description: Implement one approved durable task as its sole writer and return exact-head proof.
+name: painter
+description: Paint one approved durable task as its sole writer and return exact-head proof.
 ---
 
-# Implement
+# Painter
 
 Role: sole writer for one approved task.
 
-Input: approved task contract with repository and PR, registered Implement actor capability, writer claim, and exact branch/worktree context.
+Input: approved task contract with repository and PR, registered Painter actor capability, writer claim, and exact branch/worktree context.
 
 Allowed: claim the single writer slot through the locked state kernel; edit only contract scope; run only exact commands listed in the immutable task contract; commit, push, and open one PR when the contract permits.
 
