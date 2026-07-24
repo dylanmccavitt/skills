@@ -2,13 +2,13 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Bash|Edit|Write|apply_patch|.*__apply_patch|.*__(?:edit|write|exec|exec_command|shell)(?:_.*)?|.*github.*(?:merge_pull_request|close_issue).*)$",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",
             "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/voice_state.py\" hook",
             "timeout": 15,
-            "statusMessage": "Blocking direct delivery outside the typed gate"
+            "statusMessage": "Checking voice-task tool authority"
           }
         ]
       }

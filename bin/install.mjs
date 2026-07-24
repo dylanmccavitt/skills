@@ -24,7 +24,74 @@ const SKILLS = ["gepetto", "painter", "vigil", "checkpoint", "orchestrate"];
 const RETIRED_SKILLS = ["pinocchio", "jiminy", "implement", "review-gate"];
 const ALL_PACKAGE_SKILLS = [...new Set([...SKILLS, ...RETIRED_SKILLS])];
 const MANAGED_DIRECTORIES = [...SKILLS, "hooks"];
-const LEGACY_HOOK_PATH = "/orchestration-skills/hooks/orchestration_hook.py";
+const LEGACY_HOOK_COMMAND =
+  '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py"';
+const LEGACY_HOOK_ENTRIES = {
+  SessionStart: [
+    {
+      matcher: "^compact$",
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Checking checkpoint policy",
+        },
+      ],
+    },
+  ],
+  SubagentStart: [
+    {
+      matcher: "*",
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Loading lane contract",
+        },
+      ],
+    },
+  ],
+  SubagentStop: [
+    {
+      matcher: "*",
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Checking lane receipt",
+        },
+      ],
+    },
+  ],
+  Stop: [
+    {
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Checking orchestration result",
+        },
+      ],
+    },
+  ],
+  PreToolUse: [
+    {
+      matcher: "^(Bash|apply_patch|Edit|Write)$",
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Checking orchestration guard",
+        },
+      ],
+    },
+  ],
+};
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function readJson(path) {
@@ -111,21 +178,13 @@ function mergeHooks(existing, managed) {
   return merged;
 }
 
-function withoutLegacyHooks(existing) {
+function withoutPackageOwnedLegacyHooks(existing) {
   const cleaned = structuredClone(existing);
-  for (const [event, entries] of Object.entries(cleaned.hooks)) {
+  for (const [event, ownedEntries] of Object.entries(LEGACY_HOOK_ENTRIES)) {
+    const entries = cleaned.hooks[event];
     if (!Array.isArray(entries)) continue;
-    const kept = [];
-    for (const entry of entries) {
-      if (!entry || typeof entry !== "object" || !Array.isArray(entry.hooks)) {
-        kept.push(entry);
-        continue;
-      }
-      const hooks = entry.hooks.filter(
-        (hook) => typeof hook?.command !== "string" || !hook.command.includes(LEGACY_HOOK_PATH),
-      );
-      if (hooks.length > 0) kept.push({ ...entry, hooks });
-    }
+    const owned = new Set(ownedEntries.map((entry) => JSON.stringify(entry)));
+    const kept = entries.filter((entry) => !owned.has(JSON.stringify(entry)));
     if (kept.length > 0) cleaned.hooks[event] = kept;
     else delete cleaned.hooks[event];
   }
@@ -174,7 +233,9 @@ export function installSuite({ codexHome, sourceRoot = packageRoot } = {}) {
   const managedHooks = readJson(join(sourceRoot, "hooks", "hooks.json"));
 
   const existingPackageInstall = packageInstallExists(installRoot);
-  const existingHooks = withoutLegacyHooks(originalHooks);
+  const existingHooks = existingPackageInstall
+    ? withoutPackageOwnedLegacyHooks(originalHooks)
+    : originalHooks;
   const mergedHooks = mergeHooks(existingHooks, managedHooks);
   const priorSkillLinks = ALL_PACKAGE_SKILLS.filter((skill) =>
     managedLink(join(skillsRoot, skill), join(installRoot, skill)),
@@ -251,17 +312,21 @@ export function uninstallSuite({ codexHome, sourceRoot = packageRoot } = {}) {
 
   if (pathExists(hooksPath)) {
     const original = parseExistingHooks(hooksPath);
-    const config = withoutLegacyHooks(original);
+    const config = existingPackageInstall
+      ? withoutPackageOwnedLegacyHooks(original)
+      : structuredClone(original);
     const managed = managedHookEntries(sourceRoot);
     let changed = JSON.stringify(config) !== JSON.stringify(original);
-    for (const [event, entries] of Object.entries(managed)) {
-      if (!Array.isArray(config.hooks[event])) continue;
-      const serialized = new Set(entries.map((entry) => JSON.stringify(entry)));
-      const kept = config.hooks[event].filter((entry) => !serialized.has(JSON.stringify(entry)));
-      if (kept.length !== config.hooks[event].length) {
-        changed = true;
-        if (kept.length > 0) config.hooks[event] = kept;
-        else delete config.hooks[event];
+    if (existingPackageInstall) {
+      for (const [event, entries] of Object.entries(managed)) {
+        if (!Array.isArray(config.hooks[event])) continue;
+        const serialized = new Set(entries.map((entry) => JSON.stringify(entry)));
+        const kept = config.hooks[event].filter((entry) => !serialized.has(JSON.stringify(entry)));
+        if (kept.length !== config.hooks[event].length) {
+          changed = true;
+          if (kept.length > 0) config.hooks[event] = kept;
+          else delete config.hooks[event];
+        }
       }
     }
     if (changed) {

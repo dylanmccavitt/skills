@@ -9,6 +9,17 @@ import test from "node:test";
 import { doctorSuite, installSuite, uninstallSuite } from "../bin/install.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const legacyCommand =
+  '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py"';
+
+function legacyHook(statusMessage) {
+  return {
+    type: "command",
+    command: legacyCommand,
+    timeout: 10,
+    statusMessage,
+  };
+}
 
 function temporaryCodexHome() {
   const root = mkdtempSync(join(tmpdir(), "codex-orchestration-test-"));
@@ -101,24 +112,36 @@ test("upgrades package-owned retired skill names as an intentional clean swap", 
   for (const skill of ["pinocchio", "jiminy", "implement", "review-gate"]) {
     symlinkSync(join(installRoot, skill), join(skillsRoot, skill), "dir");
   }
-  const legacyCommand =
-    '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py"';
   writeFileSync(
     join(codexHome, "hooks.json"),
     `${JSON.stringify({
       hooks: {
-        SessionStart: [{ matcher: "^compact$", hooks: [{ type: "command", command: legacyCommand }] }],
-        SubagentStart: [{ matcher: "*", hooks: [{ type: "command", command: legacyCommand }] }],
-        SubagentStop: [{ matcher: "*", hooks: [{ type: "command", command: legacyCommand }] }],
-        Stop: [{ hooks: [{ type: "command", command: legacyCommand }] }],
+        SessionStart: [{ matcher: "^compact$", hooks: [legacyHook("Checking checkpoint policy")] }],
+        SubagentStart: [{ matcher: "*", hooks: [legacyHook("Loading lane contract")] }],
+        SubagentStop: [{ matcher: "*", hooks: [legacyHook("Checking lane receipt")] }],
+        Stop: [{ hooks: [legacyHook("Checking orchestration result")] }],
         PreToolUse: [
-          { matcher: "^(Bash|apply_patch|Edit|Write)$", hooks: [{ type: "command", command: legacyCommand }] },
+          {
+            matcher: "^(Bash|apply_patch|Edit|Write)$",
+            hooks: [legacyHook("Checking orchestration guard")],
+          },
           {
             matcher: "mixed",
             hooks: [
               { type: "command", command: `sh -c '${legacyCommand}'` },
               { type: "command", command: "preserve-me" },
             ],
+          },
+          {
+            matcher: "^(Bash|apply_patch|Edit|Write)$",
+            hooks: [
+              legacyHook("Checking orchestration guard"),
+              { type: "command", command: "preserve-co-located" },
+            ],
+          },
+          {
+            matcher: "^(Bash|apply_patch|Edit|Write)$",
+            hooks: [{ ...legacyHook("Checking orchestration guard"), timeout: 20 }],
           },
         ],
       },
@@ -135,8 +158,11 @@ test("upgrades package-owned retired skill names as an intentional clean swap", 
   }
   const hooks = JSON.parse(readFileSync(join(codexHome, "hooks.json"), "utf8"));
   const serialized = JSON.stringify(hooks);
-  assert.equal(serialized.includes("orchestration_hook.py"), false);
+  assert.equal(serialized.includes("sh -c"), true);
+  assert.equal(serialized.includes("orchestration_hook.py"), true);
   assert.equal(serialized.includes("preserve-me"), true);
+  assert.equal(serialized.includes("preserve-co-located"), true);
+  assert.equal(serialized.includes('"timeout":20'), true);
   assert.equal(serialized.includes("voice_state.py"), true);
   for (const event of ["SessionStart", "SubagentStart", "SubagentStop", "Stop"]) {
     assert.equal(hooks.hooks[event], undefined);
@@ -171,15 +197,13 @@ test("upgrade preserves retired-name links not owned by this package", () => {
   }
 });
 
-test("repair install removes an orphan package legacy hook without a marker", () => {
+test("repair install preserves ambiguous legacy-looking hooks without a marker", () => {
   const codexHome = temporaryCodexHome();
-  const legacyCommand =
-    '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py"';
   writeFileSync(
     join(codexHome, "hooks.json"),
     `${JSON.stringify({
       hooks: {
-        Stop: [{ hooks: [{ type: "command", command: legacyCommand }] }],
+        Stop: [{ hooks: [legacyHook("Checking orchestration result")] }],
         PreToolUse: [{ matcher: "foreign", hooks: [{ type: "command", command: "preserve-me" }] }],
       },
     })}\n`,
@@ -188,7 +212,7 @@ test("repair install removes an orphan package legacy hook without a marker", ()
   installSuite({ codexHome, sourceRoot: repositoryRoot });
 
   const hooks = JSON.parse(readFileSync(join(codexHome, "hooks.json"), "utf8"));
-  assert.equal(JSON.stringify(hooks).includes("orchestration_hook.py"), false);
+  assert.equal(JSON.stringify(hooks).includes("orchestration_hook.py"), true);
   assert.equal(JSON.stringify(hooks).includes("preserve-me"), true);
 });
 
@@ -246,12 +270,32 @@ test("uninstall removes managed pieces and preserves foreign entries", () => {
   assert.equal(existsSync(join(codexHome, "orchestration-skills")), false);
   const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
   assert.deepEqual(hooks.hooks.Stop, [{ hooks: [{ type: "command", command: "existing" }] }]);
+  const firstUninstall = readFileSync(hooksPath, "utf8");
+  const repeated = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
+  assert.deepEqual(repeated.removed, []);
+  assert.equal(readFileSync(hooksPath, "utf8"), firstUninstall);
 });
 
 test("uninstall on an empty home is a no-op", () => {
   const codexHome = temporaryCodexHome();
   const result = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
   assert.deepEqual(result.removed, []);
+});
+
+test("uninstall preserves legacy-looking hooks without a managed install", () => {
+  const codexHome = temporaryCodexHome();
+  const hooksPath = join(codexHome, "hooks.json");
+  const original = {
+    hooks: {
+      Stop: [{ hooks: [legacyHook("Checking orchestration result")] }],
+    },
+  };
+  writeFileSync(hooksPath, `${JSON.stringify(original)}\n`);
+
+  const result = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
+
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(JSON.parse(readFileSync(hooksPath, "utf8")), original);
 });
 
 test("uninstall refuses an unmanaged install directory", () => {

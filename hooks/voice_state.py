@@ -7,10 +7,12 @@ import hashlib
 import hmac
 import json
 import os
+import platform
 import posixpath
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,40 @@ class HeadDriftError(PersistedStateError):
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 FULL_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 MERGE_METHODS = {"merge", "rebase", "squash"}
+STATE_SCHEMA = 3
+TRUSTED_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+PROTECTED_ENVIRONMENT = {
+    "CODEX_ORCHESTRATION_STATE",
+    "CODEX_ORCHESTRATION_TASK",
+    "CODEX_ORCHESTRATION_ACTOR",
+    "CODEX_ORCHESTRATION_CREDENTIAL",
+    "CODEX_ORCHESTRATION_WORKTREE",
+}
+VIGIL_READ_ONLY_TOOLS = {
+    "Glob",
+    "Grep",
+    "Read",
+    "WebFetch",
+    "WebSearch",
+    "functions__list_mcp_resource_templates",
+    "functions__list_mcp_resources",
+    "functions__read_mcp_resource",
+    "mcp__browser__screenshot",
+    "mcp__filesystem__list_directory",
+    "mcp__filesystem__read_file",
+    "mcp__filesystem__read_multiple_files",
+    "mcp__filesystem__read_text_file",
+    "mcp__github__get_issue",
+    "mcp__github__get_issue_comments",
+    "mcp__github__get_me",
+    "mcp__github__get_pull_request",
+    "mcp__github__get_pull_request_files",
+    "mcp__github__list_issues",
+    "mcp__github__list_pull_requests",
+    "mcp__github__search_code",
+    "mcp__github__search_issues",
+    "web__run",
+}
 
 
 def observe_pr_head(repo: str, pr: str) -> str:
@@ -184,6 +220,94 @@ def validate_lanes(lanes: list[dict], approved: bool) -> list[dict]:
     return normalized_lanes
 
 
+def _canonical_path(value: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise StateError("path is required")
+    return str(Path(value).expanduser().resolve())
+
+
+def _validated_write_roots(worktree: str, roots: object) -> list[str]:
+    if (
+        not isinstance(roots, list)
+        or not roots
+        or any(not isinstance(root, str) or not root for root in roots)
+    ):
+        raise StateError("contract write_roots must be non-empty relative paths")
+    canonical_worktree = Path(worktree)
+    normalized = []
+    for root in roots:
+        portable = posixpath.normpath(root.replace("\\", "/")).strip("/")
+        portable = "." if portable in {"", "."} else portable
+        if (
+            Path(root).is_absolute()
+            or portable == ".."
+            or portable.startswith("../")
+        ):
+            raise StateError("contract write_roots must stay inside the worktree")
+        resolved = (canonical_worktree / portable).resolve()
+        if not resolved.is_relative_to(canonical_worktree):
+            raise StateError("contract write_roots must stay inside the worktree")
+        normalized.append(portable)
+    if len(set(normalized)) != len(normalized):
+        raise StateError("contract write_roots must be unique")
+    return normalized
+
+
+def _normalized_contract(contract: dict) -> dict:
+    if not isinstance(contract, dict):
+        raise StateError("contract must be an object")
+    required = {
+        "acceptance",
+        "actors",
+        "branch",
+        "commands",
+        "intent",
+        "non_scope",
+        "owner",
+        "pr",
+        "repo",
+        "scope",
+        "worktree",
+        "write_roots",
+    }
+    missing = required - set(contract)
+    if missing:
+        raise StateError(f"contract missing: {', '.join(sorted(missing))}")
+    normalized = copy.deepcopy(contract)
+    normalized["worktree"] = _canonical_path(contract.get("worktree", ""))
+    normalized["write_roots"] = _validated_write_roots(
+        normalized["worktree"],
+        contract.get("write_roots"),
+    )
+    normalized["actors"] = _validated_actors(normalized)
+    normalized["commands"] = _validated_commands(normalized)
+    return normalized
+
+
+def _actor_roles(contract: dict, actor: str) -> list[str]:
+    return sorted(
+        role for role, members in contract["actors"].items() if actor in members
+    )
+
+
+def _credential_digest(
+    task_id: str,
+    contract_digest: str,
+    contract: dict,
+    actor: str,
+    credential: str,
+) -> str:
+    return digest(
+        {
+            "task": task_id,
+            "contract_digest": contract_digest,
+            "actor": actor,
+            "roles": _actor_roles(contract, actor),
+            "credential": credential,
+        }
+    )
+
+
 def _validated_commands(contract: dict) -> dict[str, list[str]]:
     commands = contract.get("commands")
     if not isinstance(commands, dict) or set(commands) != {"painter"}:
@@ -285,43 +409,35 @@ def new_task(
     contract: dict,
     credential_hashes: dict[str, str],
 ) -> dict:
-    required = {
-        "acceptance",
-        "actors",
-        "branch",
-        "commands",
-        "intent",
-        "non_scope",
-        "owner",
-        "pr",
-        "repo",
-        "scope",
-    }
-    missing = required - set(contract)
-    if missing:
-        raise StateError(f"contract missing: {', '.join(sorted(missing))}")
     if not isinstance(task_id, str) or not task_id:
         raise StateError("task id is required")
-    if not isinstance(contract["branch"], str) or not contract["branch"]:
+    normalized_contract = _normalized_contract(contract)
+    if (
+        not isinstance(normalized_contract["branch"], str)
+        or not normalized_contract["branch"]
+    ):
         raise StateError("contract branch is required")
-    if not isinstance(contract["repo"], str) or not contract["repo"]:
+    if (
+        not isinstance(normalized_contract["repo"], str)
+        or not normalized_contract["repo"]
+    ):
         raise StateError("contract repository is required")
-    if not str(contract["pr"]).isdigit():
+    if not str(normalized_contract["pr"]).isdigit():
         raise StateError("contract PR must be an explicit number")
-    actors = _validated_actors(contract)
-    _validated_commands(contract)
+    actors = normalized_contract["actors"]
     actor_ids = {actor for members in actors.values() for actor in members}
     if set(credential_hashes) != actor_ids or any(
         not FULL_DIGEST.fullmatch(value) for value in credential_hashes.values()
     ):
         raise StateError("every registered actor requires one credential hash")
+    contract_digest = digest(normalized_contract)
     return {
-        "schema": 2,
+        "schema": STATE_SCHEMA,
         "id": task_id,
         "revision": 1,
         "state": "approved",
-        "contract": copy.deepcopy(contract),
-        "contract_digest": digest(contract),
+        "contract": normalized_contract,
+        "contract_digest": contract_digest,
         "credential_hashes": copy.deepcopy(credential_hashes),
         "writer": None,
         "head": None,
@@ -333,6 +449,52 @@ def new_task(
         "receipts": [],
         "next_action": "claim writer",
     }
+
+
+def _validate_task_integrity(task_id: str, task: object) -> None:
+    if (
+        not isinstance(task, dict)
+        or task.get("schema") != STATE_SCHEMA
+        or task.get("id") != task_id
+        or isinstance(task.get("revision"), bool)
+        or not isinstance(task.get("revision"), int)
+        or task["revision"] < 1
+        or not isinstance(task.get("contract"), dict)
+        or not isinstance(task.get("credential_hashes"), dict)
+    ):
+        raise StateError(f"invalid orchestration task: {task_id}")
+    normalized_contract = _normalized_contract(task["contract"])
+    if normalized_contract != task["contract"]:
+        raise StateError(f"non-canonical orchestration contract: {task_id}")
+    if task.get("contract_digest") != digest(normalized_contract):
+        raise StateError(f"orchestration contract integrity failure: {task_id}")
+    actor_ids = {
+        actor
+        for members in normalized_contract["actors"].values()
+        for actor in members
+    }
+    if set(task["credential_hashes"]) != actor_ids or any(
+        not isinstance(value, str) or not FULL_DIGEST.fullmatch(value)
+        for value in task["credential_hashes"].values()
+    ):
+        raise StateError(f"invalid orchestration credentials: {task_id}")
+    writer = task.get("writer")
+    if writer is not None and (
+        not isinstance(writer, dict)
+        or writer.get("branch") != normalized_contract["branch"]
+        or writer.get("worktree") != normalized_contract["worktree"]
+        or not _actor_has_role(task, writer.get("actor", ""), "painter")
+    ):
+        raise StateError(f"invalid orchestration writer lease: {task_id}")
+    checkpoint = task.get("checkpoint")
+    if isinstance(checkpoint, dict) and checkpoint.get("status") == "pending":
+        previous = checkpoint.get("previous_writer")
+        if (
+            not isinstance(previous, dict)
+            or previous.get("branch") != normalized_contract["branch"]
+            or previous.get("worktree") != normalized_contract["worktree"]
+        ):
+            raise StateError(f"invalid checkpoint reservation: {task_id}")
 
 
 def _receipt(task: dict, kind: str, text: str, actor: str) -> None:
@@ -372,7 +534,13 @@ def _authenticate(task: dict, actor: str, credential: str, role: str) -> None:
     if not _actor_has_role(task, actor, role):
         raise StateError(f"actor is not registered for the {role} role")
     expected = task["credential_hashes"].get(actor, "")
-    observed = digest({"task": task["id"], "actor": actor, "credential": credential})
+    observed = _credential_digest(
+        task["id"],
+        task["contract_digest"],
+        task["contract"],
+        actor,
+        credential,
+    )
     if not credential or not hmac.compare_digest(expected, observed):
         raise StateError("actor credential is invalid")
 
@@ -396,18 +564,19 @@ def _claim(
     worktree: str,
 ) -> None:
     def change(candidate: dict) -> None:
+        canonical_worktree = _canonical_path(worktree)
         if not _actor_has_role(candidate, actor, "painter"):
             raise StateError("writer is not registered for the Painter role")
         if candidate["state"] != "approved" or candidate["writer"]:
             raise StateError("task already has a writer")
         if branch != candidate["contract"]["branch"]:
             raise StateError("writer branch does not match the approved contract")
-        if not worktree:
-            raise StateError("writer worktree is required")
+        if canonical_worktree != candidate["contract"]["worktree"]:
+            raise StateError("writer worktree does not match the approved contract")
         candidate["writer"] = {
             "actor": actor,
             "branch": branch,
-            "worktree": worktree,
+            "worktree": canonical_worktree,
         }
         candidate["state"] = "painting"
         candidate["next_action"] = "paint approved scope"
@@ -716,41 +885,6 @@ def _consume_delivery(
     _transition(task, expected_revision, change)
 
 
-def _finish_delivery(
-    task: dict,
-    expected_revision: int,
-    grant_id: str,
-    succeeded: bool,
-    exit_code: int,
-) -> None:
-    def change(candidate: dict) -> None:
-        authority = candidate.get("authority")
-        attempt = candidate.get("delivery_attempt")
-        if (
-            candidate["state"] != "delivery_started"
-            or not authority
-            or authority.get("id") != grant_id
-            or authority.get("status") != "consumed"
-            or not attempt
-            or attempt.get("id") != grant_id
-            or attempt.get("status") != "prepared"
-        ):
-            raise StateError("delivery result does not match a consumed authority")
-        attempt["status"] = "completed" if succeeded else "failed"
-        attempt["exit_code"] = exit_code
-        attempt["finished_at_revision"] = candidate["revision"]
-        candidate["state"] = "complete" if succeeded else "delivery_failed"
-        candidate["next_action"] = "none" if succeeded else "user decides whether to retry"
-        _receipt(
-            candidate,
-            "delivered" if succeeded else "delivery-failed",
-            f"Typed delivery action exited {exit_code}.",
-            "delivery-gate",
-        )
-
-    _transition(task, expected_revision, change)
-
-
 def _recover_delivery(
     task: dict,
     expected_revision: int,
@@ -907,17 +1041,19 @@ def _resume_checkpoint(
 
 def _read_store(path: Path) -> dict:
     if not path.exists():
-        return {"schema": 2, "tasks": {}}
+        return {"schema": STATE_SCHEMA, "tasks": {}}
     try:
         store = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         raise StateError(f"unable to read orchestration state: {path}") from error
     if (
         not isinstance(store, dict)
-        or store.get("schema") != 2
+        or store.get("schema") != STATE_SCHEMA
         or not isinstance(store.get("tasks"), dict)
     ):
         raise StateError(f"invalid orchestration state: {path}")
+    for task_id, task in store["tasks"].items():
+        _validate_task_integrity(task_id, task)
     return store
 
 
@@ -966,28 +1102,38 @@ def create_task(
     contract: dict,
     credentials: dict[str, str],
 ) -> dict:
-    actors = _validated_actors(contract)
+    normalized_contract = _normalized_contract(contract)
+    actors = normalized_contract["actors"]
     actor_ids = {actor for members in actors.values() for actor in members}
     if set(credentials) != actor_ids or any(
         not isinstance(value, str) or not value for value in credentials.values()
     ):
         raise StateError("every registered actor requires one credential")
+    contract_digest = digest(normalized_contract)
     credential_hashes = {
-        actor: digest(
-            {"task": task_id, "actor": actor, "credential": credential}
+        actor: _credential_digest(
+            task_id,
+            contract_digest,
+            normalized_contract,
+            actor,
+            credential,
         )
         for actor, credential in credentials.items()
     }
     with locked_store(path) as store:
         if task_id in store["tasks"]:
             raise StateError(f"task already exists: {task_id}")
-        store["tasks"][task_id] = new_task(task_id, contract, credential_hashes)
+        store["tasks"][task_id] = new_task(
+            task_id,
+            normalized_contract,
+            credential_hashes,
+        )
         result = copy.deepcopy(store["tasks"][task_id])
     return result
 
 
 def provision_task(path: Path, task_id: str, contract: dict) -> dict:
-    actors = _validated_actors(contract)
+    actors = _normalized_contract(contract)["actors"]
     actor_ids = {actor for members in actors.values() for actor in members}
     credentials = {actor: secrets.token_urlsafe(32) for actor in actor_ids}
     task = create_task(path, task_id, contract, credentials)
@@ -1034,6 +1180,49 @@ def orchestrate_lanes(
     }
 
 
+def _reserved_writer(task: dict) -> dict | None:
+    if task.get("state") == "complete":
+        return None
+    writer = task.get("writer")
+    if isinstance(writer, dict):
+        return writer
+    checkpoint = task.get("checkpoint")
+    if (
+        isinstance(checkpoint, dict)
+        and checkpoint.get("status") == "pending"
+        and isinstance(checkpoint.get("previous_writer"), dict)
+    ):
+        return checkpoint["previous_writer"]
+    return None
+
+
+def _assert_writer_reservation_available(
+    store: dict,
+    record_id: str,
+    repo: str,
+    branch: str,
+    worktree: str,
+) -> None:
+    canonical_worktree = _canonical_path(worktree)
+    for other_id, other_task in store["tasks"].items():
+        if other_id == record_id:
+            continue
+        reservation = _reserved_writer(other_task)
+        if not reservation:
+            continue
+        same_branch = (
+            other_task["contract"]["repo"] == repo
+            and reservation.get("branch") == branch
+        )
+        same_worktree = (
+            _canonical_path(reservation.get("worktree", "")) == canonical_worktree
+        )
+        if same_branch or same_worktree:
+            raise StateError(
+                "writer reservation conflicts with another task branch or worktree"
+            )
+
+
 def mutate_task(
     path: Path,
     record_id: str,
@@ -1050,6 +1239,13 @@ def mutate_task(
             raise StateError(f"unknown task: {record_id}") from error
         try:
             if operation == "claim":
+                _assert_writer_reservation_available(
+                    store,
+                    record_id,
+                    task["contract"]["repo"],
+                    arguments.get("branch", ""),
+                    arguments.get("worktree", ""),
+                )
                 _authenticate(task, arguments.get("actor", ""), credential, "painter")
                 _claim(task, expected_revision, **arguments)
             elif operation == "painted":
@@ -1112,12 +1308,17 @@ def mutate_task(
                     authority.get("origin", ""),
                 )
                 _recover_delivery(task, expected_revision, **arguments)
-            elif operation == "finish-delivery":
-                _finish_delivery(task, expected_revision, **arguments)
             elif operation == "checkpoint":
                 _authenticate(task, arguments.get("actor", ""), credential, "painter")
                 _checkpoint(task, expected_revision, **arguments)
             elif operation == "resume-checkpoint":
+                _assert_writer_reservation_available(
+                    store,
+                    record_id,
+                    task["contract"]["repo"],
+                    task["contract"]["branch"],
+                    task["contract"]["worktree"],
+                )
                 _authenticate(task, arguments.get("actor", ""), credential, "painter")
                 _resume_checkpoint(task, expected_revision, **arguments)
             else:
@@ -1134,10 +1335,18 @@ def direct_delivery_reason(payload: dict) -> str | None:
     if payload.get("hook_event_name") != "PreToolUse":
         return None
     tool_name = payload.get("tool_name", "")
-    if isinstance(tool_name, str) and "github" in tool_name and "merge_pull_request" in tool_name:
-        return "direct GitHub merge"
-    if isinstance(tool_name, str) and "github" in tool_name and "close_issue" in tool_name:
-        return "direct issue closure"
+    normalized_tool = tool_name.lower() if isinstance(tool_name, str) else ""
+    tool_checks = (
+        ("merge_pull_request", "direct GitHub merge"),
+        ("close_issue", "direct issue closure"),
+        ("publish", "direct package publish"),
+        ("production_deploy", "direct production deploy"),
+        ("deploy_production", "direct production deploy"),
+        ("release", "direct release"),
+    )
+    for marker, reason in tool_checks:
+        if marker in normalized_tool:
+            return reason
     tool_input = payload.get("tool_input")
     if not _shell_capable_tool(payload) or not isinstance(tool_input, dict):
         return None
@@ -1178,21 +1387,16 @@ def _shell_capable_tool(payload: dict) -> bool:
     return tool_name == "Bash" or (
         isinstance(tool_name, str)
         and re.search(
-            r"__(?:exec|exec_command|shell)(?:_.*)?$",
+            r"__(?:exec|exec_command|shell|execute|run|terminal)(?:_.*)?$",
             tool_name,
         )
         is not None
     )
 
 
-def _write_capable_tool(payload: dict) -> bool:
+def _vigil_read_only_tool(payload: dict) -> bool:
     tool_name = payload.get("tool_name", "")
-    if _shell_capable_tool(payload) or tool_name in {"Edit", "Write", "apply_patch"}:
-        return True
-    return isinstance(tool_name, str) and (
-        re.search(r"__(?:edit|write)(?:_.*)?$", tool_name) is not None
-        or tool_name.endswith("__apply_patch")
-    )
+    return isinstance(tool_name, str) and tool_name in VIGIL_READ_ONLY_TOOLS
 
 
 def _ordinary_command_is_read_only(command: str) -> bool:
@@ -1234,7 +1438,7 @@ def _control_operation(command: str) -> str | None:
     match = re.fullmatch(
         r"\s*(?:/usr/bin/env\s+)?python3?\s+"
         r"(?P<script>[A-Za-z0-9_./:-]*voice_state\.py)\s+"
-        r"(create|transition|deliver|recover-delivery|classify|orchestrate)"
+        r"(create|transition|run|deliver|recover-delivery|classify|orchestrate)"
         r"\s*(?:<\s*[A-Za-z0-9_./:-]+)?\s*",
         command,
     )
@@ -1256,12 +1460,158 @@ def _command_from_payload(payload: dict) -> str:
     return command if isinstance(command, str) else ""
 
 
+def _requested_workdir(payload: dict, fallback: str) -> str:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return _canonical_path(fallback)
+    requested = {
+        key: tool_input[key]
+        for key in ("workdir", "cwd")
+        if key in tool_input
+        and tool_input[key] is not None
+        and tool_input[key] != ""
+    }
+    if any(not isinstance(value, str) for value in requested.values()):
+        raise StateError("tool workdir must be a path string")
+    canonical = {_canonical_path(value) for value in requested.values()}
+    if len(canonical) > 1:
+        raise StateError("tool workdir fields disagree")
+    return next(iter(canonical), _canonical_path(fallback))
+
+
+def _reject_environment_override(payload: dict) -> None:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return
+    for key in ("env", "environment"):
+        if (
+            key not in tool_input
+            or tool_input[key] is None
+            or tool_input[key] == {}
+        ):
+            continue
+        value = tool_input[key]
+        if not isinstance(value, dict):
+            raise StateError("tool environment override must be an object")
+        if PROTECTED_ENVIRONMENT & set(value):
+            raise StateError("tool cannot override orchestration identity")
+        raise StateError("control commands cannot override their environment")
+
+
+def _apply_patch_targets(payload: dict) -> list[str]:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        raise StateError("apply_patch requires an inspectable patch payload")
+    patch = next(
+        (
+            value
+            for key in ("patch", "input")
+            if isinstance((value := tool_input.get(key)), str)
+        ),
+        "",
+    )
+    targets = re.findall(
+        r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$",
+        patch,
+        flags=re.MULTILINE,
+    )
+    flattened = [left or right for left, right in targets]
+    if not flattened:
+        raise StateError("apply_patch must declare every target path")
+    return flattened
+
+
+def _structured_write_targets(payload: dict) -> list[str]:
+    tool_name = payload.get("tool_name", "")
+    if tool_name in {"apply_patch", "functions__apply_patch"}:
+        return _apply_patch_targets(payload)
+    supported = {
+        "Edit",
+        "Write",
+        "mcp__filesystem__edit",
+        "mcp__filesystem__write",
+        "mcp__filesystem__write_file",
+    }
+    if tool_name not in supported:
+        raise StateError("write-capable tool has no approved target adapter")
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        raise StateError("write tool requires an inspectable target")
+    targets = [
+        tool_input[key]
+        for key in ("file_path", "path", "file")
+        if key in tool_input
+    ]
+    if len(targets) != 1 or not isinstance(targets[0], str) or not targets[0]:
+        raise StateError("write tool requires exactly one target path")
+    return targets
+
+
+def _path_is_within(path: Path, roots: list[Path]) -> bool:
+    return any(path == root or path.is_relative_to(root) for root in roots)
+
+
+def _validate_painter_targets(
+    task: dict,
+    state_path: Path,
+    payload: dict,
+    workdir: str,
+) -> None:
+    worktree = Path(task["contract"]["worktree"])
+    roots = [
+        (worktree / root).resolve()
+        for root in task["contract"]["write_roots"]
+    ]
+    protected = {
+        state_path.resolve(),
+        state_path.with_suffix(state_path.suffix + ".lock").resolve(),
+        Path(__file__).resolve(),
+    }
+    for raw_target in _structured_write_targets(payload):
+        candidate = Path(raw_target)
+        target = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (Path(workdir) / candidate).resolve()
+        )
+        if (
+            not target.is_relative_to(worktree)
+            or not _path_is_within(target, roots)
+            or target in protected
+            or target == worktree / ".git"
+            or target.is_relative_to(worktree / ".git")
+        ):
+            raise StateError("write target is outside the approved Painter scope")
+
+
+def _authenticate_registered_actor(
+    task: dict,
+    actor: str,
+    credential: str,
+) -> str:
+    roles = _actor_roles(task["contract"], actor)
+    if not roles:
+        raise StateError("control command actor is not registered")
+    _authenticate(task, actor, credential, roles[0])
+    return roles[0]
+
+
 def _validate_control_actor(
     task: dict,
     operation: str,
     actor: str,
     credential: str,
 ) -> None:
+    if operation == "run":
+        _authenticate(task, actor, credential, "painter")
+        writer = task.get("writer")
+        if (
+            task["state"] not in {"painting", "changes_requested"}
+            or not writer
+            or writer.get("actor") != actor
+        ):
+            raise StateError("command runner requires the active Painter lease")
+        return
     if operation in {"deliver", "recover-delivery"}:
         authority = task.get("authority") or {}
         if actor != authority.get("actor"):
@@ -1278,14 +1628,7 @@ def _validate_control_actor(
             )
         _authenticate(task, actor, credential, approval.get("origin", ""))
         return
-    roles = [
-        role
-        for role in ("coordinator", "user", "painter", "vigil")
-        if _actor_has_role(task, actor, role)
-    ]
-    if not roles:
-        raise StateError("control command actor is not registered")
-    _authenticate(task, actor, credential, roles[0])
+    _authenticate_registered_actor(task, actor, credential)
 
 
 def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
@@ -1315,20 +1658,40 @@ def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
     task = load_task(Path(present["state"]), present["task"])
     actor = present["actor"]
     credential = present["credential"]
-    actual_worktree = str(Path(environment.get("PWD", os.getcwd())).resolve())
-    context_worktree = str(Path(present["worktree"]).resolve())
+    actual_worktree = _canonical_path(environment.get("PWD", os.getcwd()))
+    context_worktree = _canonical_path(present["worktree"])
     if actual_worktree != context_worktree:
         raise StateError("tool worktree does not match orchestration context")
+    requested_worktree = _requested_workdir(payload, actual_worktree)
+    if requested_worktree != context_worktree:
+        raise StateError("requested tool workdir does not match orchestration context")
     if operation:
+        _reject_environment_override(payload)
         if operation == "create":
             raise StateError("task creation cannot run inside another task context")
+        if _actor_has_role(task, actor, "vigil") and operation != "transition":
+            _authenticate(task, actor, credential, "vigil")
+            raise StateError(
+                "Vigil can execute only the canonical locked transition command"
+            )
         if operation == "classify":
-            return
+            raise StateError("classification runs only outside durable task context")
         _validate_control_actor(task, operation, actor, credential)
+        if operation == "run":
+            writer = task.get("writer") or {}
+            if writer.get("worktree") != context_worktree:
+                raise StateError(
+                    "command runner worktree does not match the active Painter lease"
+                )
         return
     if _actor_has_role(task, actor, "vigil"):
         _authenticate(task, actor, credential, "vigil")
-        raise StateError("Vigil cannot use Bash or write-capable tools")
+        if _vigil_read_only_tool(payload):
+            return
+        raise StateError("Vigil can use only explicit read-only inspection tools")
+    if _vigil_read_only_tool(payload):
+        _authenticate_registered_actor(task, actor, credential)
+        return
     _authenticate(task, actor, credential, "painter")
     writer = task.get("writer")
     recorded_worktree = (
@@ -1342,11 +1705,15 @@ def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
     ):
         raise StateError("write tool requires the active credentialed writer lease")
     if _shell_capable_tool(payload):
-        approved = task["contract"]["commands"]["painter"]
-        if command not in approved:
-            raise StateError(
-                "Bash command is not an exact contract-approved Painter command"
-            )
+        raise StateError(
+            "Painter commands must use the canonical voice_state.py run gateway"
+        )
+    _validate_painter_targets(
+        task,
+        Path(present["state"]),
+        payload,
+        requested_worktree,
+    )
 
 
 def handle_hook(payload: dict, environment: dict[str, str] | None = None) -> None:
@@ -1355,11 +1722,314 @@ def handle_hook(payload: dict, environment: dict[str, str] | None = None) -> Non
         raise StateError(
             f"{reason} is blocked; use the typed voice_state.py deliver command"
         )
-    if _write_capable_tool(payload):
-        _validate_tool_lease(
-            payload,
-            dict(os.environ) if environment is None else environment,
+    _validate_tool_lease(
+        payload,
+        dict(os.environ) if environment is None else environment,
+    )
+
+
+@contextmanager
+def locked_task_snapshot(path: Path, task_id: str):
+    lock = path.with_suffix(path.suffix + ".lock")
+    lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock.open("a+") as handle:
+        os.chmod(lock, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            store = _read_store(path)
+            try:
+                task = copy.deepcopy(store["tasks"][task_id])
+            except KeyError as error:
+                raise StateError(f"unknown task: {task_id}") from error
+            yield task
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _credential_paths() -> list[Path]:
+    user_home = Path.home().resolve()
+    return [
+        user_home / ".ssh",
+        user_home / ".git-credentials",
+        user_home / ".config" / "gh",
+        user_home / ".config" / "hub",
+        user_home / ".npmrc",
+        user_home / ".vercel",
+        user_home / ".aws",
+        user_home / ".azure",
+        user_home / ".docker",
+        user_home / ".kube",
+        user_home / ".codex" / "auth.json",
+    ]
+
+
+def _sandbox_profile(
+    state_path: Path,
+    worktree: Path,
+    write_roots: list[Path],
+    sandbox_home: Path,
+) -> str:
+    allowed_writes = [*write_roots, sandbox_home]
+    protected_writes = [
+        state_path.resolve(),
+        state_path.with_suffix(state_path.suffix + ".lock").resolve(),
+        (worktree / ".git").resolve(),
+        Path(__file__).resolve(),
+    ]
+    protected_reads = [
+        state_path.resolve(),
+        state_path.with_suffix(state_path.suffix + ".lock").resolve(),
+        *_credential_paths(),
+    ]
+
+    def filters(paths: list[Path]) -> str:
+        return " ".join(
+            f'(subpath {json.dumps(str(path.resolve()))})' for path in paths
         )
+
+    return " ".join(
+        [
+            "(version 1)",
+            "(deny default)",
+            "(allow process*)",
+            "(allow file-read*)",
+            "(allow sysctl-read)",
+            "(allow mach-lookup)",
+            "(allow ipc-posix*)",
+            f"(allow file-write* {filters(allowed_writes)})",
+            f"(deny file-write* {filters(protected_writes)})",
+            f"(deny file-read* {filters(protected_reads)})",
+            '(deny process-exec (literal "/usr/bin/security"))',
+        ]
+    )
+
+
+def _sandboxed_command(
+    state_path: Path,
+    worktree: Path,
+    write_roots: list[Path],
+    words: list[str],
+    run_command=subprocess.run,
+):
+    executable = shutil.which(words[0], path=TRUSTED_PATH)
+    if not executable:
+        raise StateError(f"approved command executable is not trusted: {words[0]}")
+    executable_path = Path(executable).resolve()
+    if executable_path == worktree or executable_path.is_relative_to(worktree):
+        raise StateError("approved command executable cannot come from the worktree")
+    with tempfile.TemporaryDirectory(prefix="voice-command-") as temporary:
+        sandbox_home = Path(temporary).resolve()
+        (sandbox_home / "tmp").mkdir(mode=0o700)
+        environment = {
+            "HOME": str(sandbox_home),
+            "PATH": TRUSTED_PATH,
+            "TMPDIR": str(sandbox_home / "tmp"),
+            "XDG_CONFIG_HOME": str(sandbox_home / "config"),
+            "GH_CONFIG_DIR": str(sandbox_home / "gh"),
+            "NPM_CONFIG_USERCONFIG": str(sandbox_home / "npmrc"),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        }
+        system = platform.system()
+        if system == "Darwin":
+            sandbox = Path("/usr/bin/sandbox-exec")
+            if not sandbox.exists():
+                raise StateError("secure Painter command sandbox is unavailable")
+            command = [
+                str(sandbox),
+                "-p",
+                _sandbox_profile(
+                    state_path,
+                    worktree,
+                    write_roots,
+                    sandbox_home,
+                ),
+                str(executable_path),
+                *words[1:],
+            ]
+        elif system == "Linux":
+            bubblewrap = shutil.which("bwrap", path=TRUSTED_PATH)
+            if not bubblewrap:
+                raise StateError(
+                    "secure Painter command sandbox requires bubblewrap on Linux"
+                )
+            command = [
+                bubblewrap,
+                "--die-with-parent",
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev-bind",
+                "/dev",
+                "/dev",
+                "--proc",
+                "/proc",
+            ]
+            for root in [*write_roots, sandbox_home]:
+                command.extend(["--bind", str(root), str(root)])
+            for protected in [
+                (worktree / ".git").resolve(),
+            ]:
+                if protected.exists():
+                    command.extend(["--ro-bind", str(protected), str(protected)])
+            for protected in [
+                state_path.resolve(),
+                state_path.with_suffix(state_path.suffix + ".lock").resolve(),
+                *_credential_paths(),
+            ]:
+                if protected.is_dir():
+                    command.extend(["--tmpfs", str(protected)])
+                elif protected.exists():
+                    command.extend(["--ro-bind", "/dev/null", str(protected)])
+            command.extend(["--", str(executable_path), *words[1:]])
+        else:
+            raise StateError("secure Painter command sandbox is unsupported")
+        return run_command(
+            command,
+            cwd=str(worktree),
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+
+def _github_remote_matches(repo: str, remote: str) -> bool:
+    normalized = remote.strip().removesuffix(".git")
+    candidates = {
+        f"https://github.com/{repo}",
+        f"http://github.com/{repo}",
+        f"git@github.com:{repo}",
+        f"ssh://git@github.com/{repo}",
+    }
+    return normalized in candidates
+
+
+def _run_typed_branch_push(
+    task: dict,
+    words: list[str],
+    run_command=subprocess.run,
+):
+    worktree = task["contract"]["worktree"]
+    branch = task["contract"]["branch"]
+    git = shutil.which("git", path=TRUSTED_PATH)
+    if not git:
+        raise StateError("trusted git executable is unavailable")
+    environment = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": os.environ.get("HOME", ""),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "PATH": TRUSTED_PATH,
+    }
+    if os.environ.get("SSH_AUTH_SOCK"):
+        environment["SSH_AUTH_SOCK"] = os.environ["SSH_AUTH_SOCK"]
+    if words != ["git", "push", "origin", branch]:
+        raise StateError("branch push must exactly match the approved branch")
+    remote_result = run_command(
+        [git, "-C", worktree, "remote", "get-url", "--push", "--all", "origin"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    remotes = [
+        line.strip()
+        for line in remote_result.stdout.splitlines()
+        if line.strip()
+    ]
+    if (
+        len(remotes) != 1
+        or not _github_remote_matches(task["contract"]["repo"], remotes[0])
+    ):
+        raise StateError("origin remote does not match the approved repository")
+    remote = remotes[0]
+    head = run_command(
+        [git, "-C", worktree, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    ).stdout.strip()
+    if not FULL_SHA.fullmatch(head):
+        raise StateError("worktree returned an invalid head")
+    return run_command(
+        [
+            git,
+            "-C",
+            worktree,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "credential.helper=",
+            "-c",
+            (
+                "core.sshCommand=/usr/bin/ssh -F /dev/null "
+                "-o ClearAllForwardings=yes -o PermitLocalCommand=no"
+            ),
+            "-c",
+            "protocol.ext.allow=never",
+            "push",
+            "--porcelain",
+            remote,
+            f"{head}:refs/heads/{branch}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
+def run_painter_command(
+    path: Path,
+    task_id: str,
+    actor: str,
+    credential: str,
+    command: str,
+    workdir: str,
+    run_command=subprocess.run,
+) -> dict:
+    with locked_task_snapshot(path, task_id) as task:
+        _authenticate(task, actor, credential, "painter")
+        writer = task.get("writer")
+        canonical_workdir = _canonical_path(workdir)
+        if (
+            task["state"] not in {"painting", "changes_requested"}
+            or not writer
+            or writer.get("actor") != actor
+            or writer.get("worktree") != canonical_workdir
+            or task["contract"]["worktree"] != canonical_workdir
+        ):
+            raise StateError("command runner requires the active Painter worktree lease")
+        if command not in task["contract"]["commands"]["painter"]:
+            raise StateError("command is not an exact contract-approved Painter command")
+        words = shlex.split(command)
+        if words[:2] == ["git", "push"]:
+            result = _run_typed_branch_push(task, words, run_command)
+        else:
+            roots = [
+                (Path(canonical_workdir) / root).resolve()
+                for root in task["contract"]["write_roots"]
+            ]
+            result = _sandboxed_command(
+                path,
+                Path(canonical_workdir),
+                roots,
+                words,
+                run_command,
+            )
+        return {
+            "command": command,
+            "exit_code": int(result.returncode),
+            "revision": task["revision"],
+            "stderr": getattr(result, "stderr", "") or "",
+            "stdout": getattr(result, "stdout", "") or "",
+            "task": task_id,
+        }
 
 
 def run_delivery(
@@ -1371,6 +2041,7 @@ def run_delivery(
     grant_id: str,
     action: dict,
     observe_head: Callable[[str, str], str] = observe_pr_head,
+    observe_status: Callable[[str, str], dict] = observe_pr_status,
     run_command=subprocess.run,
     after_command: Callable[[], None] | None = None,
 ) -> dict:
@@ -1407,16 +2078,22 @@ def run_delivery(
             f"typed delivery action returned exit {exit_code}; "
             "recover-delivery is required"
         )
-    finished = mutate_task(
+    observed = mutate_task(
         path,
         task_id,
         started["revision"],
-        "finish-delivery",
+        "recover-delivery",
+        credential=credential,
+        actor=actor,
         grant_id=grant_id,
-        succeeded=True,
-        exit_code=exit_code,
+        observe_status=observe_status,
     )
-    return finished
+    if observed["state"] != "complete":
+        raise StateError(
+            "typed delivery action is not yet observably merged; "
+            "recover-delivery is required"
+        )
+    return observed
 
 
 def recover_delivery(
@@ -1464,16 +2141,22 @@ def recover_delivery(
             f"typed delivery recovery returned exit {exit_code}; "
             "recover-delivery remains required"
         )
-    finished = mutate_task(
+    observed = mutate_task(
         path,
         task_id,
         recovered["revision"],
-        "finish-delivery",
+        "recover-delivery",
+        credential=credential,
+        actor=actor,
         grant_id=grant_id,
-        succeeded=True,
-        exit_code=exit_code,
+        observe_status=observe_status,
     )
-    return finished
+    if observed["state"] != "complete":
+        raise StateError(
+            "typed delivery retry is not yet observably merged; "
+            "recover-delivery remains required"
+        )
+    return observed
 
 
 def _read_cli_payload() -> dict:
@@ -1481,6 +2164,31 @@ def _read_cli_payload() -> dict:
     if not isinstance(payload, dict):
         raise StateError("command input must be a JSON object")
     return payload
+
+
+def _require_cli_identity(payload: dict, actor: str, credential: str) -> None:
+    required = {
+        name: os.environ.get(name, "")
+        for name in PROTECTED_ENVIRONMENT
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise StateError(
+            f"durable control command missing context: {', '.join(sorted(missing))}"
+        )
+    if (
+        _canonical_path(payload.get("state", ""))
+        != _canonical_path(required["CODEX_ORCHESTRATION_STATE"])
+        or payload.get("task") != required["CODEX_ORCHESTRATION_TASK"]
+        or actor != required["CODEX_ORCHESTRATION_ACTOR"]
+        or not hmac.compare_digest(
+            str(credential),
+            required["CODEX_ORCHESTRATION_CREDENTIAL"],
+        )
+        or _canonical_path(os.getcwd())
+        != _canonical_path(required["CODEX_ORCHESTRATION_WORKTREE"])
+    ):
+        raise StateError("control payload does not match durable task context")
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -1515,6 +2223,11 @@ def main(arguments: list[str] | None = None) -> int:
                 "resume-checkpoint",
             }:
                 raise StateError("operation is not available through the control CLI")
+            _require_cli_identity(
+                payload,
+                payload.get("arguments", {}).get("actor", ""),
+                payload["credential"],
+            )
             result = mutate_task(
                 Path(payload["state"]),
                 payload["task"],
@@ -1525,8 +2238,40 @@ def main(arguments: list[str] | None = None) -> int:
             )
             print(json.dumps(result, sort_keys=True))
             return 0
+        if arguments == ["run"]:
+            payload = _read_cli_payload()
+            if set(payload) != {
+                "state",
+                "task",
+                "actor",
+                "credential",
+                "command",
+                "worktree",
+            }:
+                raise StateError(
+                    "command runner requires exact task, actor, command, and worktree input"
+                )
+            _require_cli_identity(payload, payload["actor"], payload["credential"])
+            if (
+                _canonical_path(payload["worktree"])
+                != _canonical_path(
+                    os.environ["CODEX_ORCHESTRATION_WORKTREE"]
+                )
+            ):
+                raise StateError("command payload worktree does not match task context")
+            result = run_painter_command(
+                Path(payload["state"]),
+                payload["task"],
+                payload["actor"],
+                payload["credential"],
+                payload["command"],
+                payload["worktree"],
+            )
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result["exit_code"] == 0 else 2
         if arguments == ["deliver"]:
             payload = _read_cli_payload()
+            _require_cli_identity(payload, payload["actor"], payload["credential"])
             result = run_delivery(
                 Path(payload["state"]),
                 payload["task"],
@@ -1540,6 +2285,7 @@ def main(arguments: list[str] | None = None) -> int:
             return 0
         if arguments == ["recover-delivery"]:
             payload = _read_cli_payload()
+            _require_cli_identity(payload, payload["actor"], payload["credential"])
             result = recover_delivery(
                 Path(payload["state"]),
                 payload["task"],
@@ -1588,6 +2334,7 @@ def main(arguments: list[str] | None = None) -> int:
                 raise StateError(
                     "orchestration requires task and decision actor approval"
                 )
+            _require_cli_identity(payload, payload["actor"], payload["credential"])
             result = orchestrate_lanes(
                 Path(payload["state"]),
                 payload["task"],
@@ -1598,7 +2345,7 @@ def main(arguments: list[str] | None = None) -> int:
             print(json.dumps(result, sort_keys=True))
             return 0
         print(
-            "usage: voice_state.py create|transition|deliver|recover-delivery|classify|orchestrate|hook",
+            "usage: voice_state.py create|transition|run|deliver|recover-delivery|classify|orchestrate|hook",
             file=sys.stderr,
         )
         return 1

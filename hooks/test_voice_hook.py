@@ -17,7 +17,7 @@ HEAD = "a" * 40
 VOICE_STATE_PATH = Path(__file__).with_name("voice_state.py").resolve()
 
 
-def contract():
+def contract(worktree):
     return {
         "intent": "fix",
         "scope": ["PR 42"],
@@ -26,6 +26,8 @@ def contract():
         "pr": "42",
         "owner": "coordinator",
         "branch": "feature",
+        "worktree": worktree,
+        "write_roots": ["src", "tests"],
         "acceptance": ["tests"],
         "commands": {
             "painter": [
@@ -121,7 +123,7 @@ class VoiceHookTests(unittest.TestCase):
     def test_typed_delivery_hook_requires_the_granting_decision_actor(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
-            create_task(path, "task-1", contract(), TOKENS)
+            create_task(path, "task-1", contract(directory), TOKENS)
             mutate_task(
                 path,
                 "task-1",
@@ -179,7 +181,7 @@ class VoiceHookTests(unittest.TestCase):
             }
             with self.assertRaisesRegex(StateError, "durable task context"):
                 handle_hook(command, {})
-            with self.assertRaisesRegex(StateError, "decision actor"):
+            with self.assertRaisesRegex(StateError, "canonical locked transition"):
                 handle_hook(
                     command,
                     {
@@ -208,7 +210,7 @@ class VoiceHookTests(unittest.TestCase):
     def test_durable_write_tools_require_the_active_writer_lease(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
-            create_task(path, "task-1", contract(), TOKENS)
+            create_task(path, "task-1", contract(directory), TOKENS)
             mutate_task(
                 path,
                 "task-1",
@@ -227,22 +229,79 @@ class VoiceHookTests(unittest.TestCase):
                 "CODEX_ORCHESTRATION_WORKTREE": directory,
                 "PWD": directory,
             }
-            handle_hook(bash("npm test"), writer_environment)
-            handle_hook(namespaced_exec("npm test"), writer_environment)
+            run_command = bash(
+                f"python3 {VOICE_STATE_PATH} run < payload.json"
+            )
+            handle_hook(run_command, writer_environment)
+            with self.assertRaisesRegex(StateError, "run gateway"):
+                handle_hook(bash("npm test"), writer_environment)
+            with self.assertRaisesRegex(StateError, "run gateway"):
+                handle_hook(
+                    {
+                        **namespaced_exec("npm test"),
+                        "tool_input": {
+                            "cmd": "npm test",
+                            "workdir": directory,
+                        },
+                    },
+                    writer_environment,
+                )
             handle_hook(
                 {
                     "hook_event_name": "PreToolUse",
                     "tool_name": "functions__apply_patch",
-                    "tool_input": {},
+                    "tool_input": {
+                        "patch": (
+                            "*** Begin Patch\n"
+                            "*** Add File: src/value.py\n"
+                            "+value = 1\n"
+                            "*** End Patch\n"
+                        )
+                    },
                 },
                 writer_environment,
             )
-            with self.assertRaisesRegex(StateError, "exact contract-approved"):
-                handle_hook(bash("npm test && git diff --check"), writer_environment)
+            handle_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Write",
+                    "tool_input": {"file_path": "tests/test_value.py"},
+                },
+                writer_environment,
+            )
+            for target in [
+                str(path),
+                str(path.with_suffix(".json.lock")),
+                "../outside.py",
+                "/tmp/outside.py",
+                ".git/config",
+            ]:
+                with self.subTest(target=target):
+                    with self.assertRaisesRegex(StateError, "approved Painter scope"):
+                        handle_hook(
+                            {
+                                "hook_event_name": "PreToolUse",
+                                "tool_name": "Write",
+                                "tool_input": {"file_path": target},
+                            },
+                            writer_environment,
+                        )
             with self.assertRaisesRegex(StateError, "worktree"):
                 handle_hook(
                     bash("npm test"),
                     {**writer_environment, "PWD": str(Path(directory) / "other")},
+                )
+            with self.assertRaisesRegex(StateError, "requested tool workdir"):
+                handle_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "functions__exec_command",
+                        "tool_input": {
+                            "cmd": f"python3 {VOICE_STATE_PATH} run < payload.json",
+                            "workdir": str(Path(directory) / "alternate"),
+                        },
+                    },
+                    writer_environment,
                 )
 
             reviewer_environment = {
@@ -257,13 +316,26 @@ class VoiceHookTests(unittest.TestCase):
                 ),
                 reviewer_environment,
             )
+            handle_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "mcp__github__get_pull_request",
+                    "tool_input": {"repo": "owner/repo", "pull_number": 42},
+                },
+                reviewer_environment,
+            )
+            with self.assertRaisesRegex(StateError, "canonical locked transition"):
+                handle_hook(
+                    bash(f"python3 {VOICE_STATE_PATH} classify < payload.json"),
+                    reviewer_environment,
+                )
             for alternate_path in (
                 Path(directory) / "voice_state.py",
                 Path(directory) / "safe" / ".." / "voice_state.py",
                 Path("/installed/voice_state.py"),
             ):
                 with self.subTest(alternate_path=alternate_path):
-                    with self.assertRaisesRegex(StateError, "cannot use Bash"):
+                    with self.assertRaisesRegex(StateError, "read-only inspection"):
                         handle_hook(
                             bash(
                                 f"python3 {alternate_path} "
@@ -272,7 +344,7 @@ class VoiceHookTests(unittest.TestCase):
                             reviewer_environment,
                         )
             relative_kernel_path = VOICE_STATE_PATH.relative_to(Path.cwd())
-            with self.assertRaisesRegex(StateError, "cannot use Bash"):
+            with self.assertRaisesRegex(StateError, "requested tool workdir"):
                 handle_hook(
                     {
                         "hook_event_name": "PreToolUse",
@@ -287,33 +359,38 @@ class VoiceHookTests(unittest.TestCase):
                     },
                     reviewer_environment,
                 )
-            with self.assertRaisesRegex(StateError, "cannot use Bash"):
+            with self.assertRaisesRegex(StateError, "read-only inspection"):
                 handle_hook(bash("npm test"), reviewer_environment)
-            with self.assertRaisesRegex(StateError, "cannot use Bash"):
+            with self.assertRaisesRegex(StateError, "read-only inspection"):
                 handle_hook(bash("git diff --check"), reviewer_environment)
-            with self.assertRaisesRegex(StateError, "cannot use Bash"):
+            with self.assertRaisesRegex(StateError, "read-only inspection"):
                 handle_hook(
                     namespaced_exec("git diff --check"),
                     reviewer_environment,
                 )
-            with self.assertRaisesRegex(StateError, "cannot use Bash"):
-                handle_hook(
-                    {
-                        "hook_event_name": "PreToolUse",
-                        "tool_name": "mcp__filesystem__write",
-                        "tool_input": {},
-                    },
-                    reviewer_environment,
-                )
-            with self.assertRaisesRegex(StateError, "cannot use Bash"):
-                handle_hook(
-                    {
-                        "hook_event_name": "PreToolUse",
-                        "tool_name": "mcp__filesystem__edit",
-                        "tool_input": {},
-                    },
-                    reviewer_environment,
-                )
+            for tool_name in [
+                "mcp__filesystem__write",
+                "mcp__filesystem__edit",
+                "mcp__filesystem__delete_file",
+                "mcp__github__create_issue",
+                "mcp__github__get_or_create_file",
+                "mcp__git__fetch",
+                "mcp__workflow__status_update",
+                "mcp__untrusted__status",
+                "mcp__browser__click",
+                "mcp__python__execute",
+                "mcp__future__mutate_everything",
+            ]:
+                with self.subTest(tool_name=tool_name):
+                    with self.assertRaisesRegex(StateError, "read-only inspection"):
+                        handle_hook(
+                            {
+                                "hook_event_name": "PreToolUse",
+                                "tool_name": tool_name,
+                                "tool_input": {},
+                            },
+                            reviewer_environment,
+                        )
 
             mutate_task(
                 path,
@@ -325,10 +402,10 @@ class VoiceHookTests(unittest.TestCase):
                 successor="successor",
                 next_action="continue",
             )
-            with self.assertRaisesRegex(StateError, "writer lease"):
-                handle_hook(bash("npm test"), writer_environment)
+            with self.assertRaisesRegex(StateError, "active Painter lease"):
+                handle_hook(run_command, writer_environment)
 
-    def test_installed_matcher_covers_namespaced_write_tools(self):
+    def test_installed_matcher_intercepts_every_tool_name(self):
         matcher = json.loads(Path(__file__).with_name("hooks.json").read_text())[
             "hooks"
         ]["PreToolUse"][0]["matcher"]
@@ -342,6 +419,10 @@ class VoiceHookTests(unittest.TestCase):
             "functions__exec_command",
             "mcp__shell__exec_command",
             "mcp__github__merge_pull_request",
+            "mcp__github__create_issue",
+            "mcp__filesystem__delete_file",
+            "mcp__xcodebuild__build_run_sim",
+            "unknown_future_tool",
         ]:
             with self.subTest(tool_name=tool_name):
                 self.assertIsNotNone(re.fullmatch(matcher, tool_name))
