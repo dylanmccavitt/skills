@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import posixpath
 import re
 import secrets
 import subprocess
@@ -75,14 +76,28 @@ def validate_lanes(lanes: list[dict], approved: bool) -> None:
     domains = []
     for lane in lanes:
         lane_id, domain = lane.get("id"), lane.get("domain")
-        normalized = domain.strip("/") if isinstance(domain, str) else ""
+        normalized = (
+            posixpath.normpath(domain.replace("\\", "/")).strip("/").casefold()
+            if isinstance(domain, str)
+            else ""
+        )
+        if normalized in {"", "."}:
+            normalized = "."
         overlaps = any(
-            normalized == existing
+            normalized == "."
+            or existing == "."
+            or normalized == existing
             or normalized.startswith(f"{existing}/")
             or existing.startswith(f"{normalized}/")
             for existing in domains
         )
-        if not lane_id or not normalized or lane_id in seen or overlaps:
+        if (
+            not lane_id
+            or normalized == ".."
+            or normalized.startswith("../")
+            or lane_id in seen
+            or overlaps
+        ):
             raise StateError("lanes require unique ids and ownership domains")
         seen.add(lane_id)
         domains.append(normalized)
@@ -140,6 +155,7 @@ def new_task(
         "intent",
         "non_scope",
         "owner",
+        "pr",
         "repo",
         "scope",
     }
@@ -152,6 +168,8 @@ def new_task(
         raise StateError("contract branch is required")
     if not isinstance(contract["repo"], str) or not contract["repo"]:
         raise StateError("contract repository is required")
+    if not str(contract["pr"]).isdigit():
+        raise StateError("contract PR must be an explicit number")
     actors = _validated_actors(contract)
     actor_ids = {actor for members in actors.values() for actor in members}
     if set(credential_hashes) != actor_ids or any(
@@ -342,7 +360,11 @@ def _review(
     _transition(task, expected_revision, change)
 
 
-def validate_delivery_action(action: dict, repo: str | None = None) -> dict:
+def validate_delivery_action(
+    action: dict,
+    repo: str | None = None,
+    pr: str | None = None,
+) -> dict:
     if not isinstance(action, dict) or set(action) != {"kind", "repo", "pr", "method"}:
         raise StateError("delivery action must be one typed GitHub merge")
     normalized = {
@@ -358,6 +380,7 @@ def validate_delivery_action(action: dict, repo: str | None = None) -> dict:
         or not normalized["pr"].isdigit()
         or normalized["method"] not in MERGE_METHODS
         or (repo is not None and normalized["repo"] != repo)
+        or (pr is not None and normalized["pr"] != str(pr))
     ):
         raise StateError("delivery action is outside the approved task scope")
     return normalized
@@ -375,6 +398,7 @@ def _grant_delivery(
         normalized_action = validate_delivery_action(
             action,
             candidate["contract"]["repo"],
+            str(candidate["contract"]["pr"]),
         )
         if _actor_has_role(candidate, actor, "implement"):
             raise StateError("implement actors cannot grant delivery authority")
@@ -467,6 +491,7 @@ def _consume_delivery(
         normalized_action = validate_delivery_action(
             action,
             candidate["contract"]["repo"],
+            str(candidate["contract"]["pr"]),
         )
         if (
             not authority
@@ -796,25 +821,26 @@ def direct_delivery_reason(payload: dict) -> str | None:
     command = tool_input.get("command", tool_input.get("cmd", ""))
     if not isinstance(command, str):
         return None
-    normalized = re.sub(r"[\"'`\\]", "", command.lower())
+    normalized = re.sub(r"[^a-z0-9_+./:$=-]+", " ", command.lower())
     checks = (
-        (r"\bgh\b[\s\S]*\bpr\s+merge\b", "direct GitHub merge"),
+        (r"\bgh\b.*\bpr\b.*\bmerge\b", "direct GitHub merge"),
         (
-            r"\bgh\b[\s\S]*\bapi\b[\s\S]*\bpulls?/\d+/merge\b",
+            r"\bgh\b.*\bapi\b.*\bpulls?/\S+/merge\b",
             "direct GitHub merge API",
         ),
         (
-            r"\bapi\.github\.com/repos/\S+/pulls?/\d+/merge\b",
+            r"\bapi\.github\.com/repos/\S+/pulls?/\S+/merge\b",
             "direct GitHub merge API",
         ),
-        (r"\bgh\b[\s\S]*\bissue\s+close\b", "direct issue closure"),
-        (r"\bnpm\b[\s\S]*\bpublish\b", "direct package publish"),
+        (r"\bmergepullrequest\b", "direct GitHub GraphQL merge"),
+        (r"\bgh\b.*\bissue\b.*\bclose\b", "direct issue closure"),
+        (r"\bnpm\b.*\bpublish\b", "direct package publish"),
         (
-            r"\bvercel\b[\s\S]*\bdeploy\b[\s\S]*(?:--prod|--production)\b",
+            r"\bvercel\b.*\bdeploy\b.*(?:--prod|--production)\b",
             "direct production deploy",
         ),
         (
-            r"\bgit\s+push\b[^\n;&|]*(?:(?::|/|\s)(?:main|master))\b",
+            r"\bgit\b.*\bpush\b.*(?:\+|:|/|\s)(?:main|master)\b",
             "direct protected-branch push",
         ),
     )
@@ -824,11 +850,107 @@ def direct_delivery_reason(payload: dict) -> str | None:
     return None
 
 
-def handle_hook(payload: dict) -> None:
+def _write_capable_tool(payload: dict) -> bool:
+    tool_name = payload.get("tool_name", "")
+    if tool_name in {"Bash", "Edit", "Write", "apply_patch"}:
+        return True
+    return isinstance(tool_name, str) and (
+        tool_name.endswith("__edit")
+        or tool_name.endswith("__write")
+        or tool_name.endswith("__apply_patch")
+    )
+
+
+def _review_command_is_read_only(command: str) -> bool:
+    if re.search(r"[<>]|\||--output(?:=|\s)|\s-(?:i|delete|exec)\b", command):
+        return False
+    allowed = (
+        r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
+        r"(?:git\s+(?:diff|status|show|log|rev-parse)\b"
+        r"|rg\b|ls\b|head\b|tail\b"
+        r"|npm\s+test\b|node\s+--test\b"
+        r"|python3?\s+-m\s+(?:unittest|pytest)\b|pytest\b"
+        r"|gh\s+pr\s+(?:view|diff|checks)\b)"
+    )
+    parts = [part.strip() for part in re.split(r"&&|\|\||[;\n]", command)]
+    return bool(parts) and all(re.fullmatch(allowed + r".*", part) for part in parts)
+
+
+def _control_command(command: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"\s*(?:/usr/bin/env\s+)?python3?\s+\S*voice_state\.py\s+"
+            r"(?:create|transition|deliver)\s*(?:<\s*[^\s;&|]+)?\s*",
+            command,
+        )
+    )
+
+
+def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
+    names = {
+        "state": "CODEX_ORCHESTRATION_STATE",
+        "task": "CODEX_ORCHESTRATION_TASK",
+        "actor": "CODEX_ORCHESTRATION_ACTOR",
+        "credential": "CODEX_ORCHESTRATION_CREDENTIAL",
+        "worktree": "CODEX_ORCHESTRATION_WORKTREE",
+    }
+    present = {key: environment.get(name, "") for key, name in names.items()}
+    if not any(present.values()):
+        return
+    missing = [names[key] for key, value in present.items() if not value]
+    if missing:
+        raise StateError(f"incomplete orchestration writer context: {', '.join(missing)}")
+    task = load_task(Path(present["state"]), present["task"])
+    actor = present["actor"]
+    credential = present["credential"]
+    actual_worktree = str(Path(environment.get("PWD", os.getcwd())).resolve())
+    context_worktree = str(Path(present["worktree"]).resolve())
+    if actual_worktree != context_worktree:
+        raise StateError("tool worktree does not match orchestration context")
+    command = ""
+    if payload.get("tool_name") == "Bash":
+        tool_input = payload.get("tool_input")
+        if isinstance(tool_input, dict):
+            command = tool_input.get("command", tool_input.get("cmd", ""))
+    if isinstance(command, str) and _control_command(command):
+        roles = [
+            role
+            for role in ("coordinator", "user", "implement", "review_gate")
+            if _actor_has_role(task, actor, role)
+        ]
+        if not roles:
+            raise StateError("control command actor is not registered")
+        _authenticate(task, actor, credential, roles[0])
+        return
+    if _actor_has_role(task, actor, "review_gate"):
+        _authenticate(task, actor, credential, "review_gate")
+        if payload.get("tool_name") == "Bash" and _review_command_is_read_only(command):
+            return
+        raise StateError("Review Gate tool use is read-only")
+    _authenticate(task, actor, credential, "implement")
+    writer = task.get("writer")
+    recorded_worktree = (
+        str(Path(writer.get("worktree", "")).resolve()) if writer else ""
+    )
+    if (
+        task["state"] not in {"implementing", "changes_requested"}
+        or not writer
+        or writer.get("actor") != present["actor"]
+        or recorded_worktree != context_worktree
+    ):
+        raise StateError("write tool requires the active credentialed writer lease")
+
+
+def handle_hook(payload: dict, environment: dict[str, str] | None = None) -> None:
     reason = direct_delivery_reason(payload)
     if reason:
         raise StateError(
             f"{reason} is blocked; use the typed voice_state.py deliver command"
+        )
+    if _write_capable_tool(payload):
+        _validate_tool_lease(
+            payload,
+            dict(os.environ) if environment is None else environment,
         )
 
 
@@ -893,7 +1015,7 @@ def main(arguments: list[str] | None = None) -> int:
             payload = json.load(sys.stdin)
             if not isinstance(payload, dict):
                 raise StateError("hook payload must be a JSON object")
-            handle_hook(payload)
+            handle_hook(payload, dict(os.environ))
             return 0
         if arguments == ["create"]:
             payload = _read_cli_payload()

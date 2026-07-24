@@ -36,6 +36,7 @@ def contract():
         "scope": ["x"],
         "non_scope": ["y"],
         "repo": "owner/repo",
+        "pr": "42",
         "owner": "coordinator",
         "branch": "feature",
         "acceptance": ["test"],
@@ -249,6 +250,14 @@ class VoiceStateTests(unittest.TestCase):
                 grant(path, merge_action=action("99", "attacker/other"))
             self.assertIsNone(load_task(path, "task-1")["authority"])
 
+    def test_typed_grant_cannot_target_a_different_pr_in_the_same_repo(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            create_reviewed_task(path)
+            with self.assertRaisesRegex(StateError, "outside the approved task scope"):
+                grant(path, merge_action=action("99", "owner/repo"))
+            self.assertIsNone(load_task(path, "task-1")["authority"])
+
     def test_typed_delivery_refreshes_head_and_matches_it_in_merge_command(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -419,6 +428,13 @@ class VoiceStateTests(unittest.TestCase):
             [{"id": "a", "domain": "src"}, {"id": "b", "domain": "docs"}],
             True,
         )
+        for lanes in [
+            [{"id": "root", "domain": "."}, {"id": "child", "domain": "src"}],
+            [{"id": "a", "domain": "src/../docs"}, {"id": "b", "domain": "docs"}],
+        ]:
+            with self.subTest(lanes=lanes):
+                with self.assertRaisesRegex(StateError, "ownership domains"):
+                    validate_lanes(lanes, True)
 
     def test_control_cli_can_create_and_transition_a_task(self):
         with TemporaryDirectory() as directory:

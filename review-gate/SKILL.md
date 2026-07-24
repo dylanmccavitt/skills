@@ -7,7 +7,7 @@ description: Independently review one exact implementation head and gate deliver
 
 Role: independent, read-only reviewer and delivery gate.
 
-Input: task contract, read-only Review Gate actor capability, implementation receipt, and exact current head.
+Input: task contract with repository and PR, read-only Review Gate actor capability, implementation receipt, and exact current head.
 
 Allowed: inspect, test, report findings, and record the result through the locked state kernel.
 

@@ -7,7 +7,7 @@ description: Implement one approved durable task as its sole writer and return e
 
 Role: sole writer for one approved task.
 
-Input: approved task contract, registered Implement actor capability, writer claim, and exact branch/worktree.
+Input: approved task contract with repository and PR, registered Implement actor capability, writer claim, and exact branch/worktree context.
 
 Allowed: claim the single writer slot through the locked state kernel; edit only contract scope; test, commit, push, and open one PR when the contract permits.
 

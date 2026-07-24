@@ -24,7 +24,9 @@ The coordinator/user approves scope, revisions, stops, and every external delive
 
 The kernel records compact task contracts, credential hashes, registered role owners, writer ownership, receipts, proof, and authority. Persisted transitions use locked compare-and-swap updates and atomic replacement. Review Gate is credentialed separately from Implement and decision actors; checkpoint freezes the outgoing writer before transferring ownership to a confirmed successor.
 
-`voice_state.py create` provisions a task and one capability per actor. `transition` applies credentialed state changes. `deliver` is the only supported external-action path: it refreshes the live PR head, consumes the grant once, and invokes `gh pr merge` with `--match-head-commit`. The installed hook blocks direct merge, protected-branch push, issue-close, publish, and production-deploy commands.
+`voice_state.py create` provisions a task and one capability per actor. `transition` applies credentialed state changes. `deliver` is the only supported external-action path: it refreshes the approved PR head, consumes the grant once, and invokes `gh pr merge` with `--match-head-commit`.
+
+Durable tasks carry state, task, actor, capability, and worktree context in `CODEX_ORCHESTRATION_*`. The installed hook checks that live lease before Bash or file writes, keeps Review Gate commands read-only, freezes a checkpointed writer, and blocks direct merge, protected-branch push, issue-close, publish, and production-deploy commands. Ordinary tasks omit that context and stay outside the registry.
 
 ## Install
 
