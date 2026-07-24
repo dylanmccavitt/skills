@@ -203,27 +203,67 @@ def _assert_atomic_checkpoint_behavior(workspace: Path) -> None:
     sys.path.insert(0, workspace_text)
     try:
         module = importlib.import_module("release_builder.checkpoint")
-        observed_destinations: list[Path] = []
+        observed_replacements: list[dict[str, object]] = []
         original_os_replace = os.replace
         original_os_rename = os.rename
         original_path_replace = Path.replace
         original_path_rename = Path.rename
 
+        def observe_replacement(source, destination, operation):
+            source_path = Path(source)
+            destination_path = Path(destination)
+            source_is_regular = source_path.is_file() and not source_path.is_symlink()
+            source_before = source_path.read_bytes() if source_is_regular else None
+            destination_before = (
+                destination_path.read_bytes()
+                if destination_path.is_file() and not destination_path.is_symlink()
+                else None
+            )
+            result = operation()
+            destination_after = (
+                destination_path.read_bytes()
+                if destination_path.is_file() and not destination_path.is_symlink()
+                else None
+            )
+            observed_replacements.append(
+                {
+                    "source": source_path,
+                    "destination": destination_path,
+                    "source_is_regular": source_is_regular,
+                    "source_before": source_before,
+                    "destination_before": destination_before,
+                    "destination_after": destination_after,
+                }
+            )
+            return result
+
         def record_os_replace(source, destination, *args, **kwargs):
-            observed_destinations.append(Path(destination))
-            return original_os_replace(source, destination, *args, **kwargs)
+            return observe_replacement(
+                source,
+                destination,
+                lambda: original_os_replace(source, destination, *args, **kwargs),
+            )
 
         def record_os_rename(source, destination, *args, **kwargs):
-            observed_destinations.append(Path(destination))
-            return original_os_rename(source, destination, *args, **kwargs)
+            return observe_replacement(
+                source,
+                destination,
+                lambda: original_os_rename(source, destination, *args, **kwargs),
+            )
 
         def record_path_replace(source, destination):
-            observed_destinations.append(Path(destination))
-            return original_path_replace(source, destination)
+            return observe_replacement(
+                source,
+                destination,
+                lambda: original_path_replace(source, destination),
+            )
 
         def record_path_rename(source, destination):
-            observed_destinations.append(Path(destination))
-            return original_path_rename(source, destination)
+            return observe_replacement(
+                source,
+                destination,
+                lambda: original_path_rename(source, destination),
+            )
 
         replacements = (
             (original_os_replace, record_os_replace),
@@ -244,7 +284,20 @@ def _assert_atomic_checkpoint_behavior(workspace: Path) -> None:
                     }
                 ],
             )
-            checkpoint.write_text("previous checkpoint\n", encoding="utf-8")
+            previous_content = b"previous checkpoint\n"
+            checkpoint.write_bytes(previous_content)
+            expected_content = canonical_bytes(
+                expected_checkpoint(
+                    [
+                        {
+                            "id": "REL-3",
+                            "component": "scheduler",
+                            "status": "ready",
+                            "notes": "queued",
+                        }
+                    ]
+                )
+            )
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch("os.replace", record_os_replace))
                 stack.enter_context(mock.patch("os.rename", record_os_rename))
@@ -258,25 +311,21 @@ def _assert_atomic_checkpoint_behavior(workspace: Path) -> None:
                             )
                 module.prepare(source, checkpoint)
             expected_destination = checkpoint.resolve()
-            if not any(
-                destination.resolve() == expected_destination
-                for destination in observed_destinations
-            ):
+            valid_replacement = any(
+                replacement["destination"].resolve() == expected_destination
+                and replacement["source"].resolve() != expected_destination
+                and replacement["source_is_regular"] is True
+                and replacement["source_before"] == expected_content
+                and replacement["destination_before"] == previous_content
+                and replacement["destination_after"] == expected_content
+                for replacement in observed_replacements
+            )
+            if not valid_replacement:
                 raise AssertionError(
-                    "checkpoint target was not installed by atomic replacement"
+                    "checkpoint target was not installed from a distinct regular "
+                    "temporary file while preserving the previous destination"
                 )
-            if checkpoint.read_bytes() != canonical_bytes(
-                expected_checkpoint(
-                    [
-                        {
-                            "id": "REL-3",
-                            "component": "scheduler",
-                            "status": "ready",
-                            "notes": "queued",
-                        }
-                    ]
-                )
-            ):
+            if checkpoint.read_bytes() != expected_content:
                 raise AssertionError("atomic checkpoint result is incorrect")
     finally:
         sys.dont_write_bytecode = previous_bytecode_setting

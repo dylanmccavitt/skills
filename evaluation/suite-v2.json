@@ -25,10 +25,10 @@
       "fixture_id": "checkpoint-continuation-v2",
       "fixture_version": 2,
       "manifest": "fixtures/checkpoint-continuation-v2/public/manifest-v2.json",
-      "public_manifest_sha256": "sha256:8e61d8ee97965a4a348a4af01f0fad3d6a48415b95b17921504e3cfb43f56bd8",
+      "public_manifest_sha256": "sha256:13578c4c1340b6395755a3c61c04863ee45fb6c7a42777f654be9c0cf667442b",
       "public_payload_tree_sha256": "sha256:aeda0f62b681fdf38d42e7b1decfa48ad4b7cb7b1e0950fbdd9aa765df508ff7",
       "seed_repository_tree_sha256": "sha256:06d625ecf27094bfe391e9a903d7bb0f0f88a0117c70d639035afc8b72074cfa",
-      "grader_contract_sha256": "sha256:5194024d9a3bc19656f1f507059189acb68a98557ac4758f5d61c081442869d4"
+      "grader_contract_sha256": "sha256:6ff4292bce53bfeedc30490ba2f0b5c1f8f099988e070586da37a17cb42d2316"
     }
   ]
 }

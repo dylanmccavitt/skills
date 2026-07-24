@@ -402,6 +402,25 @@ class EvaluationContractTests(unittest.TestCase):
             result = self.run_checkpoint_check(workspace, "outcomes")
             self.assertNotEqual(result.returncode, 0)
 
+    def test_checkpoint_grader_rejects_same_target_replace_decoy(self):
+        fixture_root = self.root / "fixtures" / CHECKPOINT
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            shutil.copytree(fixture_root / "grader/assets/reference", workspace)
+            checkpoint = workspace / "release_builder/checkpoint.py"
+            checkpoint.write_text(
+                checkpoint.read_text(encoding="utf-8").replace(
+                    '    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")\n'
+                    "    temporary.write_bytes(content)\n"
+                    "    os.replace(temporary, path)",
+                    "    path.write_bytes(content)\n"
+                    "    os.replace(path, path)",
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_checkpoint_check(workspace, "contract")
+            self.assertNotEqual(result.returncode, 0)
+
     def test_held_out_details_cannot_leak_into_public_content(self):
         cases = (
             ("grader_tools/grade_review.py", "private command path"),

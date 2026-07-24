@@ -5,7 +5,7 @@
   "fixture_id": "checkpoint-continuation-v2",
   "fixture_version": 2,
   "public_fixture_sha256": "sha256:dc493b84409228d8d220fddbcf788147d90e3a49b8306032fb4b35877648b9f6",
-  "private_assets_tree_sha256": "sha256:181120d2c3d48f1f40d35c64851711ca89845d6e06b5c02491cfa7bb800288fd",
+  "private_assets_tree_sha256": "sha256:8e39f8254a07ceb45448703d7a5997ecb48002ac7be3ccca2d2b5b76e59dce23",
   "private_expectations": {
     "sensitive_strings": ["REL-9", "REL-7", "REL-4", "hold", "shipped", "migration"]
   },
