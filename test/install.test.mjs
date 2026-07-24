@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,17 @@ import test from "node:test";
 import { doctorSuite, installSuite, uninstallSuite } from "../bin/install.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const legacyCommand =
+  '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py"';
+
+function legacyHook(statusMessage) {
+  return {
+    type: "command",
+    command: legacyCommand,
+    timeout: 10,
+    statusMessage,
+  };
+}
 
 function temporaryCodexHome() {
   const root = mkdtempSync(join(tmpdir(), "codex-orchestration-test-"));
@@ -25,7 +36,7 @@ test("installs all skills and preserves existing hooks", () => {
   const result = installSuite({ codexHome, sourceRoot: repositoryRoot });
 
   assert.equal(result.codexHome, codexHome);
-  for (const skill of ["gepetto", "pinocchio", "jiminy", "checkpoint"]) {
+  for (const skill of ["gepetto", "painter", "vigil", "checkpoint", "orchestrate"]) {
     const path = join(codexHome, "skills", skill);
     assert.equal(lstatSync(path).isSymbolicLink(), true);
     assert.equal(existsSync(join(path, "SKILL.md")), true);
@@ -33,20 +44,33 @@ test("installs all skills and preserves existing hooks", () => {
   const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
   assert.equal(hooks.custom, true);
   assert.equal(hooks.hooks.Stop[0].hooks[0].command, "existing");
-  assert.equal(hooks.hooks.Stop.length, 2);
-  const command = hooks.hooks.SessionStart[0].hooks[0].command;
-  const hook = spawnSync(command, {
-    shell: true,
-    env: { ...process.env, CODEX_HOME: codexHome },
-    input: '{"session_id":"unregistered","hook_event_name":"SessionStart","source":"compact"}',
-    encoding: "utf8",
-  });
-  assert.equal(hook.status, 0, hook.stderr);
-  assert.equal(hook.stdout, "");
+  assert.equal(hooks.hooks.Stop.length, 1);
+  assert.equal(hooks.hooks.SessionStart, undefined);
   assert.equal(
     readdirSync(codexHome).some((name) => name.startsWith("hooks.json.backup-")),
     true,
   );
+});
+
+test("installed hook blocks direct delivery in favor of the typed runner", () => {
+  const codexHome = temporaryCodexHome();
+  installSuite({ codexHome, sourceRoot: repositoryRoot });
+  const config = JSON.parse(readFileSync(join(codexHome, "hooks.json"), "utf8"));
+  const command = config.hooks.PreToolUse[0].hooks[0].command;
+
+  const result = spawnSync(command, {
+    shell: true,
+    env: { ...process.env, CODEX_HOME: codexHome },
+    input: JSON.stringify({
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "gh pr merge 42 --repo owner/repo" },
+    }),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /typed voice_state\.py deliver/);
 });
 
 test("runs through an npm-style binary symlink", () => {
@@ -60,7 +84,7 @@ test("runs through an npm-style binary symlink", () => {
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Installed gepetto, pinocchio, jiminy, checkpoint/);
+  assert.match(result.stdout, /Installed gepetto, painter, vigil, checkpoint, orchestrate/);
 });
 
 test("repeated installation is idempotent", () => {
@@ -70,6 +94,142 @@ test("repeated installation is idempotent", () => {
   installSuite({ codexHome, sourceRoot: repositoryRoot });
   const second = readFileSync(join(codexHome, "hooks.json"), "utf8");
   assert.equal(second, first);
+});
+
+test("upgrades package-owned retired skill names as an intentional clean swap", () => {
+  const codexHome = temporaryCodexHome();
+  const installRoot = join(codexHome, "orchestration-skills");
+  const skillsRoot = join(codexHome, "skills");
+  mkdirSync(skillsRoot, { recursive: true });
+  mkdirSync(join(installRoot, "pinocchio"), { recursive: true });
+  mkdirSync(join(installRoot, "jiminy"), { recursive: true });
+  mkdirSync(join(installRoot, "implement"), { recursive: true });
+  mkdirSync(join(installRoot, "review-gate"), { recursive: true });
+  writeFileSync(
+    join(installRoot, ".codex-orchestration-install.json"),
+    `${JSON.stringify({ package: "@dylanmccavitt/skills", version: "0.4.0" })}\n`,
+  );
+  for (const skill of ["pinocchio", "jiminy", "implement", "review-gate"]) {
+    symlinkSync(join(installRoot, skill), join(skillsRoot, skill), "dir");
+  }
+  writeFileSync(
+    join(codexHome, "hooks.json"),
+    `${JSON.stringify({
+      hooks: {
+        SessionStart: [{ matcher: "^compact$", hooks: [legacyHook("Checking checkpoint policy")] }],
+        SubagentStart: [{ matcher: "*", hooks: [legacyHook("Loading lane contract")] }],
+        SubagentStop: [{ matcher: "*", hooks: [legacyHook("Checking lane receipt")] }],
+        Stop: [{ hooks: [legacyHook("Checking orchestration result")] }],
+        PreToolUse: [
+          {
+            matcher: "^(Bash|apply_patch|Edit|Write)$",
+            hooks: [legacyHook("Checking orchestration guard")],
+          },
+          {
+            matcher: "mixed",
+            hooks: [
+              { type: "command", command: `sh -c '${legacyCommand}'` },
+              { type: "command", command: "preserve-me" },
+            ],
+          },
+          {
+            matcher: "^(Bash|apply_patch|Edit|Write)$",
+            hooks: [
+              legacyHook("Checking orchestration guard"),
+              { type: "command", command: "preserve-co-located" },
+            ],
+          },
+          {
+            matcher: "^(Bash|apply_patch|Edit|Write)$",
+            hooks: [{ ...legacyHook("Checking orchestration guard"), timeout: 20 }],
+          },
+        ],
+      },
+    })}\n`,
+  );
+
+  installSuite({ codexHome, sourceRoot: repositoryRoot });
+
+  for (const skill of ["pinocchio", "jiminy", "implement", "review-gate"]) {
+    assert.throws(() => lstatSync(join(skillsRoot, skill)), { code: "ENOENT" });
+  }
+  for (const skill of ["painter", "vigil"]) {
+    assert.equal(lstatSync(join(skillsRoot, skill)).isSymbolicLink(), true);
+  }
+  const hooks = JSON.parse(readFileSync(join(codexHome, "hooks.json"), "utf8"));
+  const serialized = JSON.stringify(hooks);
+  assert.equal(serialized.includes("sh -c"), true);
+  assert.equal(serialized.includes("orchestration_hook.py"), true);
+  assert.equal(serialized.includes("preserve-me"), true);
+  assert.equal(serialized.includes("preserve-co-located"), true);
+  assert.equal(serialized.includes('"timeout":20'), true);
+  assert.equal(serialized.includes("voice_state.py"), true);
+  for (const event of ["SessionStart", "SubagentStart", "SubagentStop", "Stop"]) {
+    assert.equal(hooks.hooks[event], undefined);
+  }
+});
+
+test("upgrade preserves retired-name links not owned by this package", () => {
+  const codexHome = temporaryCodexHome();
+  const installRoot = join(codexHome, "orchestration-skills");
+  const skillsRoot = join(codexHome, "skills");
+  mkdirSync(skillsRoot, { recursive: true });
+  mkdirSync(installRoot, { recursive: true });
+  writeFileSync(
+    join(installRoot, ".codex-orchestration-install.json"),
+    `${JSON.stringify({ package: "@dylanmccavitt/skills", version: "0.4.0" })}\n`,
+  );
+  const retiredSkills = ["pinocchio", "jiminy", "implement", "review-gate"];
+  const externalTargets = new Map();
+  for (const skill of retiredSkills) {
+    const external = join(codexHome, `external-${skill}`);
+    mkdirSync(external);
+    symlinkSync(external, join(skillsRoot, skill), "dir");
+    externalTargets.set(skill, external);
+  }
+
+  installSuite({ codexHome, sourceRoot: repositoryRoot });
+
+  for (const skill of retiredSkills) {
+    const link = join(skillsRoot, skill);
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(resolve(skillsRoot, readlinkSync(link)), externalTargets.get(skill));
+  }
+});
+
+test("repair install preserves ambiguous legacy-looking hooks without a marker", () => {
+  const codexHome = temporaryCodexHome();
+  writeFileSync(
+    join(codexHome, "hooks.json"),
+    `${JSON.stringify({
+      hooks: {
+        Stop: [{ hooks: [legacyHook("Checking orchestration result")] }],
+        PreToolUse: [{ matcher: "foreign", hooks: [{ type: "command", command: "preserve-me" }] }],
+      },
+    })}\n`,
+  );
+
+  installSuite({ codexHome, sourceRoot: repositoryRoot });
+
+  const hooks = JSON.parse(readFileSync(join(codexHome, "hooks.json"), "utf8"));
+  assert.equal(JSON.stringify(hooks).includes("orchestration_hook.py"), true);
+  assert.equal(JSON.stringify(hooks).includes("preserve-me"), true);
+});
+
+test("refuses a symlinked package install root even when its target has a marker", () => {
+  const codexHome = temporaryCodexHome();
+  const external = join(dirname(codexHome), "external-install");
+  mkdirSync(external, { recursive: true });
+  writeFileSync(
+    join(external, ".codex-orchestration-install.json"),
+    `${JSON.stringify({ package: "@dylanmccavitt/skills", version: "0.4.0" })}\n`,
+  );
+  symlinkSync(external, join(codexHome, "orchestration-skills"), "dir");
+
+  assert.throws(
+    () => installSuite({ codexHome, sourceRoot: repositoryRoot }),
+    /Refusing symlinked install directory/,
+  );
 });
 
 test("refuses to replace an existing skill", () => {
@@ -103,15 +263,17 @@ test("uninstall removes managed pieces and preserves foreign entries", () => {
   const result = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
 
   assert.equal(result.removed.length > 0, true);
-  for (const skill of ["gepetto", "pinocchio", "jiminy", "checkpoint"]) {
+  for (const skill of ["gepetto", "painter", "vigil", "checkpoint", "orchestrate"]) {
     assert.equal(existsSync(join(codexHome, "skills", skill)), false);
   }
   assert.equal(lstatSync(foreignLink).isSymbolicLink(), true);
   assert.equal(existsSync(join(codexHome, "orchestration-skills")), false);
   const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
   assert.deepEqual(hooks.hooks.Stop, [{ hooks: [{ type: "command", command: "existing" }] }]);
-  assert.equal(hooks.hooks.SessionStart, undefined);
-  assert.equal(hooks.hooks.PreToolUse, undefined);
+  const firstUninstall = readFileSync(hooksPath, "utf8");
+  const repeated = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
+  assert.deepEqual(repeated.removed, []);
+  assert.equal(readFileSync(hooksPath, "utf8"), firstUninstall);
 });
 
 test("uninstall on an empty home is a no-op", () => {
@@ -120,13 +282,35 @@ test("uninstall on an empty home is a no-op", () => {
   assert.deepEqual(result.removed, []);
 });
 
+test("uninstall preserves legacy-looking hooks without a managed install", () => {
+  const codexHome = temporaryCodexHome();
+  const hooksPath = join(codexHome, "hooks.json");
+  const original = {
+    hooks: {
+      Stop: [{ hooks: [legacyHook("Checking orchestration result")] }],
+    },
+  };
+  writeFileSync(hooksPath, `${JSON.stringify(original)}\n`);
+
+  const result = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
+
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(JSON.parse(readFileSync(hooksPath, "utf8")), original);
+});
+
 test("uninstall refuses an unmanaged install directory", () => {
   const codexHome = temporaryCodexHome();
-  mkdirSync(join(codexHome, "orchestration-skills"), { recursive: true });
+  const installRoot = join(codexHome, "orchestration-skills");
+  const skillsRoot = join(codexHome, "skills");
+  mkdirSync(installRoot, { recursive: true });
+  mkdirSync(skillsRoot, { recursive: true });
+  const link = join(skillsRoot, "gepetto");
+  symlinkSync(join(installRoot, "gepetto"), link, "dir");
   assert.throws(
     () => uninstallSuite({ codexHome, sourceRoot: repositoryRoot }),
     /Refusing to remove unmanaged directory/,
   );
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
 });
 
 test("doctor passes on a fresh install", () => {
@@ -144,8 +328,8 @@ test("doctor reports tampered installs and missing installs", () => {
   assert.equal(missing.problems.length > 0, true);
 
   installSuite({ codexHome, sourceRoot: repositoryRoot });
-  writeFileSync(join(codexHome, "hooks.json"), "{\"hooks\":{}}\n");
+  writeFileSync(join(codexHome, "orchestration-skills", ".codex-orchestration-install.json"), "tampered\n");
   const tampered = doctorSuite({ codexHome, sourceRoot: repositoryRoot });
   assert.equal(tampered.ok, false);
-  assert.equal(tampered.problems.some((problem) => problem.includes("hook entr")), true);
+  assert.equal(tampered.problems.some((problem) => problem.includes("marker")), true);
 });

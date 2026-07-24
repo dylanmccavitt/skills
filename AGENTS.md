@@ -4,7 +4,7 @@
 
 ### Atomic orchestration state
 
-- Flag state transitions that bypass the registry lock, expected-revision check, atomic replacement, or continuation journal/recovery path. Safe path: route mutations through `orchestration_state.py` primitives and prove conflicts plus crash recovery in tests.
+- Flag state transitions that bypass the registry lock, expected-revision check, atomic replacement, or checkpoint recovery path. Safe path: route mutations through `voice_state.py` primitives and prove conflicts plus recovery in tests.
 
 ### Exact-head delivery gates
 

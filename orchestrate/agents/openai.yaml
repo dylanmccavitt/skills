@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestrate"
+  short_description: "Track approved complex lanes"
+  default_prompt: "Use $orchestrate to coordinate this approved lane map."

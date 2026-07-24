@@ -20,8 +20,78 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_NAME = "@dylanmccavitt/skills";
-const SKILLS = ["gepetto", "pinocchio", "jiminy", "checkpoint"];
+const SKILLS = ["gepetto", "painter", "vigil", "checkpoint", "orchestrate"];
+const RETIRED_SKILLS = ["pinocchio", "jiminy", "implement", "review-gate"];
+const ALL_PACKAGE_SKILLS = [...new Set([...SKILLS, ...RETIRED_SKILLS])];
 const MANAGED_DIRECTORIES = [...SKILLS, "hooks"];
+const LEGACY_HOOK_COMMAND =
+  '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py"';
+const LEGACY_HOOK_ENTRIES = {
+  SessionStart: [
+    {
+      matcher: "^compact$",
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Checking checkpoint policy",
+        },
+      ],
+    },
+  ],
+  SubagentStart: [
+    {
+      matcher: "*",
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Loading lane contract",
+        },
+      ],
+    },
+  ],
+  SubagentStop: [
+    {
+      matcher: "*",
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Checking lane receipt",
+        },
+      ],
+    },
+  ],
+  Stop: [
+    {
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Checking orchestration result",
+        },
+      ],
+    },
+  ],
+  PreToolUse: [
+    {
+      matcher: "^(Bash|apply_patch|Edit|Write)$",
+      hooks: [
+        {
+          type: "command",
+          command: LEGACY_HOOK_COMMAND,
+          timeout: 10,
+          statusMessage: "Checking orchestration guard",
+        },
+      ],
+    },
+  ],
+};
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function readJson(path) {
@@ -64,6 +134,21 @@ function preflightSkillLinks(skillsRoot, installRoot) {
   }
 }
 
+function packageInstallExists(installRoot, action = "replace") {
+  if (!pathExists(installRoot)) return false;
+  if (lstatSync(installRoot).isSymbolicLink()) {
+    throw new Error(`Refusing symlinked install directory: ${installRoot}`);
+  }
+  const markerPath = join(installRoot, ".codex-orchestration-install.json");
+  if (!pathExists(markerPath) || lstatSync(markerPath).isSymbolicLink()) {
+    throw new Error(`Refusing to ${action} unmanaged directory: ${installRoot}`);
+  }
+  if (readJson(markerPath).package !== PACKAGE_NAME) {
+    throw new Error(`Refusing to ${action} unmanaged directory: ${installRoot}`);
+  }
+  return true;
+}
+
 function parseExistingHooks(hooksPath) {
   if (!pathExists(hooksPath)) return { hooks: {} };
   if (lstatSync(hooksPath).isSymbolicLink()) {
@@ -91,6 +176,19 @@ function mergeHooks(existing, managed) {
     merged.hooks[event] = current;
   }
   return merged;
+}
+
+function withoutPackageOwnedLegacyHooks(existing) {
+  const cleaned = structuredClone(existing);
+  for (const [event, ownedEntries] of Object.entries(LEGACY_HOOK_ENTRIES)) {
+    const entries = cleaned.hooks[event];
+    if (!Array.isArray(entries)) continue;
+    const owned = new Set(ownedEntries.map((entry) => JSON.stringify(entry)));
+    const kept = entries.filter((entry) => !owned.has(JSON.stringify(entry)));
+    if (kept.length > 0) cleaned.hooks[event] = kept;
+    else delete cleaned.hooks[event];
+  }
+  return cleaned;
 }
 
 function writeHooks(hooksPath, config) {
@@ -131,23 +229,29 @@ export function installSuite({ codexHome, sourceRoot = packageRoot } = {}) {
   mkdirSync(resolvedHome, { recursive: true });
   mkdirSync(skillsRoot, { recursive: true });
   preflightSkillLinks(skillsRoot, installRoot);
-  const existingHooks = parseExistingHooks(hooksPath);
+  const originalHooks = parseExistingHooks(hooksPath);
   const managedHooks = readJson(join(sourceRoot, "hooks", "hooks.json"));
-  const mergedHooks = mergeHooks(existingHooks, managedHooks);
 
-  if (pathExists(installRoot)) {
-    const markerPath = join(installRoot, ".codex-orchestration-install.json");
-    if (!pathExists(markerPath) || readJson(markerPath).package !== PACKAGE_NAME) {
-      throw new Error(`Refusing to replace unmanaged directory: ${installRoot}`);
-    }
-  }
+  const existingPackageInstall = packageInstallExists(installRoot);
+  const existingHooks = existingPackageInstall
+    ? withoutPackageOwnedLegacyHooks(originalHooks)
+    : originalHooks;
+  const mergedHooks = mergeHooks(existingHooks, managedHooks);
+  const priorSkillLinks = ALL_PACKAGE_SKILLS.filter((skill) =>
+    managedLink(join(skillsRoot, skill), join(installRoot, skill)),
+  );
 
   const staging = stagePackage(sourceRoot, resolvedHome, packageJson.version);
   const previous = `${installRoot}.previous-${process.pid}`;
+  let hooksWritten = false;
   try {
     if (pathExists(installRoot)) renameSync(installRoot, previous);
     renameSync(staging, installRoot);
 
+    for (const skill of RETIRED_SKILLS) {
+      const linkPath = join(skillsRoot, skill);
+      if (managedLink(linkPath, join(installRoot, skill))) rmSync(linkPath);
+    }
     for (const skill of SKILLS) {
       const linkPath = join(skillsRoot, skill);
       const targetPath = join(installRoot, skill);
@@ -155,19 +259,21 @@ export function installSuite({ codexHome, sourceRoot = packageRoot } = {}) {
       symlinkSync(relative(skillsRoot, targetPath), linkPath, "dir");
     }
     writeHooks(hooksPath, mergedHooks);
+    hooksWritten = true;
     if (pathExists(previous)) rmSync(previous, { recursive: true });
   } catch (error) {
-    for (const skill of SKILLS) {
+    for (const skill of ALL_PACKAGE_SKILLS) {
       const linkPath = join(skillsRoot, skill);
       if (managedLink(linkPath, join(installRoot, skill))) rmSync(linkPath);
     }
     if (pathExists(installRoot)) rmSync(installRoot, { recursive: true });
     if (pathExists(previous)) renameSync(previous, installRoot);
     if (pathExists(installRoot)) {
-      for (const skill of SKILLS) {
+      for (const skill of priorSkillLinks) {
         symlinkSync(relative(skillsRoot, join(installRoot, skill)), join(skillsRoot, skill), "dir");
       }
     }
+    if (hooksWritten) writeHooks(hooksPath, originalHooks);
     if (pathExists(staging)) rmSync(staging, { recursive: true });
     throw error;
   }
@@ -189,8 +295,9 @@ export function uninstallSuite({ codexHome, sourceRoot = packageRoot } = {}) {
   const skillsRoot = join(resolvedHome, "skills");
   const hooksPath = join(resolvedHome, "hooks.json");
   const removed = [];
+  const existingPackageInstall = packageInstallExists(installRoot, "remove");
 
-  for (const skill of SKILLS) {
+  for (const skill of ALL_PACKAGE_SKILLS) {
     const linkPath = join(skillsRoot, skill);
     if (managedLink(linkPath, join(installRoot, skill))) {
       rmSync(linkPath);
@@ -198,27 +305,28 @@ export function uninstallSuite({ codexHome, sourceRoot = packageRoot } = {}) {
     }
   }
 
-  if (pathExists(installRoot)) {
-    const markerPath = join(installRoot, ".codex-orchestration-install.json");
-    if (!pathExists(markerPath) || readJson(markerPath).package !== PACKAGE_NAME) {
-      throw new Error(`Refusing to remove unmanaged directory: ${installRoot}`);
-    }
+  if (existingPackageInstall) {
     rmSync(installRoot, { recursive: true });
     removed.push(installRoot);
   }
 
   if (pathExists(hooksPath)) {
-    const config = parseExistingHooks(hooksPath);
+    const original = parseExistingHooks(hooksPath);
+    const config = existingPackageInstall
+      ? withoutPackageOwnedLegacyHooks(original)
+      : structuredClone(original);
     const managed = managedHookEntries(sourceRoot);
-    let changed = false;
-    for (const [event, entries] of Object.entries(managed)) {
-      if (!Array.isArray(config.hooks[event])) continue;
-      const serialized = new Set(entries.map((entry) => JSON.stringify(entry)));
-      const kept = config.hooks[event].filter((entry) => !serialized.has(JSON.stringify(entry)));
-      if (kept.length !== config.hooks[event].length) {
-        changed = true;
-        if (kept.length > 0) config.hooks[event] = kept;
-        else delete config.hooks[event];
+    let changed = JSON.stringify(config) !== JSON.stringify(original);
+    if (existingPackageInstall) {
+      for (const [event, entries] of Object.entries(managed)) {
+        if (!Array.isArray(config.hooks[event])) continue;
+        const serialized = new Set(entries.map((entry) => JSON.stringify(entry)));
+        const kept = config.hooks[event].filter((entry) => !serialized.has(JSON.stringify(entry)));
+        if (kept.length !== config.hooks[event].length) {
+          changed = true;
+          if (kept.length > 0) config.hooks[event] = kept;
+          else delete config.hooks[event];
+        }
       }
     }
     if (changed) {

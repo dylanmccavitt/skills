@@ -1,4 +1,0 @@
-interface:
-  display_name: "Pinocchio"
-  short_description: "Deliver one approved leaf as a verified PR"
-  default_prompt: "Use $pinocchio to implement one approved issue leaf and return exact-head proof."

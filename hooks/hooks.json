@@ -1,74 +1,14 @@
 {
   "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "^compact$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
-            "timeout": 10,
-            "statusMessage": "Checking checkpoint policy"
-          }
-        ]
-      }
-    ],
-    "SubagentStart": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
-            "timeout": 10,
-            "statusMessage": "Loading lane contract"
-          }
-        ]
-      },
-      {
-        "matcher": "tldraw-offline",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh '/Users/dylanmccavitt/skills/tldraw-offline/inject-server-context.sh' SubagentStart"
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
-            "timeout": 10,
-            "statusMessage": "Checking lane receipt"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
-            "timeout": 10,
-            "statusMessage": "Checking orchestration result"
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
-        "matcher": "^(Bash|apply_patch|Edit|Write)$",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py\"",
-            "timeout": 10,
-            "statusMessage": "Checking orchestration guard"
+            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/voice_state.py\" hook",
+            "timeout": 15,
+            "statusMessage": "Checking voice-task tool authority"
           }
         ]
       }
