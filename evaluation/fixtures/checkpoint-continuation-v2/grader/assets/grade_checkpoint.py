@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import hashlib
+import importlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 
 ALLOWED_PATHS = {
@@ -50,8 +53,8 @@ def canonical_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def expected_report(records: list[dict[str, str]]) -> str:
-    normalized = sorted(
+def normalized_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
+    return sorted(
         (
             {
                 key: value.strip()
@@ -61,6 +64,25 @@ def expected_report(records: list[dict[str, str]]) -> str:
         ),
         key=lambda record: record["id"],
     )
+
+
+def expected_checkpoint(records: list[dict[str, str]]) -> dict[str, object]:
+    normalized = normalized_records(records)
+    return {
+        "records": normalized,
+        "records_sha256": (
+            "sha256:" + hashlib.sha256(canonical_bytes(normalized)).hexdigest()
+        ),
+        "schema_version": 1,
+        "summary": {
+            "blocked": sum(record["status"] == "blocked" for record in normalized),
+            "ready": sum(record["status"] == "ready" for record in normalized),
+        },
+    }
+
+
+def expected_report(records: list[dict[str, str]]) -> str:
+    normalized = normalized_records(records)
     ready = sum(record["status"] == "ready" for record in normalized)
     blocked = sum(record["status"] == "blocked" for record in normalized)
     lines = [
@@ -97,6 +119,8 @@ def exercise(workspace: Path, records: list[dict[str, str]]) -> str:
         )
         if prepared.returncode != 0:
             raise AssertionError(prepared.stderr or prepared.stdout)
+        if checkpoint.read_bytes() != canonical_bytes(expected_checkpoint(records)):
+            raise AssertionError("checkpoint is not the required canonical state")
         source.unlink()
         completed = run(
             workspace,
@@ -144,16 +168,7 @@ def check_preservation(workspace: Path) -> None:
         )
         if result.returncode != 0:
             raise AssertionError("prepare failed")
-        normalized = sorted(records, key=lambda record: record["id"])
-        expected_state = {
-            "records": normalized,
-            "records_sha256": (
-                "sha256:" + hashlib.sha256(canonical_bytes(normalized)).hexdigest()
-            ),
-            "schema_version": 1,
-            "summary": {"blocked": 1, "ready": 0},
-        }
-        if checkpoint.read_bytes() != canonical_bytes(expected_state):
+        if checkpoint.read_bytes() != canonical_bytes(expected_checkpoint(records)):
             raise AssertionError("checkpoint is not the required canonical state")
         source.unlink()
         result = run(
@@ -181,24 +196,95 @@ def check_preservation(workspace: Path) -> None:
             raise AssertionError("tampered saved state was accepted")
 
 
-def _assert_atomic_checkpoint_source(workspace: Path) -> None:
-    source = workspace / "release_builder/checkpoint.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
-    atomic_calls = {
-        "os.replace",
-        "os.rename",
-        "Path.replace",
-        "Path.rename",
-    }
-    observed = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        owner = node.func.value
-        if isinstance(owner, ast.Name):
-            observed.add(f"{owner.id}.{node.func.attr}")
-    if not observed & atomic_calls:
-        raise AssertionError("checkpoint writer does not use atomic replacement")
+def _assert_atomic_checkpoint_behavior(workspace: Path) -> None:
+    workspace_text = str(workspace)
+    previous_bytecode_setting = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, workspace_text)
+    try:
+        module = importlib.import_module("release_builder.checkpoint")
+        observed_destinations: list[Path] = []
+        original_os_replace = os.replace
+        original_os_rename = os.rename
+        original_path_replace = Path.replace
+        original_path_rename = Path.rename
+
+        def record_os_replace(source, destination, *args, **kwargs):
+            observed_destinations.append(Path(destination))
+            return original_os_replace(source, destination, *args, **kwargs)
+
+        def record_os_rename(source, destination, *args, **kwargs):
+            observed_destinations.append(Path(destination))
+            return original_os_rename(source, destination, *args, **kwargs)
+
+        def record_path_replace(source, destination):
+            observed_destinations.append(Path(destination))
+            return original_path_replace(source, destination)
+
+        def record_path_rename(source, destination):
+            observed_destinations.append(Path(destination))
+            return original_path_rename(source, destination)
+
+        replacements = (
+            (original_os_replace, record_os_replace),
+            (original_os_rename, record_os_rename),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input.json"
+            checkpoint = root / "checkpoint.json"
+            write_input(
+                source,
+                [
+                    {
+                        "id": "REL-3",
+                        "component": "scheduler",
+                        "status": "ready",
+                        "notes": "queued",
+                    }
+                ],
+            )
+            checkpoint.write_text("previous checkpoint\n", encoding="utf-8")
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch("os.replace", record_os_replace))
+                stack.enter_context(mock.patch("os.rename", record_os_rename))
+                stack.enter_context(mock.patch.object(Path, "replace", record_path_replace))
+                stack.enter_context(mock.patch.object(Path, "rename", record_path_rename))
+                for name, value in tuple(vars(module).items()):
+                    for original, replacement in replacements:
+                        if value is original:
+                            stack.enter_context(
+                                mock.patch.object(module, name, replacement)
+                            )
+                module.prepare(source, checkpoint)
+            expected_destination = checkpoint.resolve()
+            if not any(
+                destination.resolve() == expected_destination
+                for destination in observed_destinations
+            ):
+                raise AssertionError(
+                    "checkpoint target was not installed by atomic replacement"
+                )
+            if checkpoint.read_bytes() != canonical_bytes(
+                expected_checkpoint(
+                    [
+                        {
+                            "id": "REL-3",
+                            "component": "scheduler",
+                            "status": "ready",
+                            "notes": "queued",
+                        }
+                    ]
+                )
+            ):
+                raise AssertionError("atomic checkpoint result is incorrect")
+    finally:
+        sys.dont_write_bytecode = previous_bytecode_setting
+        if sys.path and sys.path[0] == workspace_text:
+            sys.path.pop(0)
+        for name in tuple(sys.modules):
+            if name == "release_builder" or name.startswith("release_builder."):
+                del sys.modules[name]
 
 
 def _assert_standard_library_only(workspace: Path) -> None:
@@ -246,7 +332,7 @@ def check_contract(workspace: Path) -> None:
     )
     if visible.returncode != 0:
         raise AssertionError(visible.stderr or visible.stdout)
-    _assert_atomic_checkpoint_source(workspace)
+    _assert_atomic_checkpoint_behavior(workspace)
     _assert_standard_library_only(workspace)
 
     invalid_inputs = (
@@ -304,7 +390,9 @@ def check_scope(workspace: Path) -> None:
     for path in workspace.rglob("*"):
         relative_path = path.relative_to(workspace)
         if "__pycache__" in relative_path.parts:
-            continue
+            raise AssertionError(
+                f"bytecode cache path is not allowed: {relative_path.as_posix()}"
+            )
         if path.is_symlink():
             raise AssertionError(f"symlink is not allowed: {relative_path.as_posix()}")
         if path.is_dir():

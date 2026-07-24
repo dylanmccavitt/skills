@@ -338,6 +338,17 @@ class EvaluationContractTests(unittest.TestCase):
             result = self.run_checkpoint_check(workspace, "scope")
             self.assertNotEqual(result.returncode, 0)
 
+    def test_checkpoint_grader_rejects_pycache_scope_expansion(self):
+        fixture_root = self.root / "fixtures" / CHECKPOINT
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            shutil.copytree(fixture_root / "grader/assets/reference", workspace)
+            hidden = workspace / "release_builder/__pycache__/unrelated.txt"
+            hidden.parent.mkdir()
+            hidden.write_text("unrelated scope expansion\n", encoding="utf-8")
+            result = self.run_checkpoint_check(workspace, "scope")
+            self.assertNotEqual(result.returncode, 0)
+
     def test_checkpoint_grader_rejects_non_atomic_write_and_missing_tests(self):
         fixture_root = self.root / "fixtures" / CHECKPOINT
         with tempfile.TemporaryDirectory() as temporary:
@@ -353,6 +364,12 @@ class EvaluationContractTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            checkpoint.write_text(
+                checkpoint.read_text(encoding="utf-8")
+                + '\n\ndef _unused_atomic_decoy():\n'
+                + '    os.replace("unused-a", "unused-b")\n',
+                encoding="utf-8",
+            )
             result = self.run_checkpoint_check(workspace, "contract")
             self.assertNotEqual(result.returncode, 0)
 
@@ -362,6 +379,27 @@ class EvaluationContractTests(unittest.TestCase):
             shutil.copytree(fixture_root / "grader/assets/reference", workspace)
             (workspace / "tests/test_visible.py").unlink()
             result = self.run_checkpoint_check(workspace, "scope")
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_checkpoint_grader_rejects_noncanonical_multi_record_state(self):
+        fixture_root = self.root / "fixtures" / CHECKPOINT
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            shutil.copytree(fixture_root / "grader/assets/reference", workspace)
+            checkpoint = workspace / "release_builder/checkpoint.py"
+            checkpoint.write_text(
+                checkpoint.read_text(encoding="utf-8").replace(
+                    "    _write_atomic(checkpoint_path, canonical_bytes(checkpoint))",
+                    "    content = (\n"
+                    "        canonical_bytes(checkpoint)\n"
+                    "        if len(records) == 1\n"
+                    '        else json.dumps(checkpoint, indent=2).encode("utf-8")\n'
+                    "    )\n"
+                    "    _write_atomic(checkpoint_path, content)",
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_checkpoint_check(workspace, "outcomes")
             self.assertNotEqual(result.returncode, 0)
 
     def test_held_out_details_cannot_leak_into_public_content(self):
