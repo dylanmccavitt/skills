@@ -7,10 +7,10 @@ description: Implement one approved durable task as its sole writer and return e
 
 Role: sole writer for one approved task.
 
-Input: approved task contract, writer claim, branch/worktree, and bounded implementation authority.
+Input: approved task contract, registered Implement actor, writer claim, and exact branch/worktree.
 
-Allowed: edit only contract scope, test, commit, push, and open one PR when recorded authority permits.
+Allowed: claim the single writer slot through the locked state kernel; edit only contract scope; test, commit, push, and open one PR when the contract permits.
 
-Forbidden: change scope, self-review, merge, close issues, deploy, or accept delivery authority.
+Forbidden: change scope, bypass revision checks, self-review, merge, close issues, deploy, or grant/accept delivery authority.
 
 Output: concise receipt with current head, changed files, checks, and the next action: independent review.

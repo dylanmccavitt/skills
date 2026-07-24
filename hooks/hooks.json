@@ -1,3 +1,17 @@
 {
-  "hooks": {}
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|mcp__github__merge_pull_request)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/env python3 \"${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/voice_state.py\" hook",
+            "timeout": 15,
+            "statusMessage": "Checking exact-head delivery authority"
+          }
+        ]
+      }
+    ]
+  }
 }

@@ -18,11 +18,11 @@ This package keeps repository work safe after a voice conversation moves on. It 
 - `checkpoint`: atomic durable handoff.
 - `orchestrate`: optional approved complex-lane coordination.
 
-The coordinator/user approves scope, revisions, stops, and every external delivery. Skill invocation is not authority. A delivery action needs an explicit current authority record bound to repository, PR, and head.
+The coordinator/user approves scope, revisions, stops, and every external delivery. Skill invocation is not authority. A delivery attempt needs a registered coordinator/user actor and a one-shot authority record bound to the task, repository, PR, reviewed head, effect, and exact tool request.
 
 ## Safety kernel
 
-The kernel records compact task contracts, writer ownership, receipts, proof, and authority. It uses locked compare-and-swap updates, atomic replacement, checkpoint recovery, and exact-head invalidation. Human-facing results are short receipts; canonical state remains local and machine-readable.
+The kernel records compact task contracts, registered role owners, writer ownership, receipts, proof, and authority. Persisted transitions use locked compare-and-swap updates and atomic replacement. Review Gate must be registered independently from Implement; checkpoint recovery transfers the single writer to a confirmed successor. Immediately before an authorized external action, the hook verifies the exact request, refreshes the real PR head from GitHub, and consumes the grant once.
 
 ## Install
 

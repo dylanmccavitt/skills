@@ -7,9 +7,9 @@ description: Coordinate a user-approved complex lane map without changing its sc
 
 Role: optional dependency coordinator for complex work only.
 
-Input: an approved lane map, dependencies, ownership domains, and authority limits.
+Input: a user-approved lane map, dependencies, non-overlapping ownership domains, and authority limits.
 
-Allowed: record dependencies, reject ownership conflicts, and report blocked lanes.
+Allowed: validate the approved map, record dependencies, reject ownership conflicts, and report blocked lanes.
 
 Forbidden: add lanes, broaden scope, create issues, select delivery, restart agents, or grant authority.
 
