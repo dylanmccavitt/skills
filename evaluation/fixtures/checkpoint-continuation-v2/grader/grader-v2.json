@@ -5,7 +5,10 @@
   "fixture_id": "checkpoint-continuation-v2",
   "fixture_version": 2,
   "public_fixture_sha256": "sha256:dc493b84409228d8d220fddbcf788147d90e3a49b8306032fb4b35877648b9f6",
-  "private_assets_tree_sha256": "sha256:1fa14b2a6c59e9330dc948d736c935b4403e4036d2a0e5844e2092a786ae9078",
+  "private_assets_tree_sha256": "sha256:73bf4562b0fe73d458d788d0addab2755131e7bbbd383e3fe43dd300537191a6",
+  "private_expectations": {
+    "sensitive_strings": ["REL-9", "REL-7", "REL-4", "hold", "shipped", "migration"]
+  },
   "checks": [
     {
       "id": "staged-functional-outcomes",
@@ -42,6 +45,20 @@
       "execution": {
         "kind": "process",
         "argv": ["python3", "grader/assets/grade_checkpoint.py", "--check", "scope"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "exit_code",
+        "value": 0
+      }
+    },
+    {
+      "id": "visible-contract-fidelity",
+      "category": "contract_fidelity",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "grader/assets/grade_checkpoint.py", "--check", "contract"],
         "timeout_seconds": 30
       },
       "expected": {

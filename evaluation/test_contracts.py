@@ -269,7 +269,7 @@ class EvaluationContractTests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(failed.returncode, 0)
-        for check_name in ("outcomes", "preservation", "scope"):
+        for check_name in ("outcomes", "preservation", "contract", "scope"):
             with self.subTest(check=check_name):
                 completed = subprocess.run(
                     [
@@ -290,6 +290,80 @@ class EvaluationContractTests(unittest.TestCase):
                     completed.stderr or completed.stdout,
                 )
 
+    def run_checkpoint_check(self, workspace, check_name):
+        check = (
+            self.root
+            / f"fixtures/{CHECKPOINT}/grader/assets/grade_checkpoint.py"
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                str(check),
+                "--workspace",
+                str(workspace),
+                "--check",
+                check_name,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_checkpoint_grader_rejects_hard_coded_union_output(self):
+        fixture_root = self.root / "fixtures" / CHECKPOINT
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            shutil.copytree(fixture_root / "grader/assets/reference", workspace)
+            (workspace / "release_builder/render.py").write_text(
+                'def render_report(checkpoint):\n'
+                '    return "# Release readiness\\\\n\\\\nReady: 1\\\\nBlocked: 1'
+                '\\\\nBlocked: 0\\\\nREL-2 REL-9 worker REL-7 REL-4\\\\n" '
+                '+ str(checkpoint) + "\\\\n"\n',
+                encoding="utf-8",
+            )
+            result = self.run_checkpoint_check(workspace, "outcomes")
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_checkpoint_grader_rejects_symlinked_source(self):
+        fixture_root = self.root / "fixtures" / CHECKPOINT
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            workspace = temporary_root / "workspace"
+            shutil.copytree(fixture_root / "grader/assets/reference", workspace)
+            source = workspace / "release_builder/render.py"
+            external = temporary_root / "outside-render.py"
+            external.write_bytes(source.read_bytes())
+            source.unlink()
+            source.symlink_to(external)
+            result = self.run_checkpoint_check(workspace, "scope")
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_checkpoint_grader_rejects_non_atomic_write_and_missing_tests(self):
+        fixture_root = self.root / "fixtures" / CHECKPOINT
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            shutil.copytree(fixture_root / "grader/assets/reference", workspace)
+            checkpoint = workspace / "release_builder/checkpoint.py"
+            checkpoint.write_text(
+                checkpoint.read_text(encoding="utf-8").replace(
+                    '    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")\n'
+                    "    temporary.write_bytes(content)\n"
+                    "    os.replace(temporary, path)",
+                    "    path.write_bytes(content)",
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_checkpoint_check(workspace, "contract")
+            self.assertNotEqual(result.returncode, 0)
+
+            self.reset_corpus()
+            fixture_root = self.root / "fixtures" / CHECKPOINT
+            workspace = Path(temporary) / "missing-tests"
+            shutil.copytree(fixture_root / "grader/assets/reference", workspace)
+            (workspace / "tests/test_visible.py").unlink()
+            result = self.run_checkpoint_check(workspace, "scope")
+            self.assertNotEqual(result.returncode, 0)
+
     def test_held_out_details_cannot_leak_into_public_content(self):
         cases = (
             ("grader_tools/grade_review.py", "private command path"),
@@ -303,6 +377,21 @@ class EvaluationContractTests(unittest.TestCase):
                 prompt = self.root / f"fixtures/{REVIEW}/public/payload/prompt.md"
                 prompt.write_text(leaked_text + "\n", encoding="utf-8")
                 self.rebind_fixture(REVIEW)
+                self.assert_invalid("held-out grader detail leaked")
+                self.reset_corpus()
+
+    def test_checkpoint_private_expectations_cannot_leak(self):
+        for leaked_text in ("REL-9", "REL-7", "REL-4", "hold", "shipped", "migration"):
+            with self.subTest(leaked_text=leaked_text):
+                prompt = (
+                    self.root
+                    / f"fixtures/{CHECKPOINT}/public/payload/prompt.md"
+                )
+                prompt.write_text(
+                    prompt.read_text(encoding="utf-8") + f"\n{leaked_text}\n",
+                    encoding="utf-8",
+                )
+                self.rebind_fixture(CHECKPOINT)
                 self.assert_invalid("held-out grader detail leaked")
                 self.reset_corpus()
 

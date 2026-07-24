@@ -338,7 +338,7 @@ def validate_grader_shape(
         "checks",
     }
     if expected_version == 2:
-        required.add("private_assets_tree_sha256")
+        required.update({"private_assets_tree_sha256", "private_expectations"})
     _exact_keys(
         value,
         label,
@@ -361,6 +361,29 @@ def validate_grader_shape(
             value["private_assets_tree_sha256"],
             f"{label}.private_assets_tree_sha256",
         )
+        expectations = _exact_keys(
+            value["private_expectations"],
+            f"{label}.private_expectations",
+            {"sensitive_strings"},
+        )
+        sensitive_strings = expectations["sensitive_strings"]
+        if not isinstance(sensitive_strings, list) or not sensitive_strings:
+            raise ContractError(
+                f"{label}.private_expectations.sensitive_strings: "
+                "non-empty array required"
+            )
+        normalized_sensitive = [
+            _nonblank(
+                item,
+                f"{label}.private_expectations.sensitive_strings[{index}]",
+            ).lower()
+            for index, item in enumerate(sensitive_strings)
+        ]
+        if len(set(normalized_sensitive)) != len(normalized_sensitive):
+            raise ContractError(
+                f"{label}.private_expectations.sensitive_strings: "
+                "duplicate value"
+            )
     checks = value["checks"]
     if not isinstance(checks, list) or not checks:
         raise ContractError(f"{label}.checks: must be a non-empty array")
@@ -423,6 +446,12 @@ def validate_grader_shape(
 
 def _grader_sensitive_text(grader: dict[str, Any]) -> set[str]:
     sensitive = set(FORBIDDEN_PUBLIC_TEXT)
+    private_expectations = grader.get("private_expectations")
+    if private_expectations:
+        sensitive.update(
+            text.strip().lower()
+            for text in private_expectations["sensitive_strings"]
+        )
     for check in grader["checks"]:
         sensitive.add(check["id"].lower())
         sensitive.add(check["expected"]["observation"].lower())
