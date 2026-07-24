@@ -256,27 +256,6 @@ def classify(state: dict[str, Any], policies: dict[str, Any], now: int) -> dict[
     if lifecycle_error:
         return _invalid_report(state, f"INVALID_STATE_FIELDS: {lifecycle_error}")
     if lifecycle is None:
-        if not state["active"]:
-            return {
-                "session_id": state.get("session_id", "-"),
-                "role": role,
-                "status": "completed-ignored",
-                "age": "unknown",
-                "restarts": state.get("restarts", 0)
-                if type(state.get("restarts", 0)) is int
-                else 0,
-                "events": state.get("events", 0)
-                if type(state.get("events", 0)) is int
-                else 0,
-                "advice": "none",
-                "heartbeat_status": "legacy-unknown",
-                "heartbeat_event": None,
-                "heartbeat_source": None,
-                "heartbeat_observed_at": None,
-                "pressure_status": "ignored",
-                "pressure_source": None,
-                "pressure_collector": None,
-            }
         return {
             "session_id": state.get("session_id", "-"),
             "role": role,

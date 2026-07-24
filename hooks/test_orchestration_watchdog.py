@@ -311,6 +311,24 @@ class OrchestrationWatchdogTest(unittest.TestCase):
         self.assertEqual(report["pressure_status"], "legacy-unknown")
         self.assertEqual(report["advice"], "none")
 
+    def test_legacy_inactive_record_remains_unknown_not_completed(self) -> None:
+        sessions = Path(self.temporary.name) / "sessions"
+        sessions.mkdir()
+        legacy = {
+            "session_id": "legacy-1",
+            "role": "review",
+            "active": False,
+            "state_revision": 7,
+        }
+        self.session_path("legacy-1").write_text(json.dumps(legacy), encoding="utf-8")
+
+        result = self.check("--json", "--include-completed", "--now", "2000000000")
+        self.assertEqual(result.returncode, 0)
+        (report,) = json.loads(result.stdout)["sessions"]
+        self.assertEqual(report["status"], "legacy-unknown")
+        self.assertEqual(report["heartbeat_status"], "legacy-unknown")
+        self.assertEqual(report["pressure_status"], "legacy-unknown")
+
     def test_unsupported_observation_capability_is_explicit(self) -> None:
         self.register("review")
         state = json.loads(self.session_path().read_text(encoding="utf-8"))
