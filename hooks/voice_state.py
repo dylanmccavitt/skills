@@ -50,6 +50,35 @@ def observe_pr_head(repo: str, pr: str) -> str:
     return head
 
 
+def observe_pr_status(repo: str, pr: str) -> dict:
+    """Observe whether the exact PR is open, merged, or closed for recovery."""
+    result = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            pr,
+            "--repo",
+            repo,
+            "--json",
+            "headRefOid,state,mergedAt",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    observed = json.loads(result.stdout)
+    head = observed.get("headRefOid", "")
+    state = observed.get("state", "")
+    if not FULL_SHA.fullmatch(head) or state not in {"OPEN", "CLOSED", "MERGED"}:
+        raise StateError("GitHub returned an invalid PR recovery status")
+    return {
+        "head": head,
+        "state": state,
+        "merged": state == "MERGED" or bool(observed.get("mergedAt")),
+    }
+
+
 def digest(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -299,6 +328,8 @@ def new_task(
         "review": None,
         "authority": None,
         "authority_history": [],
+        "delivery_attempt": None,
+        "lane_map": None,
         "receipts": [],
         "next_action": "claim writer",
     }
@@ -470,6 +501,39 @@ def _review(
     _transition(task, expected_revision, change)
 
 
+def _approve_lanes(
+    task: dict,
+    expected_revision: int,
+    actor: str,
+    origin: str,
+    lanes: list[dict],
+) -> None:
+    def change(candidate: dict) -> None:
+        if origin not in {"coordinator", "user"} or not _actor_has_role(
+            candidate, actor, origin
+        ):
+            raise StateError("lane approval requires a registered decision actor")
+        if candidate["state"] != "approved" or candidate.get("writer"):
+            raise StateError("lane map must be approved before writer claim")
+        normalized = validate_lanes(lanes, True)
+        candidate["lane_map"] = {
+            "actor": actor,
+            "origin": origin,
+            "lanes": normalized,
+            "digest": digest(normalized),
+            "approved_at_revision": candidate["revision"],
+        }
+        candidate["next_action"] = "coordinate approved complex lanes"
+        _receipt(
+            candidate,
+            "lane-map-approved",
+            f"Approved {len(normalized)} complex lanes.",
+            actor,
+        )
+
+    _transition(task, expected_revision, change)
+
+
 def validate_delivery_action(
     action: dict,
     repo: str | None = None,
@@ -547,6 +611,7 @@ def _grant_delivery(
             "head": head,
             "status": "active",
         }
+        candidate["delivery_attempt"] = None
         candidate["next_action"] = "delivery gate refreshes live PR head"
         _receipt(
             candidate,
@@ -582,6 +647,10 @@ def _revoke_delivery(
 
 
 def _invalidate(task: dict, reason: str) -> None:
+    attempt = task.get("delivery_attempt")
+    if attempt and attempt.get("status") == "prepared":
+        attempt["status"] = "invalidated"
+        attempt["invalidated_reason"] = reason
     task["review"] = None
     _archive_authority(task, "invalidated")
     task["state"] = "implementing"
@@ -626,6 +695,15 @@ def _consume_delivery(
             raise StateError("current independent review required")
         authority["status"] = "consumed"
         authority["consumed_at_revision"] = candidate["revision"]
+        candidate["delivery_attempt"] = {
+            "id": grant_id,
+            "actor": actor,
+            "action": normalized_action,
+            "action_digest": digest(normalized_action),
+            "head": live_head,
+            "status": "prepared",
+            "prepared_at_revision": candidate["revision"],
+        }
         candidate["state"] = "delivery_started"
         candidate["next_action"] = "run the single authorized external action"
         _receipt(
@@ -647,13 +725,20 @@ def _finish_delivery(
 ) -> None:
     def change(candidate: dict) -> None:
         authority = candidate.get("authority")
+        attempt = candidate.get("delivery_attempt")
         if (
             candidate["state"] != "delivery_started"
             or not authority
             or authority.get("id") != grant_id
             or authority.get("status") != "consumed"
+            or not attempt
+            or attempt.get("id") != grant_id
+            or attempt.get("status") != "prepared"
         ):
             raise StateError("delivery result does not match a consumed authority")
+        attempt["status"] = "completed" if succeeded else "failed"
+        attempt["exit_code"] = exit_code
+        attempt["finished_at_revision"] = candidate["revision"]
         candidate["state"] = "complete" if succeeded else "delivery_failed"
         candidate["next_action"] = "none" if succeeded else "user decides whether to retry"
         _receipt(
@@ -661,6 +746,75 @@ def _finish_delivery(
             "delivered" if succeeded else "delivery-failed",
             f"Typed delivery action exited {exit_code}.",
             "delivery-gate",
+        )
+
+    _transition(task, expected_revision, change)
+
+
+def _recover_delivery(
+    task: dict,
+    expected_revision: int,
+    actor: str,
+    grant_id: str,
+    observe_status: Callable[[str, str], dict] = observe_pr_status,
+) -> None:
+    def change(candidate: dict) -> None:
+        authority = candidate.get("authority") or {}
+        attempt = candidate.get("delivery_attempt") or {}
+        if (
+            candidate.get("state") != "delivery_started"
+            or authority.get("id") != grant_id
+            or authority.get("status") != "consumed"
+            or authority.get("actor") != actor
+            or attempt.get("id") != grant_id
+            or attempt.get("status") != "prepared"
+        ):
+            raise StateError("no recoverable delivery attempt for this actor")
+        action = validate_delivery_action(
+            attempt.get("action"),
+            candidate["contract"]["repo"],
+            str(candidate["contract"]["pr"]),
+        )
+        observed = observe_status(action["repo"], action["pr"])
+        if (
+            not isinstance(observed, dict)
+            or observed.get("head") != attempt.get("head")
+        ):
+            _invalidate(candidate, "delivery recovery observed head drift")
+            raise HeadDriftError(
+                "delivery recovery head does not match the prepared attempt"
+            )
+        if observed.get("merged"):
+            attempt["status"] = "completed"
+            attempt["recovered"] = True
+            attempt["finished_at_revision"] = candidate["revision"]
+            authority["recovered_at_revision"] = candidate["revision"]
+            candidate["state"] = "complete"
+            candidate["next_action"] = "none"
+            _receipt(
+                candidate,
+                "delivery-recovered",
+                "Observed the prepared exact-head PR already merged.",
+                actor,
+            )
+            return
+        if observed.get("state") != "OPEN":
+            attempt["status"] = "failed"
+            candidate["state"] = "delivery_failed"
+            candidate["next_action"] = "user decides whether to retry"
+            _receipt(
+                candidate,
+                "delivery-recovery-failed",
+                "Prepared PR is closed without a merge.",
+                actor,
+            )
+            return
+        attempt["recovery_checked_at_revision"] = candidate["revision"]
+        _receipt(
+            candidate,
+            "delivery-retry",
+            "Prepared exact-head PR remains open; retry the same action.",
+            actor,
         )
 
     _transition(task, expected_revision, change)
@@ -855,6 +1009,31 @@ def load_task(path: Path, task_id: str) -> dict:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def orchestrate_lanes(
+    path: Path,
+    task_id: str,
+    actor: str,
+    credential: str,
+    lanes: list[dict],
+) -> dict:
+    task = load_task(path, task_id)
+    approval = task.get("lane_map") or {}
+    if actor != approval.get("actor"):
+        raise StateError("complex lanes require the approving decision actor")
+    _authenticate(task, actor, credential, approval.get("origin", ""))
+    normalized = validate_lanes(lanes, True)
+    if not approval or approval.get("digest") != digest(normalized):
+        raise StateError("lane map does not match immutable decision approval")
+    return {
+        "approved": True,
+        "actor": actor,
+        "digest": approval["digest"],
+        "lanes": normalized,
+        "status": "validated",
+        "task": task_id,
+    }
+
+
 def mutate_task(
     path: Path,
     record_id: str,
@@ -884,6 +1063,12 @@ def mutate_task(
                     "review_gate",
                 )
                 _review(task, expected_revision, **arguments)
+            elif operation == "approve-lanes":
+                origin = arguments.get("origin", "")
+                if origin not in {"coordinator", "user"}:
+                    raise StateError("lane approval origin is invalid")
+                _authenticate(task, arguments.get("actor", ""), credential, origin)
+                _approve_lanes(task, expected_revision, **arguments)
             elif operation == "grant-delivery":
                 origin = arguments.get("origin", "")
                 if origin not in {"coordinator", "user"}:
@@ -913,6 +1098,20 @@ def mutate_task(
                     authority.get("origin", ""),
                 )
                 _consume_delivery(task, expected_revision, **arguments)
+            elif operation == "recover-delivery":
+                authority = task.get("authority") or {}
+                actor = arguments.get("actor", "")
+                if actor != authority.get("actor"):
+                    raise StateError(
+                        "only the active decision actor may recover delivery"
+                    )
+                _authenticate(
+                    task,
+                    actor,
+                    credential,
+                    authority.get("origin", ""),
+                )
+                _recover_delivery(task, expected_revision, **arguments)
             elif operation == "finish-delivery":
                 _finish_delivery(task, expected_revision, **arguments)
             elif operation == "checkpoint":
@@ -940,7 +1139,7 @@ def direct_delivery_reason(payload: dict) -> str | None:
     if isinstance(tool_name, str) and "github" in tool_name and "close_issue" in tool_name:
         return "direct issue closure"
     tool_input = payload.get("tool_input")
-    if tool_name != "Bash" or not isinstance(tool_input, dict):
+    if not _shell_capable_tool(payload) or not isinstance(tool_input, dict):
         return None
     command = tool_input.get("command", tool_input.get("cmd", ""))
     if not isinstance(command, str):
@@ -974,9 +1173,21 @@ def direct_delivery_reason(payload: dict) -> str | None:
     return None
 
 
+def _shell_capable_tool(payload: dict) -> bool:
+    tool_name = payload.get("tool_name", "")
+    return tool_name == "Bash" or (
+        isinstance(tool_name, str)
+        and re.search(
+            r"__(?:exec|exec_command|shell)(?:_.*)?$",
+            tool_name,
+        )
+        is not None
+    )
+
+
 def _write_capable_tool(payload: dict) -> bool:
     tool_name = payload.get("tool_name", "")
-    if tool_name in {"Bash", "Edit", "Write", "apply_patch"}:
+    if _shell_capable_tool(payload) or tool_name in {"Edit", "Write", "apply_patch"}:
         return True
     return isinstance(tool_name, str) and (
         re.search(r"__(?:edit|write)(?:_.*)?$", tool_name) is not None
@@ -1021,16 +1232,17 @@ def _ordinary_command_is_read_only(command: str) -> bool:
 
 def _control_operation(command: str) -> str | None:
     match = re.fullmatch(
-        r"\s*(?:/usr/bin/env\s+)?python3?\s+\S*voice_state\.py\s+"
-        r"(create|transition|deliver|classify|orchestrate)"
-        r"\s*(?:<\s*[^\s;&|]+)?\s*",
+        r"\s*(?:/usr/bin/env\s+)?python3?\s+"
+        r"[A-Za-z0-9_./:-]*voice_state\.py\s+"
+        r"(create|transition|deliver|recover-delivery|classify|orchestrate)"
+        r"\s*(?:<\s*[A-Za-z0-9_./:-]+)?\s*",
         command,
     )
     return match.group(1) if match else None
 
 
 def _command_from_payload(payload: dict) -> str:
-    if payload.get("tool_name") != "Bash":
+    if not _shell_capable_tool(payload):
         return ""
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -1045,13 +1257,21 @@ def _validate_control_actor(
     actor: str,
     credential: str,
 ) -> None:
-    if operation == "deliver":
+    if operation in {"deliver", "recover-delivery"}:
         authority = task.get("authority") or {}
         if actor != authority.get("actor"):
             raise StateError(
                 "typed delivery requires the active decision actor context"
             )
         _authenticate(task, actor, credential, authority.get("origin", ""))
+        return
+    if operation == "orchestrate":
+        approval = task.get("lane_map") or {}
+        if actor != approval.get("actor"):
+            raise StateError(
+                "complex lanes require the approving decision actor context"
+            )
+        _authenticate(task, actor, credential, approval.get("origin", ""))
         return
     roles = [
         role
@@ -1075,13 +1295,11 @@ def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
     command = _command_from_payload(payload)
     operation = _control_operation(command)
     if not any(present.values()):
-        if payload.get("tool_name") != "Bash":
+        if not _shell_capable_tool(payload):
             return
-        if operation in {"create", "classify", "orchestrate"}:
+        if operation in {"create", "classify"}:
             return
-        if payload.get("tool_name") == "Bash" and _ordinary_command_is_read_only(
-            command
-        ):
+        if _ordinary_command_is_read_only(command):
             return
         raise StateError(
             "non-read-only Bash requires a credentialed durable task context"
@@ -1099,7 +1317,7 @@ def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
     if operation:
         if operation == "create":
             raise StateError("task creation cannot run inside another task context")
-        if operation in {"classify", "orchestrate"}:
+        if operation == "classify":
             return
         _validate_control_actor(task, operation, actor, credential)
         return
@@ -1118,7 +1336,7 @@ def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
         or recorded_worktree != context_worktree
     ):
         raise StateError("write tool requires the active credentialed writer lease")
-    if payload.get("tool_name") == "Bash":
+    if _shell_capable_tool(payload):
         approved = task["contract"]["commands"]["implement"]
         if command not in approved:
             raise StateError(
@@ -1149,6 +1367,7 @@ def run_delivery(
     action: dict,
     observe_head: Callable[[str, str], str] = observe_pr_head,
     run_command=subprocess.run,
+    after_command: Callable[[], None] | None = None,
 ) -> dict:
     normalized_action = validate_delivery_action(action)
     started = mutate_task(
@@ -1176,17 +1395,79 @@ def run_delivery(
     ]
     result = run_command(command, check=False)
     exit_code = int(result.returncode)
+    if after_command is not None:
+        after_command()
+    if exit_code != 0:
+        raise StateError(
+            f"typed delivery action returned exit {exit_code}; "
+            "recover-delivery is required"
+        )
     finished = mutate_task(
         path,
         task_id,
         started["revision"],
         "finish-delivery",
         grant_id=grant_id,
-        succeeded=exit_code == 0,
+        succeeded=True,
         exit_code=exit_code,
     )
+    return finished
+
+
+def recover_delivery(
+    path: Path,
+    task_id: str,
+    expected_revision: int,
+    actor: str,
+    credential: str,
+    grant_id: str,
+    observe_status: Callable[[str, str], dict] = observe_pr_status,
+    run_command=subprocess.run,
+    after_command: Callable[[], None] | None = None,
+) -> dict:
+    recovered = mutate_task(
+        path,
+        task_id,
+        expected_revision,
+        "recover-delivery",
+        credential=credential,
+        actor=actor,
+        grant_id=grant_id,
+        observe_status=observe_status,
+    )
+    if recovered["state"] != "delivery_started":
+        return recovered
+    attempt = recovered["delivery_attempt"]
+    action = validate_delivery_action(attempt["action"])
+    command = [
+        "gh",
+        "pr",
+        "merge",
+        action["pr"],
+        "--repo",
+        action["repo"],
+        f"--{action['method']}",
+        "--match-head-commit",
+        attempt["head"],
+    ]
+    result = run_command(command, check=False)
+    exit_code = int(result.returncode)
+    if after_command is not None:
+        after_command()
     if exit_code != 0:
-        raise StateError(f"typed delivery action failed with exit {exit_code}")
+        raise StateError(
+            f"typed delivery recovery returned exit {exit_code}; "
+            "recover-delivery remains required"
+        )
+    finished = mutate_task(
+        path,
+        task_id,
+        recovered["revision"],
+        "finish-delivery",
+        grant_id=grant_id,
+        succeeded=True,
+        exit_code=exit_code,
+    )
     return finished
 
 
@@ -1222,6 +1503,7 @@ def main(arguments: list[str] | None = None) -> int:
                 "claim",
                 "implemented",
                 "review",
+                "approve-lanes",
                 "grant-delivery",
                 "revoke-delivery",
                 "checkpoint",
@@ -1248,6 +1530,18 @@ def main(arguments: list[str] | None = None) -> int:
                 payload["credential"],
                 payload["grant"],
                 payload["action"],
+            )
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if arguments == ["recover-delivery"]:
+            payload = _read_cli_payload()
+            result = recover_delivery(
+                Path(payload["state"]),
+                payload["task"],
+                int(payload["revision"]),
+                payload["actor"],
+                payload["credential"],
+                payload["grant"],
             )
             print(json.dumps(result, sort_keys=True))
             return 0
@@ -1279,20 +1573,27 @@ def main(arguments: list[str] | None = None) -> int:
             return 0
         if arguments == ["orchestrate"]:
             payload = _read_cli_payload()
-            if set(payload) != {"approved", "lanes"}:
+            if set(payload) != {
+                "state",
+                "task",
+                "actor",
+                "credential",
+                "lanes",
+            }:
                 raise StateError(
-                    "orchestration requires only approved and lanes fields"
+                    "orchestration requires task and decision actor approval"
                 )
-            lanes = validate_lanes(payload["lanes"], payload["approved"])
-            print(
-                json.dumps(
-                    {"approved": True, "lanes": lanes, "status": "validated"},
-                    sort_keys=True,
-                )
+            result = orchestrate_lanes(
+                Path(payload["state"]),
+                payload["task"],
+                payload["actor"],
+                payload["credential"],
+                payload["lanes"],
             )
+            print(json.dumps(result, sort_keys=True))
             return 0
         print(
-            "usage: voice_state.py create|transition|deliver|classify|orchestrate|hook",
+            "usage: voice_state.py create|transition|deliver|recover-delivery|classify|orchestrate|hook",
             file=sys.stderr,
         )
         return 1

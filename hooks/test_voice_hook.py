@@ -49,6 +49,14 @@ def bash(command):
     }
 
 
+def namespaced_exec(command):
+    return {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "functions__exec_command",
+        "tool_input": {"cmd": command},
+    }
+
+
 class VoiceHookTests(unittest.TestCase):
     def test_direct_delivery_forms_are_blocked_in_favor_of_typed_runner(self):
         payloads = [
@@ -88,6 +96,7 @@ class VoiceHookTests(unittest.TestCase):
                 "tool_name": "mcp__codex_apps__github__close_issue",
                 "tool_input": {"repo": "owner/repo", "issue_number": 9},
             },
+            namespaced_exec("gh pr merge 42 --repo owner/repo"),
         ]
         for payload in payloads:
             with self.subTest(payload=payload):
@@ -176,6 +185,14 @@ class VoiceHookTests(unittest.TestCase):
                         "CODEX_ORCHESTRATION_CREDENTIAL": TOKENS["reviewer"],
                     },
                 )
+            with self.assertRaisesRegex(StateError, "durable task context"):
+                handle_hook(
+                    bash(
+                        "python3 /installed/$(echo>x)voice_state.py "
+                        "transition < payload.json"
+                    ),
+                    {},
+                )
             handle_hook(
                 command,
                 {
@@ -208,6 +225,7 @@ class VoiceHookTests(unittest.TestCase):
                 "PWD": directory,
             }
             handle_hook(bash("npm test"), writer_environment)
+            handle_hook(namespaced_exec("npm test"), writer_environment)
             handle_hook(
                 {
                     "hook_event_name": "PreToolUse",
@@ -229,10 +247,22 @@ class VoiceHookTests(unittest.TestCase):
                 "CODEX_ORCHESTRATION_ACTOR": "reviewer",
                 "CODEX_ORCHESTRATION_CREDENTIAL": TOKENS["reviewer"],
             }
+            handle_hook(
+                bash(
+                    "python3 /installed/voice_state.py "
+                    "transition < payload.json"
+                ),
+                reviewer_environment,
+            )
             with self.assertRaisesRegex(StateError, "cannot use Bash"):
                 handle_hook(bash("npm test"), reviewer_environment)
             with self.assertRaisesRegex(StateError, "cannot use Bash"):
                 handle_hook(bash("git diff --check"), reviewer_environment)
+            with self.assertRaisesRegex(StateError, "cannot use Bash"):
+                handle_hook(
+                    namespaced_exec("git diff --check"),
+                    reviewer_environment,
+                )
             with self.assertRaisesRegex(StateError, "cannot use Bash"):
                 handle_hook(
                     {
@@ -276,6 +306,8 @@ class VoiceHookTests(unittest.TestCase):
             "mcp__filesystem__write",
             "mcp__filesystem__write_file",
             "mcp__filesystem__edit",
+            "functions__exec_command",
+            "mcp__shell__exec_command",
             "mcp__github__merge_pull_request",
         ]:
             with self.subTest(tool_name=tool_name):

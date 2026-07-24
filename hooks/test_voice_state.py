@@ -14,6 +14,8 @@ from voice_state import (
     load_task,
     mutate_task,
     observe_pr_head,
+    observe_pr_status,
+    recover_delivery,
     run_delivery,
     validate_lanes,
     work_class,
@@ -138,6 +140,35 @@ class VoiceStateTests(unittest.TestCase):
                 "headRefOid",
                 "--jq",
                 ".headRefOid",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    @patch("voice_state.subprocess.run")
+    def test_default_recovery_observer_queries_github(self, run):
+        run.return_value.stdout = json.dumps(
+            {
+                "headRefOid": "c" * 40,
+                "state": "MERGED",
+                "mergedAt": "2026-07-24T00:00:00Z",
+            }
+        )
+        self.assertEqual(
+            observe_pr_status("owner/repo", "42"),
+            {"head": "c" * 40, "state": "MERGED", "merged": True},
+        )
+        run.assert_called_once_with(
+            [
+                "gh",
+                "pr",
+                "view",
+                "42",
+                "--repo",
+                "owner/repo",
+                "--json",
+                "headRefOid,state,mergedAt",
             ],
             check=True,
             capture_output=True,
@@ -353,12 +384,12 @@ class VoiceStateTests(unittest.TestCase):
                         )
             self.assertEqual(load_task(path, "task-1")["revision"], 5)
 
-    def test_failed_typed_delivery_is_persisted_and_not_replayed(self):
+    def test_ambiguous_delivery_failure_requires_recovery_and_is_not_replayed(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             create_reviewed_task(path)
             granted = grant(path)
-            with self.assertRaisesRegex(StateError, "failed with exit 1"):
+            with self.assertRaisesRegex(StateError, "recover-delivery is required"):
                 run_delivery(
                     path,
                     "task-1",
@@ -371,7 +402,8 @@ class VoiceStateTests(unittest.TestCase):
                     run_command=lambda _command, check: SimpleNamespace(returncode=1),
                 )
             failed = load_task(path, "task-1")
-            self.assertEqual(failed["state"], "delivery_failed")
+            self.assertEqual(failed["state"], "delivery_started")
+            self.assertEqual(failed["delivery_attempt"]["status"], "prepared")
             with self.assertRaisesRegex(StateError, "one-shot"):
                 run_delivery(
                     path,
@@ -384,6 +416,110 @@ class VoiceStateTests(unittest.TestCase):
                     observe_head=lambda _repo, _pr: HEAD,
                     run_command=lambda _command, check: SimpleNamespace(returncode=0),
                 )
+            recovered = recover_delivery(
+                path,
+                "task-1",
+                failed["revision"],
+                "coordinator",
+                TOKENS["coordinator"],
+                granted["authority"]["id"],
+                observe_status=lambda _repo, _pr: {
+                    "head": HEAD,
+                    "state": "CLOSED",
+                    "merged": False,
+                },
+                run_command=lambda _command, check: self.fail(
+                    "closed recovery must not replay"
+                ),
+            )
+            self.assertEqual(recovered["state"], "delivery_failed")
+
+    def test_delivery_recovery_retries_prepared_action_after_pre_action_crash(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            create_reviewed_task(path)
+            granted = grant(path)
+            with self.assertRaisesRegex(RuntimeError, "crash before action"):
+                run_delivery(
+                    path,
+                    "task-1",
+                    5,
+                    "coordinator",
+                    TOKENS["coordinator"],
+                    granted["authority"]["id"],
+                    action(),
+                    observe_head=lambda _repo, _pr: HEAD,
+                    run_command=lambda _command, check: (
+                        _ for _ in ()
+                    ).throw(RuntimeError("crash before action")),
+                )
+            stranded = load_task(path, "task-1")
+            self.assertEqual(stranded["state"], "delivery_started")
+            self.assertEqual(stranded["delivery_attempt"]["status"], "prepared")
+            commands = []
+            recovered = recover_delivery(
+                path,
+                "task-1",
+                stranded["revision"],
+                "coordinator",
+                TOKENS["coordinator"],
+                granted["authority"]["id"],
+                observe_status=lambda _repo, _pr: {
+                    "head": HEAD,
+                    "state": "OPEN",
+                    "merged": False,
+                },
+                run_command=lambda command, check: commands.append(command)
+                or SimpleNamespace(returncode=0),
+            )
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(recovered["state"], "complete")
+            self.assertEqual(
+                recovered["delivery_attempt"]["status"],
+                "completed",
+            )
+
+    def test_delivery_recovery_observes_merge_after_post_action_crash(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            create_reviewed_task(path)
+            granted = grant(path)
+            with self.assertRaisesRegex(RuntimeError, "crash after action"):
+                run_delivery(
+                    path,
+                    "task-1",
+                    5,
+                    "coordinator",
+                    TOKENS["coordinator"],
+                    granted["authority"]["id"],
+                    action(),
+                    observe_head=lambda _repo, _pr: HEAD,
+                    run_command=lambda _command, check: SimpleNamespace(
+                        returncode=0
+                    ),
+                    after_command=lambda: (_ for _ in ()).throw(
+                        RuntimeError("crash after action")
+                    ),
+                )
+            stranded = load_task(path, "task-1")
+            recovered = recover_delivery(
+                path,
+                "task-1",
+                stranded["revision"],
+                "coordinator",
+                TOKENS["coordinator"],
+                granted["authority"]["id"],
+                observe_status=lambda _repo, _pr: {
+                    "head": HEAD,
+                    "state": "MERGED",
+                    "merged": True,
+                },
+                run_command=lambda _command, check: self.fail(
+                    "merged recovery must not replay the action"
+                ),
+            )
+            self.assertEqual(recovered["state"], "complete")
+            self.assertTrue(recovered["delivery_attempt"]["recovered"])
 
     def test_head_drift_atomically_invalidates_review_and_authority(self):
         with TemporaryDirectory() as directory:
@@ -581,28 +717,58 @@ class VoiceStateTests(unittest.TestCase):
             check=True,
         )
         self.assertEqual(json.loads(classified.stdout), {"class": "complex"})
-        orchestrated = subprocess.run(
-            [sys.executable, str(script), "orchestrate"],
-            input=json.dumps(
+        lanes = [
+            {"id": "api", "domain": "src/api"},
+            {
+                "id": "docs",
+                "domain": "docs",
+                "depends_on": ["api"],
+            },
+        ]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            create(path)
+            approved = transition(
+                path,
+                1,
+                "approve-lanes",
+                actor="coordinator",
+                origin="coordinator",
+                lanes=lanes,
+            )
+            self.assertEqual(approved["lane_map"]["actor"], "coordinator")
+            payload = {
+                "state": str(path),
+                "task": "task-1",
+                "actor": "coordinator",
+                "credential": TOKENS["coordinator"],
+                "lanes": lanes,
+            }
+            orchestrated = subprocess.run(
+                [sys.executable, str(script), "orchestrate"],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            receipt = json.loads(orchestrated.stdout)
+            self.assertEqual(receipt["status"], "validated")
+            self.assertEqual(receipt["lanes"][1]["depends_on"], ["api"])
+            for invalid in [
+                {**payload, "actor": "reviewer", "credential": TOKENS["reviewer"]},
                 {
-                    "approved": True,
-                    "lanes": [
-                        {"id": "api", "domain": "src/api"},
-                        {
-                            "id": "docs",
-                            "domain": "docs",
-                            "depends_on": ["api"],
-                        },
-                    ],
-                }
-            ),
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        receipt = json.loads(orchestrated.stdout)
-        self.assertEqual(receipt["status"], "validated")
-        self.assertEqual(receipt["lanes"][1]["depends_on"], ["api"])
+                    **payload,
+                    "lanes": [{"id": "other", "domain": "other"}],
+                },
+            ]:
+                denied = subprocess.run(
+                    [sys.executable, str(script), "orchestrate"],
+                    input=json.dumps(invalid),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(denied.returncode, 2)
 
 
 if __name__ == "__main__":
