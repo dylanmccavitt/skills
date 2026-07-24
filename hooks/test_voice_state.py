@@ -40,6 +40,13 @@ def contract():
         "owner": "coordinator",
         "branch": "feature",
         "acceptance": ["test"],
+        "commands": {
+            "implement": [
+                "npm test",
+                "git diff --check",
+                "git push origin feature",
+            ]
+        },
         "actors": {
             "coordinator": ["coordinator"],
             "user": ["user"],
@@ -152,6 +159,22 @@ class VoiceStateTests(unittest.TestCase):
 
             with self.assertRaisesRegex(StateError, "every registered actor"):
                 create_task(path, "task-1", contract(), {"writer": "secret"})
+
+            for command in [
+                r"g\h pr merge 42",
+                "npm test && gh pr merge 42",
+                "gh api repos/owner/repo/pulls/42/merge",
+                "git push origin main",
+                "bash deploy.sh",
+            ]:
+                invalid = contract()
+                invalid["commands"]["implement"] = [command]
+                with self.subTest(command=command):
+                    with self.assertRaisesRegex(
+                        StateError,
+                        "composition|scoped command policy",
+                    ):
+                        create_task(path, f"invalid-{len(command)}", invalid, TOKENS)
 
     def test_actor_credential_prevents_writer_from_impersonating_coordinator(self):
         with TemporaryDirectory() as directory:
@@ -270,6 +293,8 @@ class VoiceStateTests(unittest.TestCase):
                 path,
                 "task-1",
                 5,
+                "coordinator",
+                TOKENS["coordinator"],
                 granted["authority"]["id"],
                 action(),
                 observe_head=lambda repo, pr: observed.append((repo, pr)) or HEAD,
@@ -300,6 +325,34 @@ class VoiceStateTests(unittest.TestCase):
             self.assertEqual(result["state"], "complete")
             self.assertEqual(result["authority"]["status"], "consumed")
 
+    def test_typed_delivery_requires_the_exact_granting_decision_actor(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            create_reviewed_task(path)
+            granted = grant(path)
+            for actor in ["writer", "reviewer", "user"]:
+                with self.subTest(actor=actor):
+                    with self.assertRaisesRegex(
+                        StateError,
+                        "decision actor|credential",
+                    ):
+                        run_delivery(
+                            path,
+                            "task-1",
+                            5,
+                            actor,
+                            TOKENS[actor],
+                            granted["authority"]["id"],
+                            action(),
+                            observe_head=lambda _repo, _pr: self.fail(
+                                "unauthenticated actor must not refresh the head"
+                            ),
+                            run_command=lambda _command, check: self.fail(
+                                "unauthenticated actor must not run delivery"
+                            ),
+                        )
+            self.assertEqual(load_task(path, "task-1")["revision"], 5)
+
     def test_failed_typed_delivery_is_persisted_and_not_replayed(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -310,6 +363,8 @@ class VoiceStateTests(unittest.TestCase):
                     path,
                     "task-1",
                     5,
+                    "coordinator",
+                    TOKENS["coordinator"],
                     granted["authority"]["id"],
                     action(),
                     observe_head=lambda _repo, _pr: HEAD,
@@ -322,6 +377,8 @@ class VoiceStateTests(unittest.TestCase):
                     path,
                     "task-1",
                     failed["revision"],
+                    "coordinator",
+                    TOKENS["coordinator"],
                     granted["authority"]["id"],
                     action(),
                     observe_head=lambda _repo, _pr: HEAD,
@@ -338,6 +395,8 @@ class VoiceStateTests(unittest.TestCase):
                     path,
                     "task-1",
                     5,
+                    "coordinator",
+                    TOKENS["coordinator"],
                     granted["authority"]["id"],
                     action(),
                     observe_head=lambda _repo, _pr: "b" * 40,
@@ -436,6 +495,30 @@ class VoiceStateTests(unittest.TestCase):
                 with self.assertRaisesRegex(StateError, "ownership domains"):
                     validate_lanes(lanes, True)
 
+    def test_lane_dependencies_are_known_and_acyclic(self):
+        validated = validate_lanes(
+            [
+                {"id": "api", "domain": "src/api"},
+                {
+                    "id": "docs",
+                    "domain": "docs",
+                    "depends_on": ["api"],
+                },
+            ],
+            True,
+        )
+        self.assertEqual(validated[1]["depends_on"], ["api"])
+        for lanes in [
+            [{"id": "a", "domain": "a", "depends_on": ["missing"]}],
+            [
+                {"id": "a", "domain": "a", "depends_on": ["b"]},
+                {"id": "b", "domain": "b", "depends_on": ["a"]},
+            ],
+        ]:
+            with self.subTest(lanes=lanes):
+                with self.assertRaisesRegex(StateError, "dependencies"):
+                    validate_lanes(lanes, True)
+
     def test_control_cli_can_create_and_transition_a_task(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -480,6 +563,46 @@ class VoiceStateTests(unittest.TestCase):
         self.assertEqual(work_class(False, True, False, False), "complex")
         with self.assertRaises(StateError):
             validate_lanes([{"id": "a", "domain": "src"}], False)
+
+    def test_classification_and_approved_lane_map_are_available_through_cli(self):
+        script = Path(__file__).with_name("voice_state.py")
+        classified = subprocess.run(
+            [sys.executable, str(script), "classify"],
+            input=json.dumps(
+                {
+                    "needs_branch": False,
+                    "concurrent": True,
+                    "external_effect": False,
+                    "high_risk": False,
+                }
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(json.loads(classified.stdout), {"class": "complex"})
+        orchestrated = subprocess.run(
+            [sys.executable, str(script), "orchestrate"],
+            input=json.dumps(
+                {
+                    "approved": True,
+                    "lanes": [
+                        {"id": "api", "domain": "src/api"},
+                        {
+                            "id": "docs",
+                            "domain": "docs",
+                            "depends_on": ["api"],
+                        },
+                    ],
+                }
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        receipt = json.loads(orchestrated.stdout)
+        self.assertEqual(receipt["status"], "validated")
+        self.assertEqual(receipt["lanes"][1]["depends_on"], ["api"])
 
 
 if __name__ == "__main__":

@@ -22,11 +22,11 @@ The coordinator/user approves scope, revisions, stops, and every external delive
 
 ## Safety kernel
 
-The kernel records compact task contracts, credential hashes, registered role owners, writer ownership, receipts, proof, and authority. Persisted transitions use locked compare-and-swap updates and atomic replacement. Review Gate is credentialed separately from Implement and decision actors; checkpoint freezes the outgoing writer before transferring ownership to a confirmed successor.
+The kernel records compact task contracts, exact Implement command permissions, credential hashes, registered role owners, writer ownership, receipts, proof, and authority. Persisted transitions use locked compare-and-swap updates and atomic replacement. Review Gate is credentialed separately from Implement and decision actors; checkpoint freezes the outgoing writer before transferring ownership to a confirmed successor.
 
-`voice_state.py create` provisions a task and one capability per actor. `transition` applies credentialed state changes. `deliver` is the only supported external-action path: it refreshes the approved PR head, consumes the grant once, and invokes `gh pr merge` with `--match-head-commit`.
+`voice_state.py create` provisions a task and one capability per actor. `transition` applies credentialed state changes. `deliver` also requires the exact granting decision actor and capability; it is the only supported external-action path, refreshes the approved PR head, consumes the grant once, and invokes `gh pr merge` with `--match-head-commit`. `classify` distinguishes ordinary, durable, and complex work; `orchestrate` accepts only a user-approved non-overlapping acyclic lane map.
 
-Durable tasks carry state, task, actor, capability, and worktree context in `CODEX_ORCHESTRATION_*`. The installed hook checks that live lease before Bash or file writes, keeps Review Gate commands read-only, freezes a checkpointed writer, and blocks direct merge, protected-branch push, issue-close, publish, and production-deploy commands. Ordinary tasks omit that context and stay outside the registry.
+Durable tasks carry state, task, actor, capability, and worktree context in `CODEX_ORCHESTRATION_*`. The installed hook checks the live lease before Bash or file writes, permits durable writers only exact contract-listed Bash commands, and denies Review Gate all shell and write-capable tools. Ordinary tasks omit that context: structured local edits remain available, while Bash is limited to literal read-only inspection. Delivery, protected-branch push, issue closure, publishing, and production deployment cannot ride through unregistered or composed shell commands.
 
 ## Install
 

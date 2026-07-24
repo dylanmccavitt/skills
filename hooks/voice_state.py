@@ -10,6 +10,7 @@ import os
 import posixpath
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -69,12 +70,17 @@ def work_class(
     return "ordinary"
 
 
-def validate_lanes(lanes: list[dict], approved: bool) -> None:
+def validate_lanes(lanes: list[dict], approved: bool) -> list[dict]:
     if not approved:
         raise StateError("complex lane map requires user approval")
+    if not isinstance(lanes, list) or not lanes:
+        raise StateError("complex lane map requires at least one lane")
     seen = set()
     domains = []
+    normalized_lanes = []
     for lane in lanes:
+        if not isinstance(lane, dict):
+            raise StateError("lanes require unique ids and ownership domains")
         lane_id, domain = lane.get("id"), lane.get("domain")
         normalized = (
             posixpath.normpath(domain.replace("\\", "/")).strip("/").casefold()
@@ -92,15 +98,117 @@ def validate_lanes(lanes: list[dict], approved: bool) -> None:
             for existing in domains
         )
         if (
-            not lane_id
+            not isinstance(lane_id, str)
+            or not lane_id
             or normalized == ".."
             or normalized.startswith("../")
             or lane_id in seen
             or overlaps
         ):
             raise StateError("lanes require unique ids and ownership domains")
+        dependencies = lane.get("depends_on", [])
+        if (
+            not isinstance(dependencies, list)
+            or any(not isinstance(item, str) or not item for item in dependencies)
+            or len(set(dependencies)) != len(dependencies)
+            or lane_id in dependencies
+        ):
+            raise StateError("lanes require valid dependency ids")
         seen.add(lane_id)
         domains.append(normalized)
+        normalized_lanes.append(
+            {
+                "id": lane_id,
+                "domain": normalized,
+                "depends_on": list(dependencies),
+            }
+        )
+
+    unknown = {
+        dependency
+        for lane in normalized_lanes
+        for dependency in lane["depends_on"]
+        if dependency not in seen
+    }
+    if unknown:
+        raise StateError("lane dependencies must reference approved lanes")
+
+    visiting = set()
+    visited = set()
+    dependencies_by_lane = {
+        lane["id"]: lane["depends_on"] for lane in normalized_lanes
+    }
+
+    def visit(lane_id: str) -> None:
+        if lane_id in visiting:
+            raise StateError("lane dependencies must be acyclic")
+        if lane_id in visited:
+            return
+        visiting.add(lane_id)
+        for dependency in dependencies_by_lane[lane_id]:
+            visit(dependency)
+        visiting.remove(lane_id)
+        visited.add(lane_id)
+
+    for lane_id in dependencies_by_lane:
+        visit(lane_id)
+    return normalized_lanes
+
+
+def _validated_commands(contract: dict) -> dict[str, list[str]]:
+    commands = contract.get("commands")
+    if not isinstance(commands, dict) or set(commands) != {"implement"}:
+        raise StateError("contract commands must define only implement")
+    approved = commands["implement"]
+    if (
+        not isinstance(approved, list)
+        or any(
+            not isinstance(command, str)
+            or not command
+            or command != command.strip()
+            or "\n" in command
+            or "\r" in command
+            for command in approved
+        )
+        or len(set(approved)) != len(approved)
+    ):
+        raise StateError("implement commands must be unique exact command strings")
+    for command in approved:
+        if re.search(r"""[\\'"`$;&|<>\n\r()]""", command):
+            raise StateError(
+                "implement commands cannot use shell composition or indirection"
+            )
+        words = shlex.split(command)
+        if (
+            not words
+            or words[0] in {"bash", "sh", "zsh", "fish"}
+            or (words[0] in {"python", "python3", "node"} and any(
+                flag in words[1:] for flag in {"-c", "-e", "--eval"}
+            ))
+            or (
+                words[0] == "gh"
+                and not (
+                    len(words) >= 3
+                    and words[1] == "pr"
+                    and words[2] in {"view", "diff", "checks"}
+                )
+            )
+            or (
+                words[:2] == ["git", "push"]
+                and (
+                    len(words) != 4
+                    or words[2] != "origin"
+                    or words[3] != contract["branch"]
+                    or words[3].casefold() in {"main", "master"}
+                )
+            )
+            or words[:2] == ["npm", "publish"]
+            or words[0] in {"curl", "wget"}
+        ):
+            raise StateError(
+                "implement command is outside the scoped command policy"
+            )
+    return {"implement": list(approved)}
 
 
 def _validated_actors(contract: dict) -> dict[str, list[str]]:
@@ -152,6 +260,7 @@ def new_task(
         "acceptance",
         "actors",
         "branch",
+        "commands",
         "intent",
         "non_scope",
         "owner",
@@ -171,6 +280,7 @@ def new_task(
     if not str(contract["pr"]).isdigit():
         raise StateError("contract PR must be an explicit number")
     actors = _validated_actors(contract)
+    _validated_commands(contract)
     actor_ids = {actor for members in actors.values() for actor in members}
     if set(credential_hashes) != actor_ids or any(
         not FULL_DIGEST.fullmatch(value) for value in credential_hashes.values()
@@ -482,6 +592,7 @@ def _invalidate(task: dict, reason: str) -> None:
 def _consume_delivery(
     task: dict,
     expected_revision: int,
+    actor: str,
     grant_id: str,
     action: dict,
     observe_head: Callable[[str, str], str] = observe_pr_head,
@@ -497,6 +608,7 @@ def _consume_delivery(
             not authority
             or authority.get("id") != grant_id
             or authority.get("status") != "active"
+            or authority.get("actor") != actor
             or authority.get("action_digest") != digest(normalized_action)
         ):
             raise StateError("no active one-shot delivery authority for this exact action")
@@ -788,6 +900,18 @@ def mutate_task(
                 )
                 _revoke_delivery(task, expected_revision, **arguments)
             elif operation == "consume-delivery":
+                authority = task.get("authority") or {}
+                actor = arguments.get("actor", "")
+                if actor != authority.get("actor"):
+                    raise StateError(
+                        "only the active decision actor may consume delivery authority"
+                    )
+                _authenticate(
+                    task,
+                    actor,
+                    credential,
+                    authority.get("origin", ""),
+                )
                 _consume_delivery(task, expected_revision, **arguments)
             elif operation == "finish-delivery":
                 _finish_delivery(task, expected_revision, **arguments)
@@ -855,35 +979,88 @@ def _write_capable_tool(payload: dict) -> bool:
     if tool_name in {"Bash", "Edit", "Write", "apply_patch"}:
         return True
     return isinstance(tool_name, str) and (
-        tool_name.endswith("__edit")
-        or tool_name.endswith("__write")
+        re.search(r"__(?:edit|write)(?:_.*)?$", tool_name) is not None
         or tool_name.endswith("__apply_patch")
     )
 
 
-def _review_command_is_read_only(command: str) -> bool:
-    if re.search(r"[<>]|\||--output(?:=|\s)|\s-(?:i|delete|exec)\b", command):
+def _ordinary_command_is_read_only(command: str) -> bool:
+    if (
+        not isinstance(command, str)
+        or not command
+        or re.search(r"""[\\'"`$;&|<>\n\r()]""", command)
+    ):
         return False
-    allowed = (
-        r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
-        r"(?:git\s+(?:diff|status|show|log|rev-parse)\b"
-        r"|rg\b|ls\b|head\b|tail\b"
-        r"|npm\s+test\b|node\s+--test\b"
-        r"|python3?\s+-m\s+(?:unittest|pytest)\b|pytest\b"
-        r"|gh\s+pr\s+(?:view|diff|checks)\b)"
-    )
-    parts = [part.strip() for part in re.split(r"&&|\|\||[;\n]", command)]
-    return bool(parts) and all(re.fullmatch(allowed + r".*", part) for part in parts)
-
-
-def _control_command(command: str) -> bool:
-    return bool(
-        re.fullmatch(
-            r"\s*(?:/usr/bin/env\s+)?python3?\s+\S*voice_state\.py\s+"
-            r"(?:create|transition|deliver)\s*(?:<\s*[^\s;&|]+)?\s*",
-            command,
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if not words:
+        return False
+    if words[0] == "git" and len(words) >= 2:
+        if words[1] not in {"diff", "status", "show", "log", "rev-parse"}:
+            return False
+        forbidden = {
+            "--ext-diff",
+            "--textconv",
+            "--output",
+            "--paginate",
+            "-p",
+        }
+        return not any(
+            word in forbidden or word.startswith("--output=") for word in words[2:]
         )
+    if words[0] == "gh" and len(words) >= 3:
+        return words[1] == "pr" and words[2] in {"view", "diff", "checks"}
+    if words[0] == "rg":
+        return not any(
+            word == "--pre" or word.startswith("--pre=") for word in words[1:]
+        )
+    return words[0] in {"ls", "head", "tail", "pwd"} and words[0] == command.split()[0]
+
+
+def _control_operation(command: str) -> str | None:
+    match = re.fullmatch(
+        r"\s*(?:/usr/bin/env\s+)?python3?\s+\S*voice_state\.py\s+"
+        r"(create|transition|deliver|classify|orchestrate)"
+        r"\s*(?:<\s*[^\s;&|]+)?\s*",
+        command,
     )
+    return match.group(1) if match else None
+
+
+def _command_from_payload(payload: dict) -> str:
+    if payload.get("tool_name") != "Bash":
+        return ""
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return ""
+    command = tool_input.get("command", tool_input.get("cmd", ""))
+    return command if isinstance(command, str) else ""
+
+
+def _validate_control_actor(
+    task: dict,
+    operation: str,
+    actor: str,
+    credential: str,
+) -> None:
+    if operation == "deliver":
+        authority = task.get("authority") or {}
+        if actor != authority.get("actor"):
+            raise StateError(
+                "typed delivery requires the active decision actor context"
+            )
+        _authenticate(task, actor, credential, authority.get("origin", ""))
+        return
+    roles = [
+        role
+        for role in ("coordinator", "user", "implement", "review_gate")
+        if _actor_has_role(task, actor, role)
+    ]
+    if not roles:
+        raise StateError("control command actor is not registered")
+    _authenticate(task, actor, credential, roles[0])
 
 
 def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
@@ -895,8 +1072,20 @@ def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
         "worktree": "CODEX_ORCHESTRATION_WORKTREE",
     }
     present = {key: environment.get(name, "") for key, name in names.items()}
+    command = _command_from_payload(payload)
+    operation = _control_operation(command)
     if not any(present.values()):
-        return
+        if payload.get("tool_name") != "Bash":
+            return
+        if operation in {"create", "classify", "orchestrate"}:
+            return
+        if payload.get("tool_name") == "Bash" and _ordinary_command_is_read_only(
+            command
+        ):
+            return
+        raise StateError(
+            "non-read-only Bash requires a credentialed durable task context"
+        )
     missing = [names[key] for key, value in present.items() if not value]
     if missing:
         raise StateError(f"incomplete orchestration writer context: {', '.join(missing)}")
@@ -907,26 +1096,16 @@ def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
     context_worktree = str(Path(present["worktree"]).resolve())
     if actual_worktree != context_worktree:
         raise StateError("tool worktree does not match orchestration context")
-    command = ""
-    if payload.get("tool_name") == "Bash":
-        tool_input = payload.get("tool_input")
-        if isinstance(tool_input, dict):
-            command = tool_input.get("command", tool_input.get("cmd", ""))
-    if isinstance(command, str) and _control_command(command):
-        roles = [
-            role
-            for role in ("coordinator", "user", "implement", "review_gate")
-            if _actor_has_role(task, actor, role)
-        ]
-        if not roles:
-            raise StateError("control command actor is not registered")
-        _authenticate(task, actor, credential, roles[0])
+    if operation:
+        if operation == "create":
+            raise StateError("task creation cannot run inside another task context")
+        if operation in {"classify", "orchestrate"}:
+            return
+        _validate_control_actor(task, operation, actor, credential)
         return
     if _actor_has_role(task, actor, "review_gate"):
         _authenticate(task, actor, credential, "review_gate")
-        if payload.get("tool_name") == "Bash" and _review_command_is_read_only(command):
-            return
-        raise StateError("Review Gate tool use is read-only")
+        raise StateError("Review Gate cannot use Bash or write-capable tools")
     _authenticate(task, actor, credential, "implement")
     writer = task.get("writer")
     recorded_worktree = (
@@ -939,6 +1118,12 @@ def _validate_tool_lease(payload: dict, environment: dict[str, str]) -> None:
         or recorded_worktree != context_worktree
     ):
         raise StateError("write tool requires the active credentialed writer lease")
+    if payload.get("tool_name") == "Bash":
+        approved = task["contract"]["commands"]["implement"]
+        if command not in approved:
+            raise StateError(
+                "Bash command is not an exact contract-approved implement command"
+            )
 
 
 def handle_hook(payload: dict, environment: dict[str, str] | None = None) -> None:
@@ -958,6 +1143,8 @@ def run_delivery(
     path: Path,
     task_id: str,
     expected_revision: int,
+    actor: str,
+    credential: str,
     grant_id: str,
     action: dict,
     observe_head: Callable[[str, str], str] = observe_pr_head,
@@ -969,6 +1156,8 @@ def run_delivery(
         task_id,
         expected_revision,
         "consume-delivery",
+        credential=credential,
+        actor=actor,
         grant_id=grant_id,
         action=normalized_action,
         observe_head=observe_head,
@@ -1055,13 +1244,55 @@ def main(arguments: list[str] | None = None) -> int:
                 Path(payload["state"]),
                 payload["task"],
                 int(payload["revision"]),
+                payload["actor"],
+                payload["credential"],
                 payload["grant"],
                 payload["action"],
             )
             print(json.dumps(result, sort_keys=True))
             return 0
+        if arguments == ["classify"]:
+            payload = _read_cli_payload()
+            expected = {
+                "needs_branch",
+                "concurrent",
+                "external_effect",
+                "high_risk",
+            }
+            if set(payload) != expected or any(
+                not isinstance(payload[name], bool) for name in expected
+            ):
+                raise StateError("classification requires four explicit booleans")
+            print(
+                json.dumps(
+                    {
+                        "class": work_class(
+                            payload["needs_branch"],
+                            payload["concurrent"],
+                            payload["external_effect"],
+                            payload["high_risk"],
+                        )
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if arguments == ["orchestrate"]:
+            payload = _read_cli_payload()
+            if set(payload) != {"approved", "lanes"}:
+                raise StateError(
+                    "orchestration requires only approved and lanes fields"
+                )
+            lanes = validate_lanes(payload["lanes"], payload["approved"])
+            print(
+                json.dumps(
+                    {"approved": True, "lanes": lanes, "status": "validated"},
+                    sort_keys=True,
+                )
+            )
+            return 0
         print(
-            "usage: voice_state.py create|transition|deliver|hook",
+            "usage: voice_state.py create|transition|deliver|classify|orchestrate|hook",
             file=sys.stderr,
         )
         return 1

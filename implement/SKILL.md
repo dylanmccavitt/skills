@@ -9,7 +9,7 @@ Role: sole writer for one approved task.
 
 Input: approved task contract with repository and PR, registered Implement actor capability, writer claim, and exact branch/worktree context.
 
-Allowed: claim the single writer slot through the locked state kernel; edit only contract scope; test, commit, push, and open one PR when the contract permits.
+Allowed: claim the single writer slot through the locked state kernel; edit only contract scope; run only exact commands listed in the immutable task contract; commit, push, and open one PR when the contract permits.
 
 Forbidden: change scope, use another actor's capability, bypass revision checks, self-review, merge, close issues, deploy, or grant/accept delivery authority.
 

@@ -1,3 +1,5 @@
+import json
+import re
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,6 +13,7 @@ TOKENS = {
     "successor": "successor-secret",
     "reviewer": "reviewer-secret",
 }
+HEAD = "a" * 40
 
 
 def contract():
@@ -23,6 +26,13 @@ def contract():
         "owner": "coordinator",
         "branch": "feature",
         "acceptance": ["tests"],
+        "commands": {
+            "implement": [
+                "npm test",
+                "git diff --check",
+                "git push origin feature",
+            ]
+        },
         "actors": {
             "coordinator": ["coordinator"],
             "implement": ["writer", "successor"],
@@ -52,6 +62,16 @@ class VoiceHookTests(unittest.TestCase):
             bash("git -C . push origin main"),
             bash("git push origin +main"),
             bash('python3 -c \'import subprocess; subprocess.run(["gh","pr","merge","42"])\''),
+            bash(r"g\h pr merge 42 --repo owner/repo"),
+            bash("'g''h' pr merge 42 --repo owner/repo"),
+            bash('a=g; b=h; "$a$b" pr merge 42 --repo owner/repo'),
+            bash(
+                "python3 -c 'import subprocess as s;"
+                "s.run([chr(103)+chr(104),chr(112)+chr(114),"
+                "chr(109)+chr(101)+chr(114)+chr(103)+chr(101)])'"
+            ),
+            bash(r"npm test && g\h pr merge 42 --repo owner/repo"),
+            bash('branch=main; git push origin "HEAD:$branch"'),
             bash("bash -lc 'npm publish'"),
             bash("gh pr merge 42 --repo owner/repo && gh issue close 9"),
             {
@@ -71,11 +91,99 @@ class VoiceHookTests(unittest.TestCase):
         ]
         for payload in payloads:
             with self.subTest(payload=payload):
-                with self.assertRaisesRegex(StateError, "typed voice_state.py deliver"):
+                with self.assertRaises(StateError):
                     handle_hook(payload)
 
-    def test_safe_branch_push_is_not_blocked(self):
-        handle_hook(bash("git push origin feat/voice-first-control-plane"))
+    def test_ordinary_bash_is_literal_read_only(self):
+        handle_hook(bash("git status --short"))
+        handle_hook(bash("gh pr view 42 --repo owner/repo"))
+        for command in [
+            "git push origin feature",
+            "npm test",
+            "git status; gh pr merge 42",
+            "rg --pre malicious pattern .",
+            "git diff --ext-diff",
+        ]:
+            with self.subTest(command=command):
+                with self.assertRaises(StateError):
+                    handle_hook(bash(command))
+
+    def test_typed_delivery_hook_requires_the_granting_decision_actor(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            create_task(path, "task-1", contract(), TOKENS)
+            mutate_task(
+                path,
+                "task-1",
+                1,
+                "claim",
+                credential=TOKENS["writer"],
+                actor="writer",
+                branch="feature",
+                worktree=directory,
+            )
+            mutate_task(
+                path,
+                "task-1",
+                2,
+                "implemented",
+                credential=TOKENS["writer"],
+                actor="writer",
+                head=HEAD,
+                checks=["npm test"],
+            )
+            mutate_task(
+                path,
+                "task-1",
+                3,
+                "review",
+                credential=TOKENS["reviewer"],
+                actor="reviewer",
+                head=HEAD,
+                passed=True,
+            )
+            mutate_task(
+                path,
+                "task-1",
+                4,
+                "grant-delivery",
+                credential=TOKENS["coordinator"],
+                actor="coordinator",
+                origin="coordinator",
+                head=HEAD,
+                action={
+                    "kind": "github_merge",
+                    "repo": "owner/repo",
+                    "pr": "42",
+                    "method": "squash",
+                },
+            )
+            command = bash("python3 /installed/voice_state.py deliver < payload.json")
+            base_environment = {
+                "CODEX_ORCHESTRATION_STATE": str(path),
+                "CODEX_ORCHESTRATION_TASK": "task-1",
+                "CODEX_ORCHESTRATION_WORKTREE": directory,
+                "PWD": directory,
+            }
+            with self.assertRaisesRegex(StateError, "durable task context"):
+                handle_hook(command, {})
+            with self.assertRaisesRegex(StateError, "decision actor"):
+                handle_hook(
+                    command,
+                    {
+                        **base_environment,
+                        "CODEX_ORCHESTRATION_ACTOR": "reviewer",
+                        "CODEX_ORCHESTRATION_CREDENTIAL": TOKENS["reviewer"],
+                    },
+                )
+            handle_hook(
+                command,
+                {
+                    **base_environment,
+                    "CODEX_ORCHESTRATION_ACTOR": "coordinator",
+                    "CODEX_ORCHESTRATION_CREDENTIAL": TOKENS["coordinator"],
+                },
+            )
 
     def test_durable_write_tools_require_the_active_writer_lease(self):
         with TemporaryDirectory() as directory:
@@ -100,6 +208,16 @@ class VoiceHookTests(unittest.TestCase):
                 "PWD": directory,
             }
             handle_hook(bash("npm test"), writer_environment)
+            handle_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "functions__apply_patch",
+                    "tool_input": {},
+                },
+                writer_environment,
+            )
+            with self.assertRaisesRegex(StateError, "exact contract-approved"):
+                handle_hook(bash("npm test && git diff --check"), writer_environment)
             with self.assertRaisesRegex(StateError, "worktree"):
                 handle_hook(
                     bash("npm test"),
@@ -111,14 +229,24 @@ class VoiceHookTests(unittest.TestCase):
                 "CODEX_ORCHESTRATION_ACTOR": "reviewer",
                 "CODEX_ORCHESTRATION_CREDENTIAL": TOKENS["reviewer"],
             }
-            handle_hook(bash("npm test && git diff --check"), reviewer_environment)
-            with self.assertRaisesRegex(StateError, "read-only"):
-                handle_hook(bash("echo changed > tracked.txt"), reviewer_environment)
-            with self.assertRaisesRegex(StateError, "read-only"):
+            with self.assertRaisesRegex(StateError, "cannot use Bash"):
+                handle_hook(bash("npm test"), reviewer_environment)
+            with self.assertRaisesRegex(StateError, "cannot use Bash"):
+                handle_hook(bash("git diff --check"), reviewer_environment)
+            with self.assertRaisesRegex(StateError, "cannot use Bash"):
                 handle_hook(
                     {
                         "hook_event_name": "PreToolUse",
-                        "tool_name": "apply_patch",
+                        "tool_name": "mcp__filesystem__write",
+                        "tool_input": {},
+                    },
+                    reviewer_environment,
+                )
+            with self.assertRaisesRegex(StateError, "cannot use Bash"):
+                handle_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "mcp__filesystem__edit",
                         "tool_input": {},
                     },
                     reviewer_environment,
@@ -136,6 +264,22 @@ class VoiceHookTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(StateError, "writer lease"):
                 handle_hook(bash("npm test"), writer_environment)
+
+    def test_installed_matcher_covers_namespaced_write_tools(self):
+        matcher = json.loads(Path(__file__).with_name("hooks.json").read_text())[
+            "hooks"
+        ]["PreToolUse"][0]["matcher"]
+        for tool_name in [
+            "Bash",
+            "apply_patch",
+            "functions__apply_patch",
+            "mcp__filesystem__write",
+            "mcp__filesystem__write_file",
+            "mcp__filesystem__edit",
+            "mcp__github__merge_pull_request",
+        ]:
+            with self.subTest(tool_name=tool_name):
+                self.assertIsNotNone(re.fullmatch(matcher, tool_name))
 
 
 if __name__ == "__main__":

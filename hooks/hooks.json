@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Bash|Edit|Write|apply_patch|.*github.*(?:merge_pull_request|close_issue).*)$",
+        "matcher": "^(Bash|Edit|Write|apply_patch|.*__apply_patch|.*__(?:edit|write)(?:_.*)?|.*github.*(?:merge_pull_request|close_issue).*)$",
         "hooks": [
           {
             "type": "command",
