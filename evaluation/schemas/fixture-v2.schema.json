@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dylanmccavitt/skills/evaluation/schemas/fixture-v2.schema.json",
+  "title": "Public Evaluation Fixture Version 2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "fixture_id", "fixture_version", "scenario_kind", "prompt", "acceptance_criteria", "seed_repository", "initial_repository", "grader"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "fixture_id": {"const": "checkpoint-continuation-v2"},
+    "fixture_version": {"const": 2},
+    "scenario_kind": {"const": "checkpoint_continuation"},
+    "prompt": {"type": "string"},
+    "acceptance_criteria": {"type": "string"},
+    "seed_repository": {"type": "string"},
+    "initial_repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_branch", "initial_ref", "clean_worktree"],
+      "properties": {
+        "default_branch": {"type": "string"},
+        "initial_ref": {"type": "string"},
+        "clean_worktree": {"const": true}
+      }
+    },
+    "grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "digest"],
+      "properties": {
+        "id": {"type": "string"},
+        "version": {"const": 2},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

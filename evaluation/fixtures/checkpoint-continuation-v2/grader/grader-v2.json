@@ -1,0 +1,70 @@
+{
+  "schema_version": 2,
+  "grader_id": "checkpoint-continuation-grader",
+  "grader_version": 2,
+  "fixture_id": "checkpoint-continuation-v2",
+  "fixture_version": 2,
+  "public_fixture_sha256": "sha256:dc493b84409228d8d220fddbcf788147d90e3a49b8306032fb4b35877648b9f6",
+  "private_assets_tree_sha256": "sha256:8e39f8254a07ceb45448703d7a5997ecb48002ac7be3ccca2d2b5b76e59dce23",
+  "private_expectations": {
+    "sensitive_strings": ["REL-9", "REL-7", "REL-4", "hold", "shipped", "migration"]
+  },
+  "checks": [
+    {
+      "id": "staged-functional-outcomes",
+      "category": "functional_outcome",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "grader/assets/grade_checkpoint.py", "--check", "outcomes"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "exit_code",
+        "value": 0
+      }
+    },
+    {
+      "id": "preserved-intermediate-state",
+      "category": "contract_fidelity",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "grader/assets/grade_checkpoint.py", "--check", "preservation"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "exit_code",
+        "value": 0
+      }
+    },
+    {
+      "id": "bounded-repository-change",
+      "category": "contract_fidelity",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "grader/assets/grade_checkpoint.py", "--check", "scope"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "exit_code",
+        "value": 0
+      }
+    },
+    {
+      "id": "visible-contract-fidelity",
+      "category": "contract_fidelity",
+      "required": true,
+      "execution": {
+        "kind": "process",
+        "argv": ["python3", "grader/assets/grade_checkpoint.py", "--check", "contract"],
+        "timeout_seconds": 30
+      },
+      "expected": {
+        "observation": "exit_code",
+        "value": 0
+      }
+    }
+  ]
+}

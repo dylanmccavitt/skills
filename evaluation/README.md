@@ -14,6 +14,8 @@ production safety, or identify a winning workflow.
 ## Versioned layout
 
 - `suite-v1.json` indexes exactly the version 1 baseline fixtures.
+- `suite-v2.json` preserves those exact version 1 bindings and adds one frozen
+  long-delivery checkpoint-continuation fixture.
 - `schemas/` defines strict suite, public fixture, held-out grader, replay trace,
   run manifest, JSONL event record, and run result shapes.
 - `fixtures/<fixture-id>/public/` is the only tree a future runner may copy into
@@ -33,6 +35,14 @@ An indexed contract version is immutable. Any incompatible schema, fixture, or
 evidence change requires a new version and new digests. Version 1 public assets
 are UTF-8 text; validation fails closed on undecodable content so binary files
 cannot bypass grader-leakage checks.
+
+The version 2 checkpoint-continuation fixture is benchmark input only. It
+provides a deterministic staged seed task and held-out outcome contract for
+future comparable runs; it is not a live run and records no cache, context,
+token, cost, latency, provider, or quality evidence. No conclusion about those
+measures is valid without separately approved provenance-bearing live evidence,
+comparable run inputs, and a held-out grade. Deferred issue #36 remains the
+owner of live cache and context economics capture.
 
 ## Canonical bytes and digests
 

@@ -130,9 +130,14 @@ def _exact_keys(
     return value
 
 
-def _version_one(value: Any, label: str) -> None:
-    if value != 1 or isinstance(value, bool):
+def _version(value: Any, label: str, *, supported: set[int]) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value not in supported
+    ):
         raise ContractError(f"{label}: unsupported version: {value!r}")
+    return value
 
 
 def tree_digest(root: Path) -> str:
@@ -179,15 +184,26 @@ def public_fixture_digest(
     )
 
 
-def validate_suite_shape(value: dict[str, Any]) -> list[dict[str, Any]]:
+def validate_suite_shape(
+    value: dict[str, Any], *, expected_version: int
+) -> list[dict[str, Any]]:
     _exact_keys(
         value,
         "suite",
         {"schema_version", "suite_id", "suite_version", "fixtures"},
     )
-    _version_one(value["schema_version"], "suite.schema_version")
+    _version(
+        value["schema_version"],
+        "suite.schema_version",
+        supported={expected_version},
+    )
     _identifier(value["suite_id"], "suite.suite_id")
-    _version_one(value["suite_version"], "suite.suite_version")
+    if value["suite_id"] != "orchestration-baselines":
+        raise ContractError("suite.suite_id: unsupported suite identity")
+    if value["suite_version"] != expected_version:
+        raise ContractError(
+            "suite.suite_version: must match the schema and index version"
+        )
     fixtures = value["fixtures"]
     if not isinstance(fixtures, list) or not fixtures:
         raise ContractError("suite.fixtures: must be a non-empty array")
@@ -211,8 +227,20 @@ def validate_suite_shape(value: dict[str, Any]) -> list[dict[str, Any]]:
         if fixture_id in seen:
             raise ContractError(f"{label}: duplicate fixture ID: {fixture_id}")
         seen.add(fixture_id)
-        _version_one(entry["fixture_version"], f"{label}.fixture_version")
-        _safe_relative_path(entry["manifest"], f"{label}.manifest")
+        fixture_version = _version(
+            entry["fixture_version"],
+            f"{label}.fixture_version",
+            supported={1, 2},
+        )
+        manifest = _safe_relative_path(entry["manifest"], f"{label}.manifest")
+        expected_manifest = (
+            PurePosixPath("fixtures")
+            / fixture_id
+            / "public"
+            / f"manifest-v{fixture_version}.json"
+        )
+        if manifest != expected_manifest:
+            raise ContractError(f"{label}.manifest: identity/version mismatch")
         for field in (
             "public_manifest_sha256",
             "public_payload_tree_sha256",
@@ -220,16 +248,34 @@ def validate_suite_shape(value: dict[str, Any]) -> list[dict[str, Any]]:
             "grader_contract_sha256",
         ):
             _digest(entry[field], f"{label}.{field}")
-    expected = {"low-risk-existing-tests-v1", "seeded-review-defects-v1"}
-    if seen != expected:
+    expected = {
+        "low-risk-existing-tests-v1": 1,
+        "seeded-review-defects-v1": 1,
+    }
+    if expected_version == 2:
+        expected["checkpoint-continuation-v2"] = 2
+    if seen != set(expected):
         raise ContractError(
-            "suite.fixtures: version 1 must contain exactly "
+            f"suite.fixtures: version {expected_version} must contain exactly "
             + ", ".join(sorted(expected))
+        )
+    observed_versions = {
+        entry["fixture_id"]: entry["fixture_version"] for entry in fixtures
+    }
+    if observed_versions != expected:
+        raise ContractError(
+            f"suite.fixtures: invalid version {expected_version} fixture identities"
+        )
+    if [entry["fixture_id"] for entry in fixtures] != list(expected):
+        raise ContractError(
+            f"suite.fixtures: invalid version {expected_version} fixture order"
         )
     return fixtures
 
 
-def validate_manifest_shape(value: dict[str, Any], label: str) -> None:
+def validate_manifest_shape(
+    value: dict[str, Any], label: str, *, expected_version: int
+) -> None:
     _exact_keys(
         value,
         label,
@@ -245,13 +291,19 @@ def validate_manifest_shape(value: dict[str, Any], label: str) -> None:
             "grader",
         },
     )
-    _version_one(value["schema_version"], f"{label}.schema_version")
+    _version(
+        value["schema_version"],
+        f"{label}.schema_version",
+        supported={expected_version},
+    )
     _identifier(value["fixture_id"], f"{label}.fixture_id")
-    _version_one(value["fixture_version"], f"{label}.fixture_version")
-    if value["scenario_kind"] not in {
-        "low_risk_existing_tests",
-        "seeded_review_defects",
-    }:
+    if value["fixture_version"] != expected_version:
+        raise ContractError(f"{label}.fixture_version: identity/version mismatch")
+    scenario_by_version = {
+        1: {"low_risk_existing_tests", "seeded_review_defects"},
+        2: {"checkpoint_continuation"},
+    }
+    if value["scenario_kind"] not in scenario_by_version[expected_version]:
         raise ContractError(f"{label}.scenario_kind: unsupported scenario kind")
     for field in ("prompt", "acceptance_criteria", "seed_repository"):
         _safe_relative_path(value[field], f"{label}.{field}")
@@ -268,30 +320,70 @@ def validate_manifest_shape(value: dict[str, Any], label: str) -> None:
         value["grader"], f"{label}.grader", {"id", "version", "digest"}
     )
     _identifier(grader["id"], f"{label}.grader.id")
-    _version_one(grader["version"], f"{label}.grader.version")
+    if grader["version"] != expected_version:
+        raise ContractError(f"{label}.grader.version: identity/version mismatch")
     _digest(grader["digest"], f"{label}.grader.digest")
 
 
-def validate_grader_shape(value: dict[str, Any], label: str) -> None:
+def validate_grader_shape(
+    value: dict[str, Any], label: str, *, expected_version: int
+) -> None:
+    required = {
+        "schema_version",
+        "grader_id",
+        "grader_version",
+        "fixture_id",
+        "fixture_version",
+        "public_fixture_sha256",
+        "checks",
+    }
+    if expected_version == 2:
+        required.update({"private_assets_tree_sha256", "private_expectations"})
     _exact_keys(
         value,
         label,
-        {
-            "schema_version",
-            "grader_id",
-            "grader_version",
-            "fixture_id",
-            "fixture_version",
-            "public_fixture_sha256",
-            "checks",
-        },
+        required,
     )
-    _version_one(value["schema_version"], f"{label}.schema_version")
+    _version(
+        value["schema_version"],
+        f"{label}.schema_version",
+        supported={expected_version},
+    )
     _identifier(value["grader_id"], f"{label}.grader_id")
-    _version_one(value["grader_version"], f"{label}.grader_version")
+    if value["grader_version"] != expected_version:
+        raise ContractError(f"{label}.grader_version: identity/version mismatch")
     _identifier(value["fixture_id"], f"{label}.fixture_id")
-    _version_one(value["fixture_version"], f"{label}.fixture_version")
+    if value["fixture_version"] != expected_version:
+        raise ContractError(f"{label}.fixture_version: identity/version mismatch")
     _digest(value["public_fixture_sha256"], f"{label}.public_fixture_sha256")
+    if expected_version == 2:
+        _digest(
+            value["private_assets_tree_sha256"],
+            f"{label}.private_assets_tree_sha256",
+        )
+        expectations = _exact_keys(
+            value["private_expectations"],
+            f"{label}.private_expectations",
+            {"sensitive_strings"},
+        )
+        sensitive_strings = expectations["sensitive_strings"]
+        if not isinstance(sensitive_strings, list) or not sensitive_strings:
+            raise ContractError(
+                f"{label}.private_expectations.sensitive_strings: "
+                "non-empty array required"
+            )
+        normalized_sensitive = [
+            _nonblank(
+                item,
+                f"{label}.private_expectations.sensitive_strings[{index}]",
+            ).lower()
+            for index, item in enumerate(sensitive_strings)
+        ]
+        if len(set(normalized_sensitive)) != len(normalized_sensitive):
+            raise ContractError(
+                f"{label}.private_expectations.sensitive_strings: "
+                "duplicate value"
+            )
     checks = value["checks"]
     if not isinstance(checks, list) or not checks:
         raise ContractError(f"{label}.checks: must be a non-empty array")
@@ -346,12 +438,20 @@ def validate_grader_shape(value: dict[str, Any], label: str) -> None:
         expected_required_categories.add("functional_outcome")
     if value["fixture_id"] == "seeded-review-defects-v1":
         expected_required_categories.add("seeded_defect_detection")
+    if value["fixture_id"] == "checkpoint-continuation-v2":
+        expected_required_categories.add("functional_outcome")
     if not expected_required_categories <= required_categories:
         raise ContractError(f"{label}.checks: missing required grading categories")
 
 
 def _grader_sensitive_text(grader: dict[str, Any]) -> set[str]:
     sensitive = set(FORBIDDEN_PUBLIC_TEXT)
+    private_expectations = grader.get("private_expectations")
+    if private_expectations:
+        sensitive.update(
+            text.strip().lower()
+            for text in private_expectations["sensitive_strings"]
+        )
     for check in grader["checks"]:
         sensitive.add(check["id"].lower())
         sensitive.add(check["expected"]["observation"].lower())
@@ -432,12 +532,15 @@ def _validate_schema_documents(root: Path) -> None:
         "event-record-v1.schema.json",
         "run-result-v1.schema.json",
         "comparison-model-v1.schema.json",
+        "suite-v2.schema.json",
+        "fixture-v2.schema.json",
+        "grader-v2.schema.json",
     }
     actual = {
         path.name for path in schema_root.iterdir() if path.is_file()
     } if schema_root.is_dir() else set()
     if actual != expected:
-        raise ContractError("schemas: missing or extra version 1 schema documents")
+        raise ContractError("schemas: missing or extra versioned schema documents")
     for name in sorted(expected):
         schema = load_json(schema_root / name)
         _nonblank(schema.get("$schema"), f"{name}.$schema")
@@ -468,7 +571,20 @@ def validate(root: Path = ROOT) -> dict[str, str]:
         raise ContractError("replay trace: must use canonical JSON bytes")
     suite_path = root / "suite-v1.json"
     suite = load_json(suite_path)
-    entries = validate_suite_shape(suite)
+    version_one_entries = validate_suite_shape(suite, expected_version=1)
+    suite_v2_path = root / "suite-v2.json"
+    suite_v2 = load_json(suite_v2_path)
+    entries = validate_suite_shape(suite_v2, expected_version=2)
+    version_one_bindings = {
+        entry["fixture_id"]: entry for entry in version_one_entries
+    }
+    for entry in entries:
+        if entry["fixture_version"] == 1 and entry != version_one_bindings.get(
+            entry["fixture_id"]
+        ):
+            raise ContractError(
+                f"{entry['fixture_id']}: version 1 suite binding drift"
+            )
     fixture_root = root / "fixtures"
     indexed_ids = {entry["fixture_id"] for entry in entries}
     actual_ids = {
@@ -482,8 +598,12 @@ def validate(root: Path = ROOT) -> dict[str, str]:
         fixture_dir = fixture_root / fixture_id
         if set(path.name for path in fixture_dir.iterdir()) != {"public", "grader"}:
             raise ContractError(f"{fixture_id}: missing or extra fixture assets")
+        fixture_version = entry["fixture_version"]
         expected_manifest = (
-            Path("fixtures") / fixture_id / "public" / "manifest-v1.json"
+            Path("fixtures")
+            / fixture_id
+            / "public"
+            / f"manifest-v{fixture_version}.json"
         ).as_posix()
         if entry["manifest"] != expected_manifest:
             raise ContractError(f"{fixture_id}: dangling manifest reference")
@@ -492,19 +612,30 @@ def validate(root: Path = ROOT) -> dict[str, str]:
         payload_root = public_root / "payload"
         seed_root = payload_root / "seed"
         grader_dir = fixture_dir / "grader"
-        grader_path = grader_dir / "grader-v1.json"
+        grader_path = grader_dir / f"grader-v{fixture_version}.json"
         if set(path.name for path in public_root.iterdir()) != {
-            "manifest-v1.json",
+            f"manifest-v{fixture_version}.json",
             "payload",
         }:
             raise ContractError(f"{fixture_id}: missing or extra public assets")
-        if set(path.name for path in grader_dir.iterdir()) != {"grader-v1.json"}:
+        expected_grader_assets = {f"grader-v{fixture_version}.json"}
+        if fixture_version == 2:
+            expected_grader_assets.add("assets")
+        if set(path.name for path in grader_dir.iterdir()) != expected_grader_assets:
             raise ContractError(f"{fixture_id}: missing or extra grader assets")
 
         manifest = load_json(manifest_path)
         grader = load_json(grader_path)
-        validate_manifest_shape(manifest, f"{fixture_id}.manifest")
-        validate_grader_shape(grader, f"{fixture_id}.grader")
+        validate_manifest_shape(
+            manifest,
+            f"{fixture_id}.manifest",
+            expected_version=fixture_version,
+        )
+        validate_grader_shape(
+            grader,
+            f"{fixture_id}.grader",
+            expected_version=fixture_version,
+        )
         if manifest["fixture_id"] != fixture_id or grader["fixture_id"] != fixture_id:
             raise ContractError(f"{fixture_id}: fixture identity binding drift")
         if manifest["fixture_version"] != entry["fixture_version"]:
@@ -533,6 +664,12 @@ def validate(root: Path = ROOT) -> dict[str, str]:
             fixture_id, entry["fixture_version"], payload_digest, seed_digest
         )
         grader_digest = document_digest(grader)
+        if fixture_version == 2:
+            private_assets_digest = tree_digest(grader_dir / "assets")
+            if grader["private_assets_tree_sha256"] != private_assets_digest:
+                raise ContractError(
+                    f"{fixture_id}: private grader asset binding drift"
+                )
         expected_digests = {
             "public_manifest_sha256": manifest_digest,
             "public_payload_tree_sha256": payload_digest,
@@ -570,7 +707,8 @@ def validate(root: Path = ROOT) -> dict[str, str]:
         raise ContractError(f"baseline-v1: {error}") from error
 
     return {
-        "suite": document_digest(suite),
+        "suite": document_digest(suite_v2),
+        "suite_v1": document_digest(suite),
         "fixtures": str(len(entries)),
         "trace": replay.digest_bytes(trace_bytes),
         "comparison": replay.digest_bytes(comparison_path.read_bytes()),
