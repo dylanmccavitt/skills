@@ -125,6 +125,23 @@ def registry_lock():
         os.close(descriptor)
 
 
+@contextmanager
+def registry_read_lock():
+    """Share an existing registry lock without creating filesystem state."""
+    lock_path = state_root() / ".registry.lock"
+    try:
+        descriptor = os.open(lock_path, os.O_RDONLY)
+    except FileNotFoundError:
+        yield
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def load_state(session_id: str) -> dict[str, Any] | None:
     path = state_path(session_id)
     try:

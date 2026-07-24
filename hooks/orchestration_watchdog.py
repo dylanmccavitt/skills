@@ -12,6 +12,7 @@ from typing import Any
 
 from orchestration_graph import DEFAULT_WORKFLOW, load_workflow
 from orchestration_state import (
+    HEARTBEAT_COLLECTOR,
     LIFECYCLE_VERSION,
     OBSERVATION_VERSION,
     REGISTRY_SCHEMA_VERSION,
@@ -19,6 +20,7 @@ from orchestration_state import (
     load_state,
     recover_transactions,
     registry_lock,
+    registry_read_lock,
     state_root,
 )
 
@@ -43,6 +45,15 @@ RUNTIME_FILES = (
     "orchestration_state.py",
     "orchestration_watchdog.py",
 )
+SUPPORTED_HEARTBEAT_EVENTS = {
+    "PreToolUse",
+    "SessionStart",
+    "Stop",
+    "SubagentStart",
+    "SubagentStop",
+}
+HEARTBEAT_CAPABILITIES = {"supported-hook-v1", "unsupported"}
+PRESSURE_CAPABILITIES = {"manual-context-v1", "unsupported"}
 
 
 def supervision_policies(workflow_path: Path) -> dict[str, Any]:
@@ -83,7 +94,7 @@ def _current_lifecycle(state: dict[str, Any]) -> tuple[dict[str, Any] | None, st
     if schema_version != REGISTRY_SCHEMA_VERSION or not isinstance(lifecycle, dict):
         return None, "record_schema_version,lifecycle"
     required = {
-        "version": LIFECYCLE_VERSION,
+        "version": lifecycle.get("version"),
         "origin": lifecycle.get("origin"),
         "created_at": lifecycle.get("created_at"),
         "observation_capabilities": lifecycle.get("observation_capabilities"),
@@ -92,13 +103,26 @@ def _current_lifecycle(state: dict[str, Any]) -> tuple[dict[str, Any] | None, st
         required["version"] != LIFECYCLE_VERSION
         or required["origin"] not in {"registration", "continuation"}
         or type(required["created_at"]) is not int
+        or required["created_at"] < 0
         or not isinstance(required["observation_capabilities"], dict)
     ):
         return None, "lifecycle"
-    if required["origin"] == "continuation" and not isinstance(
-        lifecycle.get("continued_from"), str
+    capabilities = required["observation_capabilities"]
+    if (
+        capabilities.get("heartbeat") not in HEARTBEAT_CAPABILITIES
+        or capabilities.get("pressure") not in PRESSURE_CAPABILITIES
     ):
-        return None, "lifecycle.continued_from"
+        return None, "lifecycle.observation_capabilities"
+    if required["origin"] == "continuation":
+        if not isinstance(lifecycle.get("continued_from"), str) or not lifecycle.get(
+            "continued_from"
+        ):
+            return None, "lifecycle.continued_from"
+        if (
+            type(lifecycle.get("continued_from_revision")) is not int
+            or lifecycle["continued_from_revision"] < 1
+        ):
+            return None, "lifecycle.continued_from_revision"
     return lifecycle, None
 
 
@@ -112,7 +136,10 @@ def _heartbeat_state(
     if status == "pending":
         pending_since = heartbeat.get("pending_since")
         if (
-            type(pending_since) is not int
+            lifecycle["observation_capabilities"].get("heartbeat")
+            != "supported-hook-v1"
+            or type(pending_since) is not int
+            or heartbeat.get("collector") != HEARTBEAT_COLLECTOR
             or heartbeat.get("observed_at") is not None
             or heartbeat.get("event") is not None
             or heartbeat.get("source") is not None
@@ -123,19 +150,27 @@ def _heartbeat_state(
     if status == "observed":
         observed_at = heartbeat.get("observed_at")
         if (
-            type(observed_at) is not int
+            lifecycle["observation_capabilities"].get("heartbeat")
+            != "supported-hook-v1"
+            or type(observed_at) is not int
             or not isinstance(heartbeat.get("event"), str)
-            or not heartbeat.get("event")
+            or heartbeat.get("event") not in SUPPORTED_HEARTBEAT_EVENTS
             or not isinstance(heartbeat.get("source"), str)
             or not heartbeat.get("source")
-            or not isinstance(heartbeat.get("collector"), str)
-            or not heartbeat.get("collector")
+            or heartbeat.get("collector") != HEARTBEAT_COLLECTOR
             or state.get("last_heartbeat") != observed_at
         ):
             return "invalid", "unknown", "heartbeat.observed"
         return "observed", now - observed_at, None
     capability = lifecycle["observation_capabilities"].get("heartbeat")
-    if status == "unsupported" and capability == "unsupported":
+    if (
+        status == "unsupported"
+        and capability == "unsupported"
+        and heartbeat.get("observed_at") is None
+        and heartbeat.get("event") is None
+        and heartbeat.get("source") is None
+        and state.get("last_heartbeat") is None
+    ):
         return "unsupported", "unknown", None
     return "invalid", "unknown", "heartbeat.status"
 
@@ -146,7 +181,7 @@ def _pressure_state(
     capability = lifecycle["observation_capabilities"].get("pressure")
     pressure = state.get("pressure")
     if capability == "unsupported":
-        return "unsupported", None
+        return ("unsupported", None) if pressure is None else ("invalid", None)
     if pressure is None:
         return "unavailable", None
     if not isinstance(pressure, dict):
@@ -188,7 +223,7 @@ def _pressure_state(
             and type(limit) is int
             and type(observed_at) is int
             and type(state_bytes) is int
-            and isinstance(ratio, (int, float))
+            and type(ratio) in (int, float)
             and 0 <= used <= limit
             and limit > 0
             and state_bytes >= 0
@@ -196,6 +231,7 @@ def _pressure_state(
             and isinstance(validation, dict)
             and validation.get("status") == "valid"
             and type(validation.get("validated_at")) is int
+            and validation.get("validated_at") == observed_at
         )
     except (KeyError, TypeError, ValueError, ZeroDivisionError):
         valid = False
@@ -262,24 +298,6 @@ def classify(state: dict[str, Any], policies: dict[str, Any], now: int) -> dict[
             "pressure_collector": None,
         }
 
-    if not state["active"]:
-        return {
-            "session_id": state["session_id"],
-            "role": role,
-            "status": "completed-ignored",
-            "age": "unknown",
-            "restarts": state.get("restarts", 0),
-            "events": state.get("events", 0),
-            "advice": "none",
-            "heartbeat_status": state.get("heartbeat", {}).get("status", "invalid"),
-            "heartbeat_event": state.get("heartbeat", {}).get("event"),
-            "heartbeat_source": state.get("heartbeat", {}).get("source"),
-            "heartbeat_observed_at": state.get("heartbeat", {}).get("observed_at"),
-            "pressure_status": "ignored",
-            "pressure_source": None,
-            "pressure_collector": None,
-        }
-
     restarts = state.get("restarts", 0)
     events = state.get("events", 0)
     if type(restarts) is not int or restarts < 0 or type(events) is not int or events < 0:
@@ -292,6 +310,33 @@ def classify(state: dict[str, Any], policies: dict[str, Any], now: int) -> dict[
     pressure_status, pressure = _pressure_state(state, lifecycle, policies, now)
     if pressure_status == "invalid":
         return _invalid_report(state, "INVALID_STATE_FIELDS: pressure")
+
+    if not state["active"]:
+        ended_at = lifecycle.get("ended_at")
+        end_reason = lifecycle.get("end_reason")
+        if (
+            type(ended_at) is not int
+            or ended_at < lifecycle["created_at"]
+            or end_reason not in {"completed", "continued", "terminal-receipt"}
+        ):
+            return _invalid_report(state, "INVALID_STATE_FIELDS: lifecycle.terminal")
+        heartbeat = state["heartbeat"]
+        return {
+            "session_id": state["session_id"],
+            "role": role,
+            "status": "completed-ignored",
+            "age": "unknown",
+            "restarts": restarts,
+            "events": events,
+            "advice": "none",
+            "heartbeat_status": heartbeat_status,
+            "heartbeat_event": heartbeat.get("event"),
+            "heartbeat_source": heartbeat.get("source"),
+            "heartbeat_observed_at": heartbeat.get("observed_at"),
+            "pressure_status": "ignored",
+            "pressure_source": None,
+            "pressure_collector": None,
+        }
 
     ttl = policies["heartbeat_ttl_seconds"].get(
         role, DEFAULT_SUPERVISION["heartbeat_ttl_seconds"][role]
@@ -407,7 +452,7 @@ def audit(
     policies = supervision_policies(workflow_path)
     reports: list[dict[str, Any]] = []
     states: dict[str, dict[str, Any]] = {}
-    with registry_lock():
+    with registry_read_lock():
         recovery_pending = continuation_journal_path().is_file()
         sessions = state_root() / "sessions"
         for path in sorted(sessions.glob("*.json")) if sessions.is_dir() else []:

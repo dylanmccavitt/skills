@@ -333,6 +333,50 @@ class OrchestrationWatchdogTest(unittest.TestCase):
         self.assertEqual(report["heartbeat_status"], "unsupported")
         self.assertEqual(report["pressure_status"], "unsupported")
 
+    def test_invalid_lifecycle_version_and_capabilities_fail_closed(self) -> None:
+        for session_id, mutation in (
+            ("bad-version", lambda state: state["lifecycle"].update(version=999)),
+            (
+                "bad-capability",
+                lambda state: state["lifecycle"]["observation_capabilities"].update(
+                    heartbeat="unknown"
+                ),
+            ),
+        ):
+            self.register("review", session_id)
+            state = json.loads(
+                self.session_path(session_id).read_text(encoding="utf-8")
+            )
+            mutation(state)
+            self.session_path(session_id).write_text(
+                json.dumps(state), encoding="utf-8"
+            )
+
+        result = self.check("--json")
+        self.assertEqual(result.returncode, 1)
+        reports = json.loads(result.stdout)["sessions"]
+        self.assertTrue(all(report["status"] == "invalid" for report in reports))
+
+    def test_malformed_current_terminal_is_invalid_without_hiding_other_records(self) -> None:
+        self.register("review", "good-terminal")
+        self.state_command("complete", "--session-id", "good-terminal")
+        self.register("review", "bad-terminal")
+        self.state_command("complete", "--session-id", "bad-terminal")
+        bad = json.loads(
+            self.session_path("bad-terminal").read_text(encoding="utf-8")
+        )
+        bad["heartbeat"] = "corrupt"
+        self.session_path("bad-terminal").write_text(json.dumps(bad), encoding="utf-8")
+
+        result = self.check("--json", "--include-completed")
+        self.assertEqual(result.returncode, 1)
+        reports = {
+            report["session_id"]: report
+            for report in json.loads(result.stdout)["sessions"]
+        }
+        self.assertEqual(reports["good-terminal"]["status"], "completed-ignored")
+        self.assertEqual(reports["bad-terminal"]["status"], "invalid")
+
     def test_audit_is_deterministic_payload_safe_and_reports_runtime_evidence(self) -> None:
         self.register("review")
         state = json.loads(self.session_path().read_text(encoding="utf-8"))
@@ -383,6 +427,14 @@ class OrchestrationWatchdogTest(unittest.TestCase):
         self.assertFalse(payload["writes_performed"])
         self.assertEqual(payload["actions"][0]["action"], "preserve-legacy")
         self.assertEqual(self.session_path("legacy-1").read_bytes(), before)
+
+    def test_reconcile_dry_run_does_not_create_registry_files(self) -> None:
+        result = self.watchdog(
+            "reconcile", "--dry-run", "--json", "--now", "2000000000"
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(list(Path(self.temporary.name).iterdir()), [])
 
     def test_audit_reports_interrupted_journal_without_mutating_then_check_recovers(self) -> None:
         self.register("implementation")

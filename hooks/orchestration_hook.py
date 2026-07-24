@@ -40,7 +40,7 @@ def main() -> int:
             recover_transactions()
             session_id = str(payload.get("session_id", ""))
             context = HookContext(payload, load_state(session_id) if session_id else None)
-            if context.active:
+            if context.active and context.event in HANDLERS:
                 observed_at = int(time.time())
                 context.state["last_heartbeat"] = observed_at
                 context.state["events"] = context.state.get("events", 0) + 1

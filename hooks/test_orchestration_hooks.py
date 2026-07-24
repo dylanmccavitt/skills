@@ -2300,6 +2300,15 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(state["heartbeat"]["event"], "PreToolUse")
         self.assertEqual(state["heartbeat"]["source"], "Bash")
 
+    def test_unknown_hook_event_does_not_create_heartbeat_evidence(self) -> None:
+        self.register("implementation")
+        before = self.session_state()
+
+        result = self.hook("UnknownEvent")
+
+        self.assertIsNone(result)
+        self.assertEqual(self.session_state(), before)
+
     def test_continue_resets_successor_events(self) -> None:
         self.register("implementation")
         self.hook("SessionStart", source="startup")
