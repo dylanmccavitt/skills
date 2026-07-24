@@ -8,10 +8,26 @@ import sys
 import time
 
 from orchestration_events import HANDLERS, HookContext
-from orchestration_state import load_state, recover_transactions, registry_lock
+from orchestration_state import (
+    HEARTBEAT_COLLECTOR,
+    OBSERVATION_VERSION,
+    load_state,
+    recover_transactions,
+    registry_lock,
+)
 
 
 BLOCKING_EVENTS = {"PreToolUse", "Stop", "SubagentStop"}
+
+
+def heartbeat_source(payload: dict[str, object], event: str) -> str:
+    if event == "SessionStart":
+        return str(payload.get("source") or "unknown")
+    if event == "PreToolUse":
+        return str(payload.get("tool_name") or "unknown")
+    if event in {"SubagentStart", "SubagentStop"}:
+        return str(payload.get("agent_type") or "unknown")
+    return event or "unknown"
 
 
 def main() -> int:
@@ -24,9 +40,18 @@ def main() -> int:
             recover_transactions()
             session_id = str(payload.get("session_id", ""))
             context = HookContext(payload, load_state(session_id) if session_id else None)
-            if context.active:
-                context.state["last_heartbeat"] = int(time.time())
+            if context.active and context.event in HANDLERS:
+                observed_at = int(time.time())
+                context.state["last_heartbeat"] = observed_at
                 context.state["events"] = context.state.get("events", 0) + 1
+                context.state["heartbeat"] = {
+                    "version": OBSERVATION_VERSION,
+                    "status": "observed",
+                    "observed_at": observed_at,
+                    "event": context.event,
+                    "source": heartbeat_source(payload, context.event),
+                    "collector": HEARTBEAT_COLLECTOR,
+                }
                 context.save()
             handler = HANDLERS.get(context.event)
             result = handler(context) if handler else None

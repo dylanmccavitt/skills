@@ -206,15 +206,46 @@ routes, and terminal states. Validate it directly with:
 python3 hooks/orchestration_graph.py
 ```
 
-The watchdog classifies registered lanes against the graph's supervision
-policies (healthy, stale, recycle, over-budget) and only reports; restarts stay
-with the coordinator. Measured context/state pressure drives recycling, while
-the event count remains a compatibility fallback when telemetry is absent.
-Check it with:
+New registry records carry an explicit lifecycle/schema version. Registration
+and continuation begin with a `pending` heartbeat observation; a lane is not
+called stale merely because no supported hook has run yet. Each later heartbeat
+names the observed hook event, source, collector, and timestamp. This proves
+only that the hook was observed at that time, not uninterrupted process
+execution between observations.
+
+The watchdog reports evidence-specific states: `healthy-current`,
+`stale-current`, `recycle-current`, `legacy-unknown`, `completed-ignored`,
+`over-budget`, and `invalid`. Legacy records remain unknown rather than being
+treated as live, stale, complete, or token-consuming. Pressure samples include
+source, collector, context-window identity, validation state, and timestamp.
+Missing samples are `unavailable`, expired samples are `measured-expired`, and
+neither is presented as measured context. The event counter is a separate
+compatibility heuristic and never becomes measured pressure. The 80% context
+checkpoint threshold is unchanged.
+
+Check current records with:
 
 ```sh
 python3 hooks/orchestration_watchdog.py check
 ```
+
+Inventory lifecycle, heartbeat, pressure, and content-based runtime
+compatibility without exposing stored packets or prompts:
+
+```sh
+python3 hooks/orchestration_watchdog.py audit --json
+```
+
+Reconciliation is intentionally dry-run-only. It preserves legacy records
+byte-for-byte and reports which records need manual evidence:
+
+```sh
+python3 hooks/orchestration_watchdog.py reconcile --dry-run --json
+```
+
+These commands inspect the selected `CODEX_ORCHESTRATION_STATE_DIR`; they do not
+install hooks, change active Codex configuration, delete records, or infer
+historical liveness or spending.
 
 ## License
 

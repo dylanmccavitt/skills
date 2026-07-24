@@ -197,6 +197,8 @@ class OrchestrationHookTest(unittest.TestCase):
         state = self.session_state()
         self.assertFalse(state["active"])
         self.assertEqual(state["terminal_packet_type"], "IMPLEMENTATION_PACKET")
+        self.assertEqual(state["lifecycle"]["end_reason"], "terminal-receipt")
+        self.assertIsInstance(state["lifecycle"]["ended_at"], int)
         canonical = json.dumps(packet, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             state["terminal_packet_digest"],
@@ -2276,13 +2278,36 @@ class OrchestrationHookTest(unittest.TestCase):
 
     def test_hook_events_stamp_heartbeat_and_count_events(self) -> None:
         self.register("implementation")
-        self.assertNotIn("last_heartbeat", self.session_state())
+        registered = self.session_state()
+        self.assertIsNone(registered["last_heartbeat"])
+        self.assertEqual(registered["record_schema_version"], 1)
+        self.assertEqual(registered["lifecycle"]["origin"], "registration")
+        self.assertEqual(registered["heartbeat"]["status"], "pending")
+        self.assertEqual(registered["events"], 0)
         self.hook("SessionStart", source="startup")
         state = self.session_state()
         self.assertIsInstance(state["last_heartbeat"], int)
         self.assertEqual(state["events"], 1)
+        self.assertEqual(state["heartbeat"]["status"], "observed")
+        self.assertEqual(state["heartbeat"]["event"], "SessionStart")
+        self.assertEqual(state["heartbeat"]["source"], "startup")
+        self.assertEqual(
+            state["heartbeat"]["observed_at"], state["last_heartbeat"]
+        )
         self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "ls"})
-        self.assertEqual(self.session_state()["events"], 2)
+        state = self.session_state()
+        self.assertEqual(state["events"], 2)
+        self.assertEqual(state["heartbeat"]["event"], "PreToolUse")
+        self.assertEqual(state["heartbeat"]["source"], "Bash")
+
+    def test_unknown_hook_event_does_not_create_heartbeat_evidence(self) -> None:
+        self.register("implementation")
+        before = self.session_state()
+
+        result = self.hook("UnknownEvent")
+
+        self.assertIsNone(result)
+        self.assertEqual(self.session_state(), before)
 
     def test_continue_resets_successor_events(self) -> None:
         self.register("implementation")
@@ -2292,7 +2317,14 @@ class OrchestrationHookTest(unittest.TestCase):
         self.assertEqual(self.session_state()["events"], 2)
         successor = self.session_state("session-2")
         self.assertEqual(successor["events"], 0)
-        self.assertIsInstance(successor["last_heartbeat"], int)
+        self.assertIsNone(successor["last_heartbeat"])
+        self.assertEqual(successor["heartbeat"]["status"], "pending")
+        self.assertEqual(successor["lifecycle"]["origin"], "continuation")
+        self.assertEqual(successor["lifecycle"]["continued_from"], "session-1")
+        self.assertEqual(
+            successor["lifecycle"]["continued_from_revision"],
+            self.session_state()["state_revision"] - 1,
+        )
 
     def test_continue_preserves_context_refs_but_resets_ephemeral_pressure(self) -> None:
         self.register("implementation")
@@ -2312,6 +2344,64 @@ class OrchestrationHookTest(unittest.TestCase):
         successor = self.session_state("session-2")
         self.assertTrue(successor["context_refs"]["research-artifact"]["ref"].startswith("sha256:"))
         self.assertNotIn("pressure", successor)
+
+    def test_pressure_record_has_typed_provenance_and_validation(self) -> None:
+        self.register("implementation")
+        recorded = json.loads(
+            self.state_command(
+                "pressure",
+                "record",
+                "--session-id",
+                "session-1",
+                "--context-used-tokens",
+                "800",
+                "--context-limit-tokens",
+                "1000",
+                "--source",
+                "codex-context-meter",
+                "--collector",
+                "collector-v2",
+                "--context-window-id",
+                "window-7",
+            ).stdout
+        )
+        self.assertEqual(recorded["version"], 1)
+        self.assertEqual(recorded["status"], "measured")
+        self.assertEqual(recorded["source"], "codex-context-meter")
+        self.assertEqual(recorded["collector"], "collector-v2")
+        self.assertEqual(
+            recorded["context_window"],
+            {
+                "status": "identified",
+                "id": "window-7",
+                "unavailable_reason": None,
+            },
+        )
+        self.assertEqual(recorded["validation"]["status"], "valid")
+        self.assertEqual(self.session_state()["pressure"], recorded)
+
+    def test_pressure_record_marks_missing_window_identity_unavailable(self) -> None:
+        self.register("implementation")
+        recorded = json.loads(
+            self.state_command(
+                "pressure",
+                "record",
+                "--session-id",
+                "session-1",
+                "--context-used-tokens",
+                "100",
+                "--context-limit-tokens",
+                "1000",
+            ).stdout
+        )
+        self.assertEqual(
+            recorded["context_window"],
+            {
+                "status": "unavailable",
+                "id": None,
+                "unavailable_reason": "not-supplied",
+            },
+        )
 
     def test_continue_rejects_same_or_existing_successor_without_mutation(self) -> None:
         self.register("implementation")

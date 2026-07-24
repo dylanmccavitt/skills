@@ -33,6 +33,11 @@ PROTECTED_CONTEXT_KEYS = {
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 CONTENT_REF_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 REVIEW_ATTEMPT_PATTERN = CONTENT_REF_PATTERN
+REGISTRY_SCHEMA_VERSION = 1
+LIFECYCLE_VERSION = 1
+OBSERVATION_VERSION = 1
+HEARTBEAT_COLLECTOR = "orchestration-hook-v1"
+PRESSURE_COLLECTOR = "orchestration-state-cli-v1"
 
 
 def state_root() -> Path:
@@ -120,6 +125,23 @@ def registry_lock():
         os.close(descriptor)
 
 
+@contextmanager
+def registry_read_lock():
+    """Share an existing registry lock without creating filesystem state."""
+    lock_path = state_root() / ".registry.lock"
+    try:
+        descriptor = os.open(lock_path, os.O_RDONLY)
+    except FileNotFoundError:
+        yield
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def load_state(session_id: str) -> dict[str, Any] | None:
     path = state_path(session_id)
     try:
@@ -172,6 +194,41 @@ def write_state(
     return path
 
 
+def _new_lifecycle(
+    *,
+    now: int,
+    origin: str,
+    source_id: str | None = None,
+    source_revision: int | None = None,
+) -> dict[str, Any]:
+    lifecycle: dict[str, Any] = {
+        "version": LIFECYCLE_VERSION,
+        "created_at": now,
+        "origin": origin,
+        "observation_capabilities": {
+            "heartbeat": "supported-hook-v1",
+            "pressure": "manual-context-v1",
+        },
+    }
+    if source_id is not None:
+        lifecycle["continued_from"] = source_id
+    if source_revision is not None:
+        lifecycle["continued_from_revision"] = source_revision
+    return lifecycle
+
+
+def pending_heartbeat(now: int) -> dict[str, Any]:
+    return {
+        "version": OBSERVATION_VERSION,
+        "status": "pending",
+        "observed_at": None,
+        "event": None,
+        "source": None,
+        "collector": HEARTBEAT_COLLECTOR,
+        "pending_since": now,
+    }
+
+
 def register(
     session_id: str,
     role: str,
@@ -213,12 +270,18 @@ def register(
         if not checkpoint_on_compact and existing.get("checkpoint_on_compact"):
             raise ValueError(f"checkpoint policy conflict for authoritative registration: {session_id}")
         return state_path(session_id)
+    now = int(time.time())
     registration = {
+        "record_schema_version": REGISTRY_SCHEMA_VERSION,
+        "lifecycle": _new_lifecycle(now=now, origin="registration"),
         "role": role,
         "active": True,
         "checkpoint_on_compact": checkpoint_on_compact,
         "merge_authorized": merge_authorized,
         "agents": {},
+        "events": 0,
+        "last_heartbeat": None,
+        "heartbeat": pending_heartbeat(now),
     }
     if coordinator_thread_id:
         registration["coordinator_thread_id"] = coordinator_thread_id
@@ -238,19 +301,34 @@ def continue_session(source_id: str, successor_id: str, *, supervised: bool = Fa
     if load_state(successor_id) is not None:
         raise ValueError(f"successor session already exists: {successor_id}")
     source_revision = int(source.get("state_revision", 0))
+    now = int(time.time())
     source_next = dict(source)
     source_next["successor_id"] = successor_id
     source_next["active"] = False
     source_next["checkpoint_on_compact"] = False
+    source_lifecycle = source_next.get("lifecycle")
+    if isinstance(source_lifecycle, dict):
+        source_lifecycle = dict(source_lifecycle)
+        source_lifecycle["ended_at"] = now
+        source_lifecycle["end_reason"] = "continued"
+        source_next["lifecycle"] = source_lifecycle
     successor = dict(source_next)
     successor.pop("successor_id", None)
     successor.pop("pressure", None)
     successor["source_id"] = source_id
+    successor["record_schema_version"] = REGISTRY_SCHEMA_VERSION
+    successor["lifecycle"] = _new_lifecycle(
+        now=now,
+        origin="continuation",
+        source_id=source_id,
+        source_revision=source_revision,
+    )
     successor["agents"] = {}
     successor["active"] = True
     successor["checkpoint_on_compact"] = True
     successor["events"] = 0
-    successor["last_heartbeat"] = int(time.time())
+    successor["last_heartbeat"] = None
+    successor["heartbeat"] = pending_heartbeat(now)
     successor["restarts"] = source.get("restarts", 0) + (1 if supervised else 0)
     journal_path = continuation_journal_path()
     _write_json_atomic(journal_path, {
@@ -1481,20 +1559,45 @@ def record_pressure(
     session_id: str,
     context_used_tokens: int,
     context_limit_tokens: int,
+    *,
+    source: str = "manual",
+    collector: str = PRESSURE_COLLECTOR,
+    context_window_id: str | None = None,
 ) -> dict[str, Any]:
     state = load_state(session_id)
     if state is None:
         raise ValueError(f"no registered session: {session_id}")
+    if not state.get("active"):
+        raise ValueError(f"cannot record pressure for inactive session: {session_id}")
     if context_used_tokens < 0 or context_limit_tokens <= 0:
         raise ValueError("context token counts require used >= 0 and limit > 0")
     if context_used_tokens > context_limit_tokens:
         raise ValueError("context used tokens cannot exceed the context limit")
+    if not source.strip() or not collector.strip():
+        raise ValueError("pressure source and collector must be non-empty")
+    if context_window_id is not None and not context_window_id.strip():
+        raise ValueError("pressure context window ID must be non-empty when supplied")
+    observed_at = int(time.time())
+    context_window = (
+        {"status": "identified", "id": context_window_id, "unavailable_reason": None}
+        if context_window_id is not None
+        else {"status": "unavailable", "id": None, "unavailable_reason": "not-supplied"}
+    )
     pressure = {
+        "version": OBSERVATION_VERSION,
+        "status": "measured",
+        "source": source,
+        "collector": collector,
+        "context_window": context_window,
         "context_used_tokens": context_used_tokens,
         "context_limit_tokens": context_limit_tokens,
         "context_ratio": context_used_tokens / context_limit_tokens,
         "state_bytes": 0,
-        "observed_at": int(time.time()),
+        "observed_at": observed_at,
+        "validation": {
+            "status": "valid",
+            "validated_at": observed_at,
+        },
     }
     state["pressure"] = pressure
     _stabilize_pressure_size(session_id, state, pressure)
@@ -1572,6 +1675,9 @@ def _parser() -> argparse.ArgumentParser:
     pressure_record_parser.add_argument("--session-id", required=True)
     pressure_record_parser.add_argument("--context-used-tokens", type=int, required=True)
     pressure_record_parser.add_argument("--context-limit-tokens", type=int, required=True)
+    pressure_record_parser.add_argument("--source", default="manual")
+    pressure_record_parser.add_argument("--collector", default=PRESSURE_COLLECTOR)
+    pressure_record_parser.add_argument("--context-window-id")
 
     graph_parser = subparsers.add_parser("graph")
     graph_actions = graph_parser.add_subparsers(dest="graph_command", required=True)
@@ -1633,6 +1739,9 @@ def _dispatch(args: argparse.Namespace) -> int:
                 args.session_id,
                 args.context_used_tokens,
                 args.context_limit_tokens,
+                source=args.source,
+                collector=args.collector,
+                context_window_id=args.context_window_id,
             )
         except (OSError, ValueError) as error:
             print(f"orchestration_state: {error}", file=sys.stderr)
@@ -1697,6 +1806,10 @@ def _dispatch(args: argparse.Namespace) -> int:
         else:
             state["active"] = False
             state["checkpoint_on_compact"] = False
+            lifecycle = state.get("lifecycle")
+            if isinstance(lifecycle, dict):
+                lifecycle["ended_at"] = int(time.time())
+                lifecycle["end_reason"] = "completed"
             path = write_state(
                 args.session_id,
                 state,
