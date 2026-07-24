@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -289,6 +290,10 @@ def stop(context: HookContext) -> JsonObject:
         context.state["terminal_packet_digest"] = canonical_packet_digest(packet)
         context.state["active"] = False
         context.state["checkpoint_on_compact"] = False
+        lifecycle = context.state.get("lifecycle")
+        if isinstance(lifecycle, dict):
+            lifecycle["ended_at"] = int(time.time())
+            lifecycle["end_reason"] = "terminal-receipt"
         context.save()
     return {}
 

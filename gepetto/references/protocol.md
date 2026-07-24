@@ -105,10 +105,12 @@ Load full content only when `reload_required` is true; otherwise use the returne
 
 ## Supervision
 
-Hooks stamp `last_heartbeat` and a compatibility `events` counter on every registered active session. Record measurable pressure before classifying whenever token telemetry is available:
+New registrations and continuations carry a versioned lifecycle record and begin with a pending heartbeat observation. Supported hook invocations record the exact event, source, collector, and timestamp plus compatibility `last_heartbeat` and `events` fields. A heartbeat proves only that one hook observation occurred; it is not proof of uninterrupted execution between observations. Legacy records without the lifecycle contract remain legacy/unknown.
+
+Record measurable pressure before classifying whenever token telemetry is available. The record includes typed source, collector, context-window, validation, and observation fields:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" pressure record --session-id <task-id> --context-used-tokens <used> --context-limit-tokens <limit>
+python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_state.py" pressure record --session-id <task-id> --context-used-tokens <used> --context-limit-tokens <limit> --source <measurement-source> --collector <collector-version> --context-window-id <window-id>
 ```
 
 The sample also records persisted state bytes. Classify lane liveness mechanically when refreshing task state:
@@ -119,11 +121,15 @@ python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_wa
 
 The watchdog only reports; Gepetto owns every restart. Apply its statuses explicitly:
 
-- `stale` raises `LANE_UNRESPONSIVE` into `blocked`; replace the lane task through the checkpoint flow, registering the continuation with `continue --supervised` so the restart consumes budget.
+- `stale-current` raises `LANE_UNRESPONSIVE` into `blocked`; replace the lane task through the checkpoint flow, registering the continuation with `continue --supervised` so the restart consumes budget.
 - `over-budget` raises `RESTART_BUDGET_EXCEEDED` into `needs_decision`; stop for a user decision.
-- `recycle` requests a proactive checkpoint (a planned handoff, no `--supervised`). Measured context or state pressure takes precedence; the event threshold is used only when no pressure sample exists.
+- `recycle-current` requests a proactive checkpoint (a planned handoff, no `--supervised`). Current measured context or state pressure takes precedence; unavailable or expired pressure remains explicit, and the event threshold is labeled as a separate heuristic.
+- `legacy-unknown` and `completed-ignored` are non-actionable. Never infer current liveness, staleness, completion, or token spending from them.
+- `invalid` is fail-closed for structurally invalid current-lifecycle records.
 
-TTLs, restart budget, and pressure/event thresholds come from `policies.supervision` in `workflow.json`. Pressure resets on continuation. The command exits non-zero when any lane is stale or over-budget.
+TTLs, restart budget, and pressure/event thresholds come from `policies.supervision` in `workflow.json`. Pressure resets on continuation. Missing pressure is `unavailable`, expired valid pressure is `measured-expired`, and neither is reported as measured context. The 80% pressure threshold is unchanged. The command exits non-zero when any lane is stale-current, over-budget, or invalid.
+
+Use `orchestration_watchdog.py audit` for deterministic, payload-safe lifecycle and runtime compatibility inventory. Use `orchestration_watchdog.py reconcile --dry-run` for a no-write plan. The repository-local interface does not mutate active Codex installation/configuration or historical records.
 
 ## Research task prompt
 
