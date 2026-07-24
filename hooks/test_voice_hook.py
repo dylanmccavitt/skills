@@ -271,6 +271,22 @@ class VoiceHookTests(unittest.TestCase):
                             ),
                             reviewer_environment,
                         )
+            relative_kernel_path = VOICE_STATE_PATH.relative_to(Path.cwd())
+            with self.assertRaisesRegex(StateError, "cannot use Bash"):
+                handle_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "functions__exec_command",
+                        "tool_input": {
+                            "cmd": (
+                                f"python3 {relative_kernel_path} "
+                                "transition < payload.json"
+                            ),
+                            "workdir": str(Path(directory) / "alternate"),
+                        },
+                    },
+                    reviewer_environment,
+                )
             with self.assertRaisesRegex(StateError, "cannot use Bash"):
                 handle_hook(bash("npm test"), reviewer_environment)
             with self.assertRaisesRegex(StateError, "cannot use Bash"):

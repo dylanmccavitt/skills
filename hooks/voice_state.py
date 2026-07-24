@@ -1240,7 +1240,8 @@ def _control_operation(command: str) -> str | None:
     )
     if not match:
         return None
-    if Path(match.group("script")).resolve() != Path(__file__).resolve():
+    script = Path(match.group("script"))
+    if not script.is_absolute() or script.resolve() != Path(__file__).resolve():
         return None
     return match.group(2)
 
