@@ -1233,12 +1233,16 @@ def _ordinary_command_is_read_only(command: str) -> bool:
 def _control_operation(command: str) -> str | None:
     match = re.fullmatch(
         r"\s*(?:/usr/bin/env\s+)?python3?\s+"
-        r"[A-Za-z0-9_./:-]*voice_state\.py\s+"
+        r"(?P<script>[A-Za-z0-9_./:-]*voice_state\.py)\s+"
         r"(create|transition|deliver|recover-delivery|classify|orchestrate)"
         r"\s*(?:<\s*[A-Za-z0-9_./:-]+)?\s*",
         command,
     )
-    return match.group(1) if match else None
+    if not match:
+        return None
+    if Path(match.group("script")).resolve() != Path(__file__).resolve():
+        return None
+    return match.group(2)
 
 
 def _command_from_payload(payload: dict) -> str:

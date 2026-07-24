@@ -14,6 +14,7 @@ TOKENS = {
     "reviewer": "reviewer-secret",
 }
 HEAD = "a" * 40
+VOICE_STATE_PATH = Path(__file__).with_name("voice_state.py").resolve()
 
 
 def contract():
@@ -167,7 +168,9 @@ class VoiceHookTests(unittest.TestCase):
                     "method": "squash",
                 },
             )
-            command = bash("python3 /installed/voice_state.py deliver < payload.json")
+            command = bash(
+                f"python3 {VOICE_STATE_PATH} deliver < payload.json"
+            )
             base_environment = {
                 "CODEX_ORCHESTRATION_STATE": str(path),
                 "CODEX_ORCHESTRATION_TASK": "task-1",
@@ -249,11 +252,25 @@ class VoiceHookTests(unittest.TestCase):
             }
             handle_hook(
                 bash(
-                    "python3 /installed/voice_state.py "
+                    f"python3 {VOICE_STATE_PATH} "
                     "transition < payload.json"
                 ),
                 reviewer_environment,
             )
+            for alternate_path in (
+                Path(directory) / "voice_state.py",
+                Path(directory) / "safe" / ".." / "voice_state.py",
+                Path("/installed/voice_state.py"),
+            ):
+                with self.subTest(alternate_path=alternate_path):
+                    with self.assertRaisesRegex(StateError, "cannot use Bash"):
+                        handle_hook(
+                            bash(
+                                f"python3 {alternate_path} "
+                                "transition < payload.json"
+                            ),
+                            reviewer_environment,
+                        )
             with self.assertRaisesRegex(StateError, "cannot use Bash"):
                 handle_hook(bash("npm test"), reviewer_environment)
             with self.assertRaisesRegex(StateError, "cannot use Bash"):
