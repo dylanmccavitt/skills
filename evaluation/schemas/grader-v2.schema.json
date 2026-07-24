@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dylanmccavitt/skills/evaluation/schemas/grader-v2.schema.json",
+  "title": "Held-Out Evaluation Grader Version 2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "grader_id", "grader_version", "fixture_id", "fixture_version", "public_fixture_sha256", "private_assets_tree_sha256", "checks"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "grader_id": {"type": "string"},
+    "grader_version": {"const": 2},
+    "fixture_id": {"const": "checkpoint-continuation-v2"},
+    "fixture_version": {"const": 2},
+    "public_fixture_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "private_assets_tree_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "required", "execution", "expected"],
+        "properties": {
+          "id": {"type": "string"},
+          "category": {"enum": ["functional_outcome", "contract_fidelity"]},
+          "required": {"type": "boolean"},
+          "execution": {"type": "object"},
+          "expected": {"type": "object"}
+        }
+      }
+    }
+  }
+}

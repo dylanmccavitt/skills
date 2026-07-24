@@ -1,5 +1,8 @@
+import hashlib
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +20,10 @@ from validate import (
 HERE = Path(__file__).resolve().parent
 LOW = "low-risk-existing-tests-v1"
 REVIEW = "seeded-review-defects-v1"
+CHECKPOINT = "checkpoint-continuation-v2"
+CORPUS_V1_BYTES_SHA256 = (
+    "055de4a7412053013ba5cb629ea9a42470d461f7c07d2e341580bbb11703f1a5"
+)
 
 
 class EvaluationContractTests(unittest.TestCase):
@@ -43,40 +50,78 @@ class EvaluationContractTests(unittest.TestCase):
         shutil.copytree(HERE, self.root, ignore=shutil.ignore_patterns("__pycache__"))
 
     def rebind_fixture(self, fixture_id):
-        suite_path = self.root / "suite-v1.json"
-        suite = load_json(suite_path)
-        entry = next(
-            item for item in suite["fixtures"] if item["fixture_id"] == fixture_id
-        )
         fixture_root = self.root / "fixtures" / fixture_id
-        manifest_path = fixture_root / "public/manifest-v1.json"
-        grader_path = fixture_root / "grader/grader-v1.json"
+        version = 2 if fixture_id == CHECKPOINT else 1
+        manifest_path = fixture_root / f"public/manifest-v{version}.json"
+        grader_path = fixture_root / f"grader/grader-v{version}.json"
         manifest = load_json(manifest_path)
         grader = load_json(grader_path)
         payload_digest = tree_digest(fixture_root / "public/payload")
         seed_digest = tree_digest(fixture_root / "public/payload/seed")
         grader["public_fixture_sha256"] = public_fixture_digest(
-            fixture_id, entry["fixture_version"], payload_digest, seed_digest
+            fixture_id, version, payload_digest, seed_digest
         )
+        if version == 2:
+            grader["private_assets_tree_sha256"] = tree_digest(
+                fixture_root / "grader/assets"
+            )
         grader_path.write_text(json.dumps(grader, indent=2) + "\n", encoding="utf-8")
         grader_digest = document_digest(grader)
         manifest["grader"]["digest"] = grader_digest
         manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
-        entry.update(
-            {
-                "public_manifest_sha256": document_digest(manifest),
-                "public_payload_tree_sha256": payload_digest,
-                "seed_repository_tree_sha256": seed_digest,
-                "grader_contract_sha256": grader_digest,
-            }
-        )
-        suite_path.write_text(json.dumps(suite, indent=2) + "\n", encoding="utf-8")
+        for suite_version in (1, 2):
+            suite_path = self.root / f"suite-v{suite_version}.json"
+            suite = load_json(suite_path)
+            entry = next(
+                (
+                    item
+                    for item in suite["fixtures"]
+                    if item["fixture_id"] == fixture_id
+                ),
+                None,
+            )
+            if entry is None:
+                continue
+            entry.update(
+                {
+                    "public_manifest_sha256": document_digest(manifest),
+                    "public_payload_tree_sha256": payload_digest,
+                    "seed_repository_tree_sha256": seed_digest,
+                    "grader_contract_sha256": grader_digest,
+                }
+            )
+            suite_path.write_text(
+                json.dumps(suite, indent=2) + "\n", encoding="utf-8"
+            )
 
     def test_checked_in_corpus_is_valid(self):
         result = validate(self.root)
-        self.assertEqual(result["fixtures"], "2")
+        self.assertEqual(result["fixtures"], "3")
+
+    def test_version_one_corpus_bytes_remain_frozen(self):
+        paths = [self.root / "suite-v1.json"]
+        paths.extend(sorted((self.root / "schemas").glob("*-v1.schema.json")))
+        for fixture_id in (LOW, REVIEW):
+            paths.extend(
+                sorted(
+                    path
+                    for path in (self.root / "fixtures" / fixture_id).rglob("*")
+                    if path.is_file()
+                )
+            )
+        hasher = hashlib.sha256()
+        hasher.update(b"evaluation-corpus-v1\0")
+        hasher.update(len(paths).to_bytes(8, "big"))
+        for path in sorted(paths):
+            relative = path.relative_to(self.root).as_posix().encode("utf-8")
+            content = path.read_bytes()
+            hasher.update(len(relative).to_bytes(8, "big"))
+            hasher.update(relative)
+            hasher.update(len(content).to_bytes(8, "big"))
+            hasher.update(content)
+        self.assertEqual(hasher.hexdigest(), CORPUS_V1_BYTES_SHA256)
 
     def test_duplicate_json_keys_are_rejected(self):
         path = self.root / "suite-v1.json"
@@ -136,7 +181,7 @@ class EvaluationContractTests(unittest.TestCase):
                 {"manifest": f"fixtures/{LOW}/public/missing.json"}
             ),
         )
-        self.assert_invalid("dangling manifest reference")
+        self.assert_invalid("identity/version mismatch|dangling manifest reference")
 
         self.reset_corpus()
         self.rewrite_json(
@@ -178,7 +223,72 @@ class EvaluationContractTests(unittest.TestCase):
         (self.root / "schemas/unversioned.schema.json").write_text(
             "{}\n", encoding="utf-8"
         )
-        self.assert_invalid("missing or extra version 1 schema documents")
+        self.assert_invalid("missing or extra versioned schema documents")
+
+    def test_version_two_identity_and_scenario_combinations_fail_closed(self):
+        self.rewrite_json(
+            "suite-v2.json",
+            lambda value: value["fixtures"][2].update({"fixture_version": 1}),
+        )
+        self.assert_invalid("identity/version mismatch|invalid version 2 fixture")
+
+        self.reset_corpus()
+        self.rewrite_json(
+            f"fixtures/{CHECKPOINT}/public/manifest-v2.json",
+            lambda value: value.update({"scenario_kind": "low_risk_existing_tests"}),
+        )
+        self.assert_invalid("unsupported scenario kind")
+
+    def test_private_asset_tampering_is_rejected(self):
+        grader_asset = (
+            self.root
+            / f"fixtures/{CHECKPOINT}/grader/assets/grade_checkpoint.py"
+        )
+        grader_asset.write_text(
+            grader_asset.read_text(encoding="utf-8") + "\n# tamper\n",
+            encoding="utf-8",
+        )
+        self.assert_invalid("private grader asset binding drift")
+
+    def test_checkpoint_fixture_rejects_partial_and_accepts_reference(self):
+        fixture_root = self.root / "fixtures" / CHECKPOINT
+        check = fixture_root / "grader/assets/grade_checkpoint.py"
+        partial = fixture_root / "public/payload/seed"
+        reference = fixture_root / "grader/assets/reference"
+        failed = subprocess.run(
+            [
+                sys.executable,
+                str(check),
+                "--workspace",
+                str(partial),
+                "--check",
+                "outcomes",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        for check_name in ("outcomes", "preservation", "scope"):
+            with self.subTest(check=check_name):
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(check),
+                        "--workspace",
+                        str(reference),
+                        "--check",
+                        check_name,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr or completed.stdout,
+                )
 
     def test_held_out_details_cannot_leak_into_public_content(self):
         cases = (

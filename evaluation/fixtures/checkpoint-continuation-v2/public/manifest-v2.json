@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "fixture_id": "checkpoint-continuation-v2",
+  "fixture_version": 2,
+  "scenario_kind": "checkpoint_continuation",
+  "prompt": "payload/prompt.md",
+  "acceptance_criteria": "payload/acceptance.md",
+  "seed_repository": "payload/seed",
+  "initial_repository": {
+    "default_branch": "main",
+    "initial_ref": "fixture-v2",
+    "clean_worktree": true
+  },
+  "grader": {
+    "id": "checkpoint-continuation-grader",
+    "version": 2,
+    "digest": "sha256:eb8d070fce32906a532e73046cb0983c4304af7ec4c5387e4539aeda84e83bf3"
+  }
+}
