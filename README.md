@@ -18,11 +18,13 @@ This package keeps repository work safe after a voice conversation moves on. It 
 - `checkpoint`: atomic durable handoff.
 - `orchestrate`: optional approved complex-lane coordination.
 
-The coordinator/user approves scope, revisions, stops, and every external delivery. Skill invocation is not authority. A delivery attempt needs a registered coordinator/user actor and a one-shot authority record bound to the task, repository, PR, reviewed head, effect, and exact tool request.
+The coordinator/user approves scope, revisions, stops, and every external delivery. Skill invocation is not authority. A delivery attempt needs a credentialed coordinator/user actor and a one-shot typed action bound to the task, repository, PR, reviewed head, and merge method.
 
 ## Safety kernel
 
-The kernel records compact task contracts, registered role owners, writer ownership, receipts, proof, and authority. Persisted transitions use locked compare-and-swap updates and atomic replacement. Review Gate must be registered independently from Implement; checkpoint recovery transfers the single writer to a confirmed successor. Immediately before an authorized external action, the hook verifies the exact request, refreshes the real PR head from GitHub, and consumes the grant once.
+The kernel records compact task contracts, credential hashes, registered role owners, writer ownership, receipts, proof, and authority. Persisted transitions use locked compare-and-swap updates and atomic replacement. Review Gate is credentialed separately from Implement and decision actors; checkpoint freezes the outgoing writer before transferring ownership to a confirmed successor.
+
+`voice_state.py create` provisions a task and one capability per actor. `transition` applies credentialed state changes. `deliver` is the only supported external-action path: it refreshes the live PR head, consumes the grant once, and invokes `gh pr merge` with `--match-head-commit`. The installed hook blocks direct merge, protected-branch push, issue-close, publish, and production-deploy commands.
 
 ## Install
 

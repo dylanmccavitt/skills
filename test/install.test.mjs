@@ -41,7 +41,7 @@ test("installs all skills and preserves existing hooks", () => {
   );
 });
 
-test("installed delivery hook fails closed without exact task authority", () => {
+test("installed hook blocks direct delivery in favor of the typed runner", () => {
   const codexHome = temporaryCodexHome();
   installSuite({ codexHome, sourceRoot: repositoryRoot });
   const config = JSON.parse(readFileSync(join(codexHome, "hooks.json"), "utf8"));
@@ -59,7 +59,7 @@ test("installed delivery hook fails closed without exact task authority", () => 
   });
 
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /missing delivery gate context/);
+  assert.match(result.stderr, /typed voice_state\.py deliver/);
 });
 
 test("runs through an npm-style binary symlink", () => {
@@ -157,6 +157,27 @@ test("upgrade preserves legacy-named links not owned by this package", () => {
   const link = join(skillsRoot, "pinocchio");
   assert.equal(lstatSync(link).isSymbolicLink(), true);
   assert.equal(resolve(skillsRoot, readlinkSync(link)), external);
+});
+
+test("repair install removes an orphan package legacy hook without a marker", () => {
+  const codexHome = temporaryCodexHome();
+  const legacyCommand =
+    '/usr/bin/env python3 "${CODEX_HOME:-$HOME/.codex}/orchestration-skills/hooks/orchestration_hook.py"';
+  writeFileSync(
+    join(codexHome, "hooks.json"),
+    `${JSON.stringify({
+      hooks: {
+        Stop: [{ hooks: [{ type: "command", command: legacyCommand }] }],
+        PreToolUse: [{ matcher: "foreign", hooks: [{ type: "command", command: "preserve-me" }] }],
+      },
+    })}\n`,
+  );
+
+  installSuite({ codexHome, sourceRoot: repositoryRoot });
+
+  const hooks = JSON.parse(readFileSync(join(codexHome, "hooks.json"), "utf8"));
+  assert.equal(JSON.stringify(hooks).includes("orchestration_hook.py"), false);
+  assert.equal(JSON.stringify(hooks).includes("preserve-me"), true);
 });
 
 test("refuses a symlinked package install root even when its target has a marker", () => {

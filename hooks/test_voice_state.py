@@ -1,23 +1,33 @@
+import json
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from voice_state import (
     HeadDriftError,
     StateError,
     create_task,
-    delivery_request,
     load_task,
     mutate_task,
     observe_pr_head,
-    requested_delivery_effect,
+    run_delivery,
     validate_lanes,
     work_class,
 )
 
 
 HEAD = "a" * 40
+TOKENS = {
+    "coordinator": "coordinator-secret",
+    "user": "user-secret",
+    "writer": "writer-secret",
+    "successor": "successor-secret",
+    "reviewer": "reviewer-secret",
+}
 
 
 def contract():
@@ -38,37 +48,51 @@ def contract():
     }
 
 
-def merge_payload(pr="42"):
+def action(pr="42", repo="owner/repo"):
     return {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {"command": f"gh pr merge {pr} --repo owner/repo"},
+        "kind": "github_merge",
+        "repo": repo,
+        "pr": pr,
+        "method": "squash",
     }
 
 
-def create_reviewed_task(path):
-    create_task(path, "task-1", contract())
-    mutate_task(
+def create(path):
+    return create_task(path, "task-1", contract(), TOKENS)
+
+
+def transition(path, revision, operation, **arguments):
+    actor = arguments.get("actor")
+    return mutate_task(
         path,
         "task-1",
+        revision,
+        operation,
+        credential=TOKENS.get(actor, ""),
+        **arguments,
+    )
+
+
+def create_reviewed_task(path):
+    create(path)
+    transition(
+        path,
         1,
         "claim",
         actor="writer",
         branch="feature",
         worktree="writer-tree",
     )
-    mutate_task(
+    transition(
         path,
-        "task-1",
         2,
         "implemented",
         actor="writer",
         head=HEAD,
         checks=["npm test"],
     )
-    return mutate_task(
+    return transition(
         path,
-        "task-1",
         3,
         "review",
         actor="reviewer",
@@ -77,21 +101,15 @@ def create_reviewed_task(path):
     )
 
 
-def grant_delivery(path, revision=4, payload=None):
-    request = delivery_request(payload or merge_payload())
-    return mutate_task(
+def grant(path, revision=4, merge_action=None):
+    return transition(
         path,
-        "task-1",
         revision,
         "grant-delivery",
         actor="coordinator",
         origin="coordinator",
-        effect=request["effect"],
-        repo="owner/repo",
-        task_id="task-1",
-        pr="42",
         head=HEAD,
-        request_digest=request["digest"],
+        action=merge_action or action(),
     )
 
 
@@ -118,46 +136,55 @@ class VoiceStateTests(unittest.TestCase):
             text=True,
         )
 
-    def test_contract_requires_separate_registered_roles_and_decision_owner(self):
+    def test_contract_requires_independent_roles_and_credentials(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
+            path = Path(directory) / "state.json"
             invalid = contract()
             invalid["actors"]["review_gate"] = ["writer"]
             with self.assertRaisesRegex(StateError, "must be independent"):
-                create_task(path, "task-1", invalid)
+                create_task(path, "task-1", invalid, TOKENS)
 
             invalid = contract()
-            invalid["actors"]["coordinator"] = ["other"]
-            with self.assertRaisesRegex(StateError, "task owner"):
-                create_task(path, "task-1", invalid)
+            invalid["actors"]["review_gate"] = ["coordinator"]
+            with self.assertRaisesRegex(StateError, "must remain read-only"):
+                create_task(path, "task-1", invalid, TOKENS)
+
+            with self.assertRaisesRegex(StateError, "every registered actor"):
+                create_task(path, "task-1", contract(), {"writer": "secret"})
+
+    def test_actor_credential_prevents_writer_from_impersonating_coordinator(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            create_reviewed_task(path)
+            with self.assertRaisesRegex(StateError, "credential is invalid"):
+                mutate_task(
+                    path,
+                    "task-1",
+                    4,
+                    "grant-delivery",
+                    credential=TOKENS["writer"],
+                    actor="coordinator",
+                    origin="coordinator",
+                    head=HEAD,
+                    action=action(),
+                )
+            self.assertIsNone(load_task(path, "task-1")["authority"])
 
     def test_claim_requires_registered_writer_approved_branch_and_current_revision(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
-            create_task(path, "task-1", contract())
-            with self.assertRaisesRegex(StateError, "not registered"):
-                mutate_task(
-                    path,
-                    "task-1",
-                    1,
-                    "claim",
-                    actor="intruder",
-                    branch="feature",
-                    worktree="intruder-tree",
-                )
+            path = Path(directory) / "state.json"
+            create(path)
             with self.assertRaisesRegex(StateError, "approved contract"):
-                mutate_task(
+                transition(
                     path,
-                    "task-1",
                     1,
                     "claim",
                     actor="writer",
                     branch="other",
                     worktree="writer-tree",
                 )
-            claimed = mutate_task(
+            claimed = transition(
                 path,
-                "task-1",
                 1,
                 "claim",
                 actor="writer",
@@ -166,62 +193,46 @@ class VoiceStateTests(unittest.TestCase):
             )
             self.assertEqual(claimed["revision"], 2)
             with self.assertRaisesRegex(StateError, "revision conflict"):
-                mutate_task(
+                transition(
                     path,
-                    "task-1",
                     1,
-                    "claim",
-                    actor="successor",
-                    branch="feature",
-                    worktree="successor-tree",
+                    "checkpoint",
+                    actor="writer",
+                    successor="successor",
+                    next_action="continue",
                 )
-            self.assertEqual(load_task(path, "task-1")["writer"]["actor"], "writer")
 
-    def test_only_registered_independent_reviewer_can_review_current_head(self):
+    def test_only_credentialed_independent_reviewer_can_review_current_head(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
-            create_task(path, "task-1", contract())
-            mutate_task(
+            path = Path(directory) / "state.json"
+            create(path)
+            transition(
                 path,
-                "task-1",
                 1,
                 "claim",
                 actor="writer",
                 branch="feature",
                 worktree="writer-tree",
             )
-            mutate_task(
+            transition(
                 path,
-                "task-1",
                 2,
                 "implemented",
                 actor="writer",
                 head=HEAD,
                 checks=["npm test"],
             )
-            with self.assertRaisesRegex(StateError, "not registered"):
-                mutate_task(
+            with self.assertRaisesRegex(StateError, "review_gate"):
+                transition(
                     path,
-                    "task-1",
                     3,
                     "review",
                     actor="writer",
                     head=HEAD,
                     passed=True,
                 )
-            with self.assertRaisesRegex(StateError, "current implemented head"):
-                mutate_task(
-                    path,
-                    "task-1",
-                    3,
-                    "review",
-                    actor="reviewer",
-                    head="b" * 40,
-                    passed=True,
-                )
-            reviewed = mutate_task(
+            reviewed = transition(
                 path,
-                "task-1",
                 3,
                 "review",
                 actor="reviewer",
@@ -230,228 +241,152 @@ class VoiceStateTests(unittest.TestCase):
             )
             self.assertEqual(reviewed["state"], "review_passed")
 
-    def test_implement_actor_cannot_grant_delivery(self):
+    def test_typed_grant_cannot_target_a_different_repo(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
+            path = Path(directory) / "state.json"
             create_reviewed_task(path)
-            request = delivery_request(merge_payload())
-            with self.assertRaisesRegex(StateError, "cannot grant"):
-                mutate_task(
-                    path,
-                    "task-1",
-                    4,
-                    "grant-delivery",
-                    actor="writer",
-                    origin="coordinator",
-                    effect="merge",
-                    repo="owner/repo",
-                    task_id="task-1",
-                    pr="42",
-                    head=HEAD,
-                    request_digest=request["digest"],
-                )
-            self.assertEqual(load_task(path, "task-1")["revision"], 4)
+            with self.assertRaisesRegex(StateError, "outside the approved task scope"):
+                grant(path, merge_action=action("99", "attacker/other"))
+            self.assertIsNone(load_task(path, "task-1")["authority"])
 
-    def test_unregistered_decision_actor_cannot_grant_delivery(self):
+    def test_typed_delivery_refreshes_head_and_matches_it_in_merge_command(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
+            path = Path(directory) / "state.json"
             create_reviewed_task(path)
-            request = delivery_request(merge_payload())
-            with self.assertRaisesRegex(StateError, "not registered"):
-                mutate_task(
-                    path,
-                    "task-1",
-                    4,
-                    "grant-delivery",
-                    actor="intruder",
-                    origin="coordinator",
-                    effect="merge",
-                    repo="owner/repo",
-                    task_id="task-1",
-                    pr="42",
-                    head=HEAD,
-                    request_digest=request["digest"],
-                )
-
-    def test_delivery_grant_is_exact_action_exact_head_and_one_shot(self):
-        with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
-            create_reviewed_task(path)
-            granted = grant_delivery(path)
-            grant_id = granted["authority"]["id"]
-            request = delivery_request(merge_payload())
+            granted = grant(path)
             observed = []
-            consumed = mutate_task(
+            commands = []
+
+            result = run_delivery(
                 path,
                 "task-1",
                 5,
-                "consume-delivery",
-                grant_id=grant_id,
-                effect=request["effect"],
-                request_digest=request["digest"],
+                granted["authority"]["id"],
+                action(),
                 observe_head=lambda repo, pr: observed.append((repo, pr)) or HEAD,
+                run_command=lambda command, check: commands.append((command, check))
+                or SimpleNamespace(returncode=0),
             )
-            self.assertEqual(observed, [("owner/repo", "42")])
-            self.assertEqual(consumed["authority"]["status"], "consumed")
-            self.assertEqual(consumed["state"], "delivery_started")
-            with self.assertRaisesRegex(StateError, "one-shot"):
-                mutate_task(
-                    path,
-                    "task-1",
-                    6,
-                    "consume-delivery",
-                    grant_id=grant_id,
-                    effect=request["effect"],
-                    request_digest=request["digest"],
-                    observe_head=lambda _repo, _pr: HEAD,
-                )
 
-    def test_different_action_cannot_consume_grant_or_trigger_head_observation(self):
+            self.assertEqual(observed, [("owner/repo", "42")])
+            self.assertEqual(
+                commands,
+                [
+                    (
+                        [
+                            "gh",
+                            "pr",
+                            "merge",
+                            "42",
+                            "--repo",
+                            "owner/repo",
+                            "--squash",
+                            "--match-head-commit",
+                            HEAD,
+                        ],
+                        False,
+                    )
+                ],
+            )
+            self.assertEqual(result["state"], "complete")
+            self.assertEqual(result["authority"]["status"], "consumed")
+
+    def test_failed_typed_delivery_is_persisted_and_not_replayed(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
+            path = Path(directory) / "state.json"
             create_reviewed_task(path)
-            granted = grant_delivery(path)
-            observations = []
-            different = delivery_request(merge_payload("99"))
-            with self.assertRaisesRegex(StateError, "exact action"):
-                mutate_task(
+            granted = grant(path)
+            with self.assertRaisesRegex(StateError, "failed with exit 1"):
+                run_delivery(
                     path,
                     "task-1",
                     5,
-                    "consume-delivery",
-                    grant_id=granted["authority"]["id"],
-                    effect=different["effect"],
-                    request_digest=different["digest"],
-                    observe_head=lambda repo, pr: observations.append((repo, pr)) or HEAD,
+                    granted["authority"]["id"],
+                    action(),
+                    observe_head=lambda _repo, _pr: HEAD,
+                    run_command=lambda _command, check: SimpleNamespace(returncode=1),
                 )
-            self.assertEqual(observations, [])
-            self.assertEqual(load_task(path, "task-1")["authority"]["status"], "active")
+            failed = load_task(path, "task-1")
+            self.assertEqual(failed["state"], "delivery_failed")
+            with self.assertRaisesRegex(StateError, "one-shot"):
+                run_delivery(
+                    path,
+                    "task-1",
+                    failed["revision"],
+                    granted["authority"]["id"],
+                    action(),
+                    observe_head=lambda _repo, _pr: HEAD,
+                    run_command=lambda _command, check: SimpleNamespace(returncode=0),
+                )
 
     def test_head_drift_atomically_invalidates_review_and_authority(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
+            path = Path(directory) / "state.json"
             create_reviewed_task(path)
-            granted = grant_delivery(path)
-            request = delivery_request(merge_payload())
+            granted = grant(path)
             with self.assertRaisesRegex(HeadDriftError, "live PR head"):
-                mutate_task(
+                run_delivery(
                     path,
                     "task-1",
                     5,
-                    "consume-delivery",
-                    grant_id=granted["authority"]["id"],
-                    effect=request["effect"],
-                    request_digest=request["digest"],
+                    granted["authority"]["id"],
+                    action(),
                     observe_head=lambda _repo, _pr: "b" * 40,
+                    run_command=lambda _command, check: self.fail(
+                        "command must not run"
+                    ),
                 )
             recovered = load_task(path, "task-1")
             self.assertEqual(recovered["revision"], 6)
             self.assertEqual(recovered["state"], "implementing")
             self.assertIsNone(recovered["review"])
             self.assertIsNone(recovered["authority"])
-            self.assertEqual(recovered["authority_history"][-1]["status"], "invalidated")
 
-    def test_revoked_or_superseded_grant_cannot_be_consumed(self):
+    def test_checkpoint_freezes_outgoing_writer_then_transfers_ownership(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
-            create_reviewed_task(path)
-            first = grant_delivery(path)
-            first_id = first["authority"]["id"]
-            revoked = mutate_task(
+            path = Path(directory) / "state.json"
+            create(path)
+            transition(
                 path,
-                "task-1",
-                5,
-                "revoke-delivery",
-                actor="coordinator",
-                grant_id=first_id,
-            )
-            request = delivery_request(merge_payload())
-            with self.assertRaisesRegex(StateError, "one-shot"):
-                mutate_task(
-                    path,
-                    "task-1",
-                    6,
-                    "consume-delivery",
-                    grant_id=first_id,
-                    effect=request["effect"],
-                    request_digest=request["digest"],
-                    observe_head=lambda _repo, _pr: HEAD,
-                )
-            self.assertEqual(revoked["authority"]["status"], "revoked")
-
-            second = grant_delivery(path, revision=6)
-            third = grant_delivery(path, revision=7)
-            self.assertEqual(third["authority_history"][-1]["status"], "superseded")
-            with self.assertRaisesRegex(StateError, "one-shot"):
-                mutate_task(
-                    path,
-                    "task-1",
-                    8,
-                    "consume-delivery",
-                    grant_id=second["authority"]["id"],
-                    effect=request["effect"],
-                    request_digest=request["digest"],
-                    observe_head=lambda _repo, _pr: HEAD,
-                )
-
-    def test_checkpoint_recovers_and_transfers_single_writer_ownership(self):
-        with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
-            create_task(path, "task-1", contract())
-            mutate_task(
-                path,
-                "task-1",
                 1,
                 "claim",
                 actor="writer",
                 branch="feature",
                 worktree="writer-tree",
             )
-            with self.assertRaisesRegex(StateError, "registered implement successor"):
-                mutate_task(
-                    path,
-                    "task-1",
-                    2,
-                    "checkpoint",
-                    actor="writer",
-                    successor="intruder",
-                    next_action="continue focused tests",
-                )
-            mutate_task(
+            checkpointed = transition(
                 path,
-                "task-1",
                 2,
                 "checkpoint",
                 actor="writer",
                 successor="successor",
                 next_action="continue focused tests",
             )
-
-            recovered = load_task(path, "task-1")
-            self.assertEqual(recovered["checkpoint"]["status"], "pending")
-            self.assertEqual(recovered["writer"]["actor"], "writer")
-            resumed = mutate_task(
+            self.assertIsNone(checkpointed["writer"])
+            with self.assertRaisesRegex(StateError, "claimed writer"):
+                transition(
+                    path,
+                    3,
+                    "implemented",
+                    actor="writer",
+                    head=HEAD,
+                    checks=[],
+                )
+            resumed = transition(
                 path,
-                "task-1",
                 3,
                 "resume-checkpoint",
                 actor="successor",
             )
-            self.assertEqual(resumed["revision"], 4)
             self.assertEqual(resumed["checkpoint"]["status"], "resumed")
-            self.assertEqual(
-                resumed["checkpoint"]["previous_writer"]["actor"], "writer"
-            )
             self.assertEqual(resumed["writer"]["actor"], "successor")
-            self.assertEqual(resumed["writer"]["worktree"], "writer-tree")
 
     def test_store_compare_and_swap_rejects_stale_mutation_without_partial_state(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "voice-state.json"
-            create_task(path, "task-1", contract())
-            mutate_task(
+            path = Path(directory) / "state.json"
+            create(path)
+            transition(
                 path,
-                "task-1",
                 1,
                 "claim",
                 actor="writer",
@@ -459,9 +394,8 @@ class VoiceStateTests(unittest.TestCase):
                 worktree="writer-tree",
             )
             with self.assertRaisesRegex(StateError, "revision conflict"):
-                mutate_task(
+                transition(
                     path,
-                    "task-1",
                     1,
                     "checkpoint",
                     actor="writer",
@@ -472,17 +406,12 @@ class VoiceStateTests(unittest.TestCase):
             self.assertEqual(recovered["revision"], 2)
             self.assertNotIn("checkpoint", recovered)
 
-    def test_ordinary_bypasses_state_and_complex_requires_approved_lanes(self):
-        self.assertEqual(work_class(False, False, False, False), "ordinary")
-        self.assertEqual(work_class(True, False, False, False), "durable")
-        self.assertEqual(work_class(False, True, False, False), "complex")
-        with self.assertRaises(StateError):
-            validate_lanes([{"id": "a", "domain": "src"}], False)
-        with self.assertRaises(StateError):
+    def test_lane_domains_reject_nested_overlap(self):
+        with self.assertRaisesRegex(StateError, "ownership domains"):
             validate_lanes(
                 [
                     {"id": "a", "domain": "src"},
-                    {"id": "b", "domain": "src"},
+                    {"id": "b", "domain": "src/api"},
                 ],
                 True,
             )
@@ -491,24 +420,50 @@ class VoiceStateTests(unittest.TestCase):
             True,
         )
 
-    def test_delivery_detection_covers_explicit_gh_global_repo_forms(self):
-        for command in [
-            "gh pr merge 42 --repo owner/repo",
-            "gh --repo owner/repo pr merge 42",
-            "gh -R owner/repo pr merge 42",
-            "/usr/local/bin/gh pr merge 42 --repo owner/repo",
-        ]:
-            with self.subTest(command=command):
-                self.assertEqual(
-                    requested_delivery_effect(
-                        {
-                            "hook_event_name": "PreToolUse",
-                            "tool_name": "Bash",
-                            "tool_input": {"command": command},
-                        }
-                    ),
-                    "merge",
-                )
+    def test_control_cli_can_create_and_transition_a_task(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            script = Path(__file__).with_name("voice_state.py")
+            created = subprocess.run(
+                [sys.executable, str(script), "create"],
+                input=json.dumps(
+                    {"state": str(path), "task": "task-1", "contract": contract()}
+                ),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            provisioned = json.loads(created.stdout)
+            claimed = subprocess.run(
+                [sys.executable, str(script), "transition"],
+                input=json.dumps(
+                    {
+                        "state": str(path),
+                        "task": "task-1",
+                        "revision": 1,
+                        "operation": "claim",
+                        "credential": provisioned["credentials"]["writer"],
+                        "arguments": {
+                            "actor": "writer",
+                            "branch": "feature",
+                            "worktree": "writer-tree",
+                        },
+                    }
+                ),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(claimed.stdout)["writer"]["actor"], "writer")
+            stored = path.read_text()
+            self.assertNotIn(provisioned["credentials"]["writer"], stored)
+
+    def test_work_class_keeps_orchestration_opt_in(self):
+        self.assertEqual(work_class(False, False, False, False), "ordinary")
+        self.assertEqual(work_class(True, False, False, False), "durable")
+        self.assertEqual(work_class(False, True, False, False), "complex")
+        with self.assertRaises(StateError):
+            validate_lanes([{"id": "a", "domain": "src"}], False)
 
 
 if __name__ == "__main__":

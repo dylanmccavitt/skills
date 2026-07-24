@@ -4,9 +4,11 @@ from __future__ import annotations
 import copy
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -29,31 +31,7 @@ class HeadDriftError(PersistedStateError):
 
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 FULL_DIGEST = re.compile(r"^[0-9a-f]{64}$")
-DELIVERY_EFFECTS = {"close", "deploy", "merge", "publish"}
-DELIVERY_PATTERNS = (
-    (
-        re.compile(
-            r"(?:^|[\s;&|])(?:\S*/)?gh(?:\s+(?:--repo|-R)\s+\S+)?"
-            r"\s+pr\s+merge(?:\s|$)"
-        ),
-        "merge",
-    ),
-    (
-        re.compile(
-            r"(?:^|[\s;&|])(?:\S*/)?gh(?:\s+(?:--repo|-R)\s+\S+)?"
-            r"\s+issue\s+close(?:\s|$)"
-        ),
-        "close",
-    ),
-    (re.compile(r"(?:^|[\s;&|])(?:\S*/)?npm\s+publish(?:\s|$)"), "publish"),
-    (
-        re.compile(
-            r"(?:^|[\s;&|])(?:\S*/)?vercel\s+deploy\b.*"
-            r"(?:--prod|--production)(?:\s|$)"
-        ),
-        "deploy",
-    ),
-)
+MERGE_METHODS = {"merge", "rebase", "squash"}
 
 
 def observe_pr_head(repo: str, pr: str) -> str:
@@ -94,13 +72,20 @@ def validate_lanes(lanes: list[dict], approved: bool) -> None:
     if not approved:
         raise StateError("complex lane map requires user approval")
     seen = set()
-    domains = set()
+    domains = []
     for lane in lanes:
         lane_id, domain = lane.get("id"), lane.get("domain")
-        if not lane_id or not domain or lane_id in seen or domain in domains:
+        normalized = domain.strip("/") if isinstance(domain, str) else ""
+        overlaps = any(
+            normalized == existing
+            or normalized.startswith(f"{existing}/")
+            or existing.startswith(f"{normalized}/")
+            for existing in domains
+        )
+        if not lane_id or not normalized or lane_id in seen or overlaps:
             raise StateError("lanes require unique ids and ownership domains")
         seen.add(lane_id)
-        domains.add(domain)
+        domains.append(normalized)
 
 
 def _validated_actors(contract: dict) -> dict[str, list[str]]:
@@ -136,12 +121,18 @@ def _validated_actors(contract: dict) -> dict[str, list[str]]:
         raise StateError("implement and review_gate actors must be independent")
     if implementers & decision_actors:
         raise StateError("implement actors cannot hold delivery authority")
+    if reviewers & decision_actors:
+        raise StateError("review_gate actors must remain read-only")
     if contract["owner"] not in decision_actors:
         raise StateError("task owner must be a registered coordinator or user actor")
     return normalized
 
 
-def new_task(task_id: str, contract: dict) -> dict:
+def new_task(
+    task_id: str,
+    contract: dict,
+    credential_hashes: dict[str, str],
+) -> dict:
     required = {
         "acceptance",
         "actors",
@@ -161,7 +152,12 @@ def new_task(task_id: str, contract: dict) -> dict:
         raise StateError("contract branch is required")
     if not isinstance(contract["repo"], str) or not contract["repo"]:
         raise StateError("contract repository is required")
-    _validated_actors(contract)
+    actors = _validated_actors(contract)
+    actor_ids = {actor for members in actors.values() for actor in members}
+    if set(credential_hashes) != actor_ids or any(
+        not FULL_DIGEST.fullmatch(value) for value in credential_hashes.values()
+    ):
+        raise StateError("every registered actor requires one credential hash")
     return {
         "schema": 2,
         "id": task_id,
@@ -169,6 +165,7 @@ def new_task(task_id: str, contract: dict) -> dict:
         "state": "approved",
         "contract": copy.deepcopy(contract),
         "contract_digest": digest(contract),
+        "credential_hashes": copy.deepcopy(credential_hashes),
         "writer": None,
         "head": None,
         "review": None,
@@ -212,6 +209,15 @@ def _actor_has_role(task: dict, actor: str, role: str) -> bool:
     return actor in task["contract"]["actors"].get(role, [])
 
 
+def _authenticate(task: dict, actor: str, credential: str, role: str) -> None:
+    if not _actor_has_role(task, actor, role):
+        raise StateError(f"actor is not registered for the {role} role")
+    expected = task["credential_hashes"].get(actor, "")
+    observed = digest({"task": task["id"], "actor": actor, "credential": credential})
+    if not credential or not hmac.compare_digest(expected, observed):
+        raise StateError("actor credential is invalid")
+
+
 def _archive_authority(task: dict, status: str) -> None:
     authority = task.get("authority")
     if not authority:
@@ -233,7 +239,7 @@ def _claim(
     def change(candidate: dict) -> None:
         if not _actor_has_role(candidate, actor, "implement"):
             raise StateError("writer is not registered for the implement role")
-        if candidate["writer"]:
+        if candidate["state"] != "approved" or candidate["writer"]:
             raise StateError("task already has a writer")
         if branch != candidate["contract"]["branch"]:
             raise StateError("writer branch does not match the approved contract")
@@ -258,7 +264,11 @@ def _set_implemented(
     checks: list[str],
 ) -> None:
     def change(candidate: dict) -> None:
-        if not candidate["writer"] or candidate["writer"]["actor"] != actor:
+        if (
+            candidate["state"] not in {"implementing", "changes_requested"}
+            or not candidate["writer"]
+            or candidate["writer"]["actor"] != actor
+        ):
             raise StateError("only the claimed writer may implement")
         if not FULL_SHA.fullmatch(head):
             raise StateError("implementation head must be a full commit SHA")
@@ -332,31 +342,48 @@ def _review(
     _transition(task, expected_revision, change)
 
 
+def validate_delivery_action(action: dict, repo: str | None = None) -> dict:
+    if not isinstance(action, dict) or set(action) != {"kind", "repo", "pr", "method"}:
+        raise StateError("delivery action must be one typed GitHub merge")
+    normalized = {
+        "kind": action.get("kind"),
+        "repo": action.get("repo"),
+        "pr": str(action.get("pr", "")),
+        "method": action.get("method"),
+    }
+    if (
+        normalized["kind"] != "github_merge"
+        or not isinstance(normalized["repo"], str)
+        or not normalized["repo"]
+        or not normalized["pr"].isdigit()
+        or normalized["method"] not in MERGE_METHODS
+        or (repo is not None and normalized["repo"] != repo)
+    ):
+        raise StateError("delivery action is outside the approved task scope")
+    return normalized
+
+
 def _grant_delivery(
     task: dict,
     expected_revision: int,
     actor: str,
     origin: str,
-    effect: str,
-    repo: str,
-    task_id: str,
-    pr: str,
     head: str,
-    request_digest: str,
+    action: dict,
 ) -> None:
     def change(candidate: dict) -> None:
+        normalized_action = validate_delivery_action(
+            action,
+            candidate["contract"]["repo"],
+        )
         if _actor_has_role(candidate, actor, "implement"):
             raise StateError("implement actors cannot grant delivery authority")
         if origin not in {"coordinator", "user"} or not _actor_has_role(
             candidate, actor, origin
         ):
             raise StateError("delivery authority actor is not registered for this task")
-        if task_id != candidate["id"] or repo != candidate["contract"]["repo"]:
-            raise StateError("delivery authority scope does not match the task")
-        if effect not in DELIVERY_EFFECTS or not pr:
-            raise StateError("delivery authority requires an explicit supported effect and PR")
-        if not FULL_SHA.fullmatch(head) or not FULL_DIGEST.fullmatch(request_digest):
-            raise StateError("delivery authority requires exact head and action digests")
+        if not FULL_SHA.fullmatch(head):
+            raise StateError("delivery authority requires an exact head")
         if (
             candidate["state"] != "review_passed"
             or not candidate["review"]
@@ -370,25 +397,20 @@ def _grant_delivery(
         grant_id = digest(
             {
                 "actor": actor,
-                "effect": effect,
+                "action": normalized_action,
                 "head": head,
-                "pr": pr,
-                "repo": repo,
-                "request_digest": request_digest,
                 "revision": candidate["revision"],
-                "task": task_id,
+                "task": candidate["id"],
             }
         )
         candidate["authority"] = {
             "id": grant_id,
             "actor": actor,
             "origin": origin,
-            "effect": effect,
-            "repo": repo,
-            "task": task_id,
-            "pr": pr,
+            "action": normalized_action,
+            "action_digest": digest(normalized_action),
+            "task": candidate["id"],
             "head": head,
-            "request_digest": request_digest,
             "status": "active",
         }
         candidate["next_action"] = "delivery gate refreshes live PR head"
@@ -437,21 +459,23 @@ def _consume_delivery(
     task: dict,
     expected_revision: int,
     grant_id: str,
-    effect: str,
-    request_digest: str,
+    action: dict,
     observe_head: Callable[[str, str], str] = observe_pr_head,
 ) -> None:
     def change(candidate: dict) -> None:
         authority = candidate.get("authority")
+        normalized_action = validate_delivery_action(
+            action,
+            candidate["contract"]["repo"],
+        )
         if (
             not authority
             or authority.get("id") != grant_id
             or authority.get("status") != "active"
-            or authority.get("effect") != effect
-            or authority.get("request_digest") != request_digest
+            or authority.get("action_digest") != digest(normalized_action)
         ):
             raise StateError("no active one-shot delivery authority for this exact action")
-        live_head = observe_head(authority["repo"], authority["pr"])
+        live_head = observe_head(normalized_action["repo"], normalized_action["pr"])
         if live_head != authority["head"] or live_head != candidate["head"]:
             _invalidate(candidate, f"live PR head changed to {live_head}")
             raise HeadDriftError(
@@ -477,6 +501,34 @@ def _consume_delivery(
     _transition(task, expected_revision, change)
 
 
+def _finish_delivery(
+    task: dict,
+    expected_revision: int,
+    grant_id: str,
+    succeeded: bool,
+    exit_code: int,
+) -> None:
+    def change(candidate: dict) -> None:
+        authority = candidate.get("authority")
+        if (
+            candidate["state"] != "delivery_started"
+            or not authority
+            or authority.get("id") != grant_id
+            or authority.get("status") != "consumed"
+        ):
+            raise StateError("delivery result does not match a consumed authority")
+        candidate["state"] = "complete" if succeeded else "delivery_failed"
+        candidate["next_action"] = "none" if succeeded else "user decides whether to retry"
+        _receipt(
+            candidate,
+            "delivered" if succeeded else "delivery-failed",
+            f"Typed delivery action exited {exit_code}.",
+            "delivery-gate",
+        )
+
+    _transition(task, expected_revision, change)
+
+
 def _checkpoint(
     task: dict,
     expected_revision: int,
@@ -486,7 +538,12 @@ def _checkpoint(
 ) -> None:
     def change(candidate: dict) -> None:
         writer = candidate.get("writer")
-        if not writer or writer["actor"] != actor:
+        if (
+            candidate["state"]
+            not in {"implementing", "implemented", "changes_requested", "review_passed"}
+            or not writer
+            or writer["actor"] != actor
+        ):
             raise StateError("only the claimed writer may checkpoint")
         if (
             not _actor_has_role(candidate, successor, "implement")
@@ -508,6 +565,7 @@ def _checkpoint(
         }
         candidate["review"] = None
         _archive_authority(candidate, "invalidated")
+        candidate["writer"] = None
         candidate["state"] = "checkpointed"
         candidate["next_action"] = next_action
         _receipt(
@@ -528,7 +586,9 @@ def _resume_checkpoint(
     def change(candidate: dict) -> None:
         saved = candidate.get("checkpoint")
         if (
-            not saved
+            candidate["state"] != "checkpointed"
+            or candidate.get("writer") is not None
+            or not saved
             or saved.get("status") != "pending"
             or saved.get("successor") != actor
             or not _actor_has_role(candidate, actor, "implement")
@@ -609,13 +669,38 @@ def locked_store(path: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def create_task(path: Path, task_id: str, contract: dict) -> dict:
+def create_task(
+    path: Path,
+    task_id: str,
+    contract: dict,
+    credentials: dict[str, str],
+) -> dict:
+    actors = _validated_actors(contract)
+    actor_ids = {actor for members in actors.values() for actor in members}
+    if set(credentials) != actor_ids or any(
+        not isinstance(value, str) or not value for value in credentials.values()
+    ):
+        raise StateError("every registered actor requires one credential")
+    credential_hashes = {
+        actor: digest(
+            {"task": task_id, "actor": actor, "credential": credential}
+        )
+        for actor, credential in credentials.items()
+    }
     with locked_store(path) as store:
         if task_id in store["tasks"]:
             raise StateError(f"task already exists: {task_id}")
-        store["tasks"][task_id] = new_task(task_id, contract)
+        store["tasks"][task_id] = new_task(task_id, contract, credential_hashes)
         result = copy.deepcopy(store["tasks"][task_id])
     return result
+
+
+def provision_task(path: Path, task_id: str, contract: dict) -> dict:
+    actors = _validated_actors(contract)
+    actor_ids = {actor for members in actors.values() for actor in members}
+    credentials = {actor: secrets.token_urlsafe(32) for actor in actor_ids}
+    task = create_task(path, task_id, contract, credentials)
+    return {"task": task, "credentials": credentials}
 
 
 def load_task(path: Path, task_id: str) -> dict:
@@ -638,6 +723,7 @@ def mutate_task(
     record_id: str,
     expected_revision: int,
     operation: str,
+    credential: str = "",
     **arguments,
 ) -> dict:
     persisted_error = None
@@ -648,20 +734,43 @@ def mutate_task(
             raise StateError(f"unknown task: {record_id}") from error
         try:
             if operation == "claim":
+                _authenticate(task, arguments.get("actor", ""), credential, "implement")
                 _claim(task, expected_revision, **arguments)
             elif operation == "implemented":
+                _authenticate(task, arguments.get("actor", ""), credential, "implement")
                 _set_implemented(task, expected_revision, **arguments)
             elif operation == "review":
+                _authenticate(
+                    task,
+                    arguments.get("actor", ""),
+                    credential,
+                    "review_gate",
+                )
                 _review(task, expected_revision, **arguments)
             elif operation == "grant-delivery":
+                origin = arguments.get("origin", "")
+                if origin not in {"coordinator", "user"}:
+                    raise StateError("delivery authority origin is invalid")
+                _authenticate(task, arguments.get("actor", ""), credential, origin)
                 _grant_delivery(task, expected_revision, **arguments)
             elif operation == "revoke-delivery":
+                authority = task.get("authority") or {}
+                _authenticate(
+                    task,
+                    arguments.get("actor", ""),
+                    credential,
+                    authority.get("origin", ""),
+                )
                 _revoke_delivery(task, expected_revision, **arguments)
             elif operation == "consume-delivery":
                 _consume_delivery(task, expected_revision, **arguments)
+            elif operation == "finish-delivery":
+                _finish_delivery(task, expected_revision, **arguments)
             elif operation == "checkpoint":
+                _authenticate(task, arguments.get("actor", ""), credential, "implement")
                 _checkpoint(task, expected_revision, **arguments)
             elif operation == "resume-checkpoint":
+                _authenticate(task, arguments.get("actor", ""), credential, "implement")
                 _resume_checkpoint(task, expected_revision, **arguments)
             else:
                 raise StateError(f"unknown operation: {operation}")
@@ -673,85 +782,170 @@ def mutate_task(
     return result
 
 
-def requested_delivery_effect(payload: dict) -> str | None:
+def direct_delivery_reason(payload: dict) -> str | None:
     if payload.get("hook_event_name") != "PreToolUse":
         return None
-    if payload.get("tool_name") == "mcp__github__merge_pull_request":
-        return "merge"
+    tool_name = payload.get("tool_name", "")
+    if isinstance(tool_name, str) and "github" in tool_name and "merge_pull_request" in tool_name:
+        return "direct GitHub merge"
+    if isinstance(tool_name, str) and "github" in tool_name and "close_issue" in tool_name:
+        return "direct issue closure"
     tool_input = payload.get("tool_input")
-    if payload.get("tool_name") != "Bash" or not isinstance(tool_input, dict):
+    if tool_name != "Bash" or not isinstance(tool_input, dict):
         return None
     command = tool_input.get("command", tool_input.get("cmd", ""))
     if not isinstance(command, str):
         return None
-    for pattern, effect in DELIVERY_PATTERNS:
-        if pattern.search(command):
-            return effect
+    normalized = re.sub(r"[\"'`\\]", "", command.lower())
+    checks = (
+        (r"\bgh\b[\s\S]*\bpr\s+merge\b", "direct GitHub merge"),
+        (
+            r"\bgh\b[\s\S]*\bapi\b[\s\S]*\bpulls?/\d+/merge\b",
+            "direct GitHub merge API",
+        ),
+        (
+            r"\bapi\.github\.com/repos/\S+/pulls?/\d+/merge\b",
+            "direct GitHub merge API",
+        ),
+        (r"\bgh\b[\s\S]*\bissue\s+close\b", "direct issue closure"),
+        (r"\bnpm\b[\s\S]*\bpublish\b", "direct package publish"),
+        (
+            r"\bvercel\b[\s\S]*\bdeploy\b[\s\S]*(?:--prod|--production)\b",
+            "direct production deploy",
+        ),
+        (
+            r"\bgit\s+push\b[^\n;&|]*(?:(?::|/|\s)(?:main|master))\b",
+            "direct protected-branch push",
+        ),
+    )
+    for pattern, reason in checks:
+        if re.search(pattern, normalized):
+            return reason
     return None
 
 
-def delivery_request(payload: dict) -> dict | None:
-    """Return the exact external action digest used by both grant and hook."""
-    effect = requested_delivery_effect(payload)
-    if effect is None:
-        return None
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
-        raise StateError("delivery tool input must be an object")
-    return {
-        "effect": effect,
-        "digest": digest({"tool": payload.get("tool_name"), "input": tool_input}),
-    }
+def handle_hook(payload: dict) -> None:
+    reason = direct_delivery_reason(payload)
+    if reason:
+        raise StateError(
+            f"{reason} is blocked; use the typed voice_state.py deliver command"
+        )
 
 
-def handle_hook(
-    payload: dict,
-    environment: dict[str, str],
+def run_delivery(
+    path: Path,
+    task_id: str,
+    expected_revision: int,
+    grant_id: str,
+    action: dict,
     observe_head: Callable[[str, str], str] = observe_pr_head,
-) -> None:
-    request = delivery_request(payload)
-    if request is None:
-        return
-    names = {
-        "state": "CODEX_ORCHESTRATION_STATE",
-        "task": "CODEX_ORCHESTRATION_TASK",
-        "revision": "CODEX_ORCHESTRATION_REVISION",
-        "grant": "CODEX_ORCHESTRATION_GRANT",
-    }
-    values = {key: environment.get(name, "") for key, name in names.items()}
-    missing = [names[key] for key, value in values.items() if not value]
-    if missing:
-        raise StateError(f"missing delivery gate context: {', '.join(missing)}")
-    try:
-        revision = int(values["revision"])
-    except ValueError as error:
-        raise StateError("delivery gate revision must be an integer") from error
-    mutate_task(
-        Path(values["state"]),
-        values["task"],
-        revision,
+    run_command=subprocess.run,
+) -> dict:
+    normalized_action = validate_delivery_action(action)
+    started = mutate_task(
+        path,
+        task_id,
+        expected_revision,
         "consume-delivery",
-        grant_id=values["grant"],
-        effect=request["effect"],
-        request_digest=request["digest"],
+        grant_id=grant_id,
+        action=normalized_action,
         observe_head=observe_head,
     )
+    head = started["head"]
+    command = [
+        "gh",
+        "pr",
+        "merge",
+        normalized_action["pr"],
+        "--repo",
+        normalized_action["repo"],
+        f"--{normalized_action['method']}",
+        "--match-head-commit",
+        head,
+    ]
+    result = run_command(command, check=False)
+    exit_code = int(result.returncode)
+    finished = mutate_task(
+        path,
+        task_id,
+        started["revision"],
+        "finish-delivery",
+        grant_id=grant_id,
+        succeeded=exit_code == 0,
+        exit_code=exit_code,
+    )
+    if exit_code != 0:
+        raise StateError(f"typed delivery action failed with exit {exit_code}")
+    return finished
+
+
+def _read_cli_payload() -> dict:
+    payload = json.load(sys.stdin)
+    if not isinstance(payload, dict):
+        raise StateError("command input must be a JSON object")
+    return payload
 
 
 def main(arguments: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if arguments is None else arguments)
-    if arguments == ["hook"]:
-        try:
+    try:
+        if arguments == ["hook"]:
             payload = json.load(sys.stdin)
             if not isinstance(payload, dict):
                 raise StateError("hook payload must be a JSON object")
-            handle_hook(payload, dict(os.environ))
+            handle_hook(payload)
             return 0
-        except Exception as error:
-            print(f"voice-state-hook: {error}", file=sys.stderr)
-            return 2
-    print("usage: voice_state.py hook", file=sys.stderr)
-    return 1
+        if arguments == ["create"]:
+            payload = _read_cli_payload()
+            result = provision_task(
+                Path(payload["state"]),
+                payload["task"],
+                payload["contract"],
+            )
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if arguments == ["transition"]:
+            payload = _read_cli_payload()
+            operation = payload["operation"]
+            if operation not in {
+                "claim",
+                "implemented",
+                "review",
+                "grant-delivery",
+                "revoke-delivery",
+                "checkpoint",
+                "resume-checkpoint",
+            }:
+                raise StateError("operation is not available through the control CLI")
+            result = mutate_task(
+                Path(payload["state"]),
+                payload["task"],
+                int(payload["revision"]),
+                operation,
+                credential=payload["credential"],
+                **payload.get("arguments", {}),
+            )
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if arguments == ["deliver"]:
+            payload = _read_cli_payload()
+            result = run_delivery(
+                Path(payload["state"]),
+                payload["task"],
+                int(payload["revision"]),
+                payload["grant"],
+                payload["action"],
+            )
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        print(
+            "usage: voice_state.py create|transition|deliver|hook",
+            file=sys.stderr,
+        )
+        return 1
+    except Exception as error:
+        print(f"voice-state: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

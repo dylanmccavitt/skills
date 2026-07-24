@@ -9,7 +9,7 @@ Role: atomic handoff.
 
 Input: current task record and revision, claimed writer, registered Implement successor, exact head, proof, authority limits, and next action.
 
-Allowed: atomically checkpoint and transfer the single writer slot to one confirmed successor through the locked state kernel.
+Allowed: atomically freeze the outgoing writer and transfer the single writer slot to one credentialed successor through the locked state kernel.
 
 Forbidden: auto-restart, alter scope or authority, bypass revision checks, create a second writer, or hide a failed handoff.
 

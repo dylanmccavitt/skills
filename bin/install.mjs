@@ -174,7 +174,7 @@ export function installSuite({ codexHome, sourceRoot = packageRoot } = {}) {
   const managedHooks = readJson(join(sourceRoot, "hooks", "hooks.json"));
 
   const existingPackageInstall = packageInstallExists(installRoot);
-  const existingHooks = existingPackageInstall ? withoutLegacyHooks(originalHooks) : originalHooks;
+  const existingHooks = withoutLegacyHooks(originalHooks);
   const mergedHooks = mergeHooks(existingHooks, managedHooks);
   const priorSkillLinks = ALL_PACKAGE_SKILLS.filter((skill) =>
     managedLink(join(skillsRoot, skill), join(installRoot, skill)),
@@ -251,7 +251,7 @@ export function uninstallSuite({ codexHome, sourceRoot = packageRoot } = {}) {
 
   if (pathExists(hooksPath)) {
     const original = parseExistingHooks(hooksPath);
-    const config = existingPackageInstall ? withoutLegacyHooks(original) : original;
+    const config = withoutLegacyHooks(original);
     const managed = managedHookEntries(sourceRoot);
     let changed = JSON.stringify(config) !== JSON.stringify(original);
     for (const [event, entries] of Object.entries(managed)) {
