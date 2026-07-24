@@ -1,50 +1,17 @@
 {
   "name": "@dylanmccavitt/skills",
-  "version": "0.4.0",
-  "description": "Install the Gepetto, Pinocchio, Jiminy, and Checkpoint orchestration skills for Codex.",
+  "version": "1.0.0",
+  "description": "Voice-directed durable delivery skills for Codex.",
   "license": "MIT",
   "author": "Dylan McCavitt",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/dylanmccavitt/skills.git"
-  },
+  "repository": { "type": "git", "url": "git+https://github.com/dylanmccavitt/skills.git" },
   "homepage": "https://github.com/dylanmccavitt/skills#readme",
   "bugs": "https://github.com/dylanmccavitt/skills/issues",
   "type": "module",
-  "bin": {
-    "skills": "bin/install.mjs"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
-  "files": [
-    "bin/",
-    "checkpoint/SKILL.md",
-    "checkpoint/agents/",
-    "gepetto/",
-    "hooks/hooks.json",
-    "hooks/orchestration_events.py",
-    "hooks/orchestration_contract.py",
-    "hooks/orchestration_graph.py",
-    "hooks/orchestration_hook.py",
-    "hooks/orchestration_packets.py",
-    "hooks/orchestration_state.py",
-    "hooks/orchestration_watchdog.py",
-    "jiminy/",
-    "pinocchio/",
-    "LICENSE",
-    "README.md"
-  ],
-  "scripts": {
-    "test": "node --test test/*.test.mjs && python3 -m unittest discover -s hooks -p \"test_*.py\" && python3 hooks/orchestration_graph.py && python3 -m unittest discover -s evaluation -p \"test_*.py\" && python3 evaluation/validate.py",
-    "prepack": "npm test"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "keywords": [
-    "codex",
-    "codex-skills",
-    "orchestration"
-  ]
+  "bin": { "skills": "bin/install.mjs" },
+  "publishConfig": { "access": "public" },
+  "files": ["bin/", "checkpoint/", "gepetto/", "implement/", "orchestrate/", "review-gate/", "hooks/hooks.json", "hooks/voice_state.py", "LICENSE", "README.md"],
+  "scripts": { "test": "node --test test/*.test.mjs && python3 -m unittest discover -s hooks -p 'test_*.py'", "prepack": "npm test" },
+  "engines": { "node": ">=18" },
+  "keywords": ["codex", "codex-skills", "voice", "orchestration"]
 }

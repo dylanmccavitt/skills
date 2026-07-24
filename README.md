@@ -1,85 +1,28 @@
-# Codex driven skills
+# Voice-directed Codex skills
 
-Four Codex skills for agent orchestration. Coordinated Codex threads in the desktop app take a tracked repo from research through to a verified PR and merge:
+This package keeps repository work safe after a voice conversation moves on. It does not choose product scope or delivery for the user.
 
-- `$gepetto` — orchestrator - researches inline for single-leaf scope, delegates research, implementation (`$pinocchio`), and review threads otherwise
-- `$pinocchio` — implementer - delivers one approved leaf as a verified pull request
-- `$jiminy` — merge-time gatekeeper - created at JIMINY_READY, re-validates exact-head merge gates on live heads, merges in dependency order, verifies integration
-- `$checkpoint` — compaction - continues long-running work in a fresh Codex thread with the context the successor needs
-- Context refs — stable instructions and artifacts are exact-byte SHA-256 references, so unchanged content is not repeatedly loaded into task context
-- State safety — process-locked CAS updates, crash-recoverable continuation journals, atomic graph/ledger transitions, and coordinator-bound Jiminy runners prevent competing authoritative state
-- Supervision — mechanical liveness and pressure detection: hooks stamp heartbeats, measurable context/state pressure drives proactive checkpoints, and Gepetto owns every restart
+## Paths
 
-<h2 align="center">Thread-driven agent graph</h2>
+| Path | Use | Flow |
+| --- | --- | --- |
+| Ordinary | small, local, low-risk work | coordinator → result |
+| Durable | branch, PR, handoff, external effect, or meaningful risk | coordinator → Implement → Review Gate → explicit delivery authority |
+| Complex | approved dependent lanes | coordinator → Orchestrate → per-lane Implement/Review Gate |
 
-<p align="center">
-  Each stage runs in a dedicated Codex thread with a focused responsibility.
-</p>
+## Skills
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <strong>Gepetto</strong><br>
-      <sub>Coordinates delivery</sub>
-    </td>
-    <td align="center">→</td>
-    <td align="center">
-      <strong>Research</strong><br>
-      <sub>Defines the work</sub>
-    </td>
-    <td align="center">→</td>
-    <td align="center">
-      <strong>Pinocchio</strong><br>
-      <sub>Implements one leaf</sub>
-    </td>
-  </tr>
-  <tr>
-    <td></td>
-    <td></td>
-    <td colspan="3" align="center">↓</td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Complete</strong><br>
-      <sub>PR merged</sub>
-    </td>
-    <td align="center">←</td>
-    <td align="center">
-      <strong>Jiminy</strong><br>
-      <sub>Merges at JIMINY_READY</sub>
-    </td>
-    <td align="center">←</td>
-    <td align="center">
-      <strong>Review</strong><br>
-      <sub>Validates the exact head</sub>
-    </td>
-  </tr>
-</table>
+- `gepetto`: optional, read-only issue/lane research and recommendation.
+- `implement`: sole writer for one approved durable task.
+- `review-gate`: independent, read-only exact-head review and delivery gate.
+- `checkpoint`: atomic durable handoff.
+- `orchestrate`: optional approved complex-lane coordination.
 
-<p align="center">
-  <sub>
-    The reviewer collects all findings, runs one fixer pass, then re-reviews the changed delta.
-  </sub>
-</p>
+The coordinator/user approves scope, revisions, stops, and every external delivery. Skill invocation is not authority. A delivery action needs an explicit current authority record bound to repository, PR, and head.
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <strong>Checkpoint</strong><br>
-      <sub>
-        Continues any active role in a fresh Codex thread after compaction.
-      </sub>
-    </td>
-  </tr>
-</table>
+## Safety kernel
 
-<p>
-  Gepetto researches single-leaf scope inline and launches dedicated research,
-  implementation, and review threads otherwise, supplying each a focused contract
-  and routing structured results through the graph. Jiminy is created only at
-  JIMINY_READY to execute the merge set. The orchestration happens through active
-  Codex thread creation—not a background automation or CI pipeline.
-</p>
+The kernel records compact task contracts, writer ownership, receipts, proof, and authority. It uses locked compare-and-swap updates, atomic replacement, checkpoint recovery, and exact-head invalidation. Human-facing results are short receipts; canonical state remains local and machine-readable.
 
 ## Install
 
@@ -87,166 +30,12 @@ Four Codex skills for agent orchestration. Coordinated Codex threads in the desk
 npx @dylanmccavitt/skills@latest
 ```
 
-`bunx`, `pnpm dlx`, and `yarn dlx` work equally. Supports macOS and Linux;
-requires Node.js 18+ and Python 3. Installs the suite under
-`${CODEX_HOME:-$HOME/.codex}`, links all four skills into the Codex skills
-directory, and adds the orchestration hooks without removing existing hook
-entries. If `hooks.json` already exists, a timestamped backup is saved first.
-
-The installer refuses to replace unrelated skills, an unmanaged installation
-directory, or a symlinked hook configuration. Resolve the reported conflict and
-rerun. Restart Codex or begin a new task after installation. To update, rerun
-the same command.
-
-The registry coordinates tasks under one user account; it is not a security
-boundary against other processes running as that user.
-
-### Uninstall
-
-```sh
-npx @dylanmccavitt/skills@latest uninstall
-```
-
-Removes managed symlinks, the managed install directory, and managed hook entries.
-
-### Doctor
-
-```sh
-npx @dylanmccavitt/skills@latest doctor
-```
-
-Verifies the install; exits non-zero on problems.
+The installer adds only managed skills and hooks, preserves unrelated hooks, and refuses unmanaged replacement. Remove it with `npx @dylanmccavitt/skills@latest uninstall`.
 
 ## Development
-
-Run the complete test suite:
 
 ```sh
 npm test
 ```
 
-Inspect the files that will be published:
-
-```sh
-npm pack --dry-run
-```
-
-Validate the repository-only evaluation fixtures and deterministic protocol
-replay contracts:
-
-```sh
-python3 evaluation/validate.py
-python3 -m unittest discover -s evaluation -p "test_*.py"
-```
-
-The versioned baseline corpus defines frozen inputs and held-out graders.
-`evaluation/replay.py` replays a canonical trace against multiple exact local
-workflow refs without checkout, network access, or historical-code execution,
-emitting strict run-manifest, JSONL event, and result evidence.
-`evaluation/compare.py` validates complete comparable runs and deterministically
-renders one normalized comparison model as synchronized Markdown and static
-HTML. The checked-in four-ref dashboard describes deterministic protocol
-behavior only; it does not measure live-agent quality, cost, latency, model
-performance, production safety, rank workflows, or select a winner. See
-[`evaluation/README.md`](evaluation/README.md) for canonical-byte rules,
-supported workflow-v1 vocabulary, baseline regeneration, comparison semantics,
-and the trust boundary.
-
-### Releases
-
-Releases are tag-driven. A `vX.Y.Z` tag must point to a commit on `main` and
-must match the version in `package.json`. The release workflow tests and packs
-that exact commit, publishes it to npm through npm Trusted Publishing, and then
-creates the matching GitHub Release.
-
-The first publication needs a one-time bootstrap because the npm package does
-not exist yet:
-
-```sh
-npm login
-npm publish --access public
-npm trust github @dylanmccavitt/skills \
-  --file release.yml \
-  --repo dylanmccavitt/skills \
-  --allow-publish
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-Run those commands from an up-to-date, clean `main` branch after this workflow
-has been merged. The initial `npm publish` creates the package; the trust command
-authorizes only `.github/workflows/release.yml` to publish later versions. The
-`v0.1.0` workflow run will recognize the existing npm version and create its
-GitHub Release without publishing it twice.
-
-For subsequent releases, update the package version in a pull request:
-
-```sh
-npm version patch --no-git-tag-version
-```
-
-After that pull request is merged, update `main`, tag the merge commit using the
-same version, and push the tag:
-
-```sh
-git switch main
-git pull --ff-only origin main
-git tag vX.Y.Z
-git push origin vX.Y.Z
-```
-
-Pushing the tag is the public release action. Do not reuse or move a published
-release tag; publish a new package version instead.
-
-The machine-readable delivery graph at
-`gepetto/references/workflow.json` records task flow, guards, invalidation
-routes, and terminal states. Validate it directly with:
-
-```sh
-python3 hooks/orchestration_graph.py
-```
-
-New registry records carry an explicit lifecycle/schema version. Registration
-and continuation begin with a `pending` heartbeat observation; a lane is not
-called stale merely because no supported hook has run yet. Each later heartbeat
-names the observed hook event, source, collector, and timestamp. This proves
-only that the hook was observed at that time, not uninterrupted process
-execution between observations.
-
-The watchdog reports evidence-specific states: `healthy-current`,
-`stale-current`, `recycle-current`, `legacy-unknown`, `completed-ignored`,
-`over-budget`, and `invalid`. Legacy records remain unknown rather than being
-treated as live, stale, complete, or token-consuming. Pressure samples include
-source, collector, context-window identity, validation state, and timestamp.
-Missing samples are `unavailable`, expired samples are `measured-expired`, and
-neither is presented as measured context. The event counter is a separate
-compatibility heuristic and never becomes measured pressure. The 80% context
-checkpoint threshold is unchanged.
-
-Check current records with:
-
-```sh
-python3 hooks/orchestration_watchdog.py check
-```
-
-Inventory lifecycle, heartbeat, pressure, and content-based runtime
-compatibility without exposing stored packets or prompts:
-
-```sh
-python3 hooks/orchestration_watchdog.py audit --json
-```
-
-Reconciliation is intentionally dry-run-only. It preserves legacy records
-byte-for-byte and reports which records need manual evidence:
-
-```sh
-python3 hooks/orchestration_watchdog.py reconcile --dry-run --json
-```
-
-These commands inspect the selected `CODEX_ORCHESTRATION_STATE_DIR`; they do not
-install hooks, change active Codex configuration, delete records, or infer
-historical liveness or spending.
-
-## License
-
-[MIT](LICENSE)
+The tests cover writer conflicts, review independence, exact-head delivery authority, proof invalidation, and package installation.

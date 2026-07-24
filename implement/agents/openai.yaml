@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement"
+  short_description: "Implement one approved task"
+  default_prompt: "Use $implement to deliver this approved task as its sole writer."

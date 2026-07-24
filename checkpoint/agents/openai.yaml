@@ -1,4 +1,4 @@
 interface:
   display_name: "Checkpoint"
-  short_description: "Continue compacted work without archiving"
-  default_prompt: "Use $checkpoint to continue this task in a fresh, correctly named Codex task without archiving either task."
+  short_description: "Transfer a durable task safely"
+  default_prompt: "Use $checkpoint to preserve one task's owner, proof, authority limits, and exact next action in a confirmed successor."

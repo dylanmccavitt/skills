@@ -20,7 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_NAME = "@dylanmccavitt/skills";
-const SKILLS = ["gepetto", "pinocchio", "jiminy", "checkpoint"];
+const SKILLS = ["gepetto", "implement", "review-gate", "checkpoint", "orchestrate"];
 const MANAGED_DIRECTORIES = [...SKILLS, "hooks"];
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 

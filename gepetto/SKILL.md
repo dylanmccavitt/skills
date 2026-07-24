@@ -1,48 +1,16 @@
 ---
 name: gepetto
-description: Coordinate tracked repository work through research, Pinocchio implementation, review, and Jiminy merge tasks. Use only when the user invokes Gepetto or explicitly requests this orchestration.
+description: Research one user-approved repository issue or lane and return a concise recommendation. Never use for implementation or delivery.
 ---
 
-# Gepetto
+# Geppetto
 
-Remain the sole delivery coordinator. Never become an automation, implement code, review PRs, or merge.
+Role: read-only investigator.
 
-Read [references/protocol.md](references/protocol.md) and validate its machine-readable [references/workflow.json](references/workflow.json) before dispatching a task. Use its prompts, registration commands, packet schemas, graph transitions, and gates exactly. The graph records the flow; it never replaces active task coordination.
+Input: one issue or lane named by the coordinator/user.
 
-## Invariants
+Allowed: inspect repository, issue, PR, tests, and risks; recommend ordinary, durable, or complex handling.
 
-- Refresh Git, GitHub, task state, and the current head before decisions. Content-bind repository instructions; reload them only when their exact-byte digest changes.
-- Run the watchdog check when refreshing task state; route a stale lane through `LANE_UNRESPONSIVE` (checkpoint-replace the lane task with `continue --supervised`), a lane over its restart budget through `RESTART_BUDGET_EXCEEDED` into `needs_decision`, and proactively checkpoint a lane flagged `recycle`.
-- Run research → approved leaf map → Pinocchio → review → Jiminy.
-- Use one app task per lane and reuse matching live tasks.
-- Keep one writer per branch and worktree.
-- Treat a packet as actionable when its stated head SHA matches the live head. Refresh persisted artifact digests when assembling `JIMINY_READY` or on a drift event; reload full content only when a digest changed.
-- Bind implementation, review, CI, and merge readiness to the live PR head SHA.
-- Treat `CHECKPOINT_CONTINUATION` as task-ID replacement, never a new lane.
-- Keep blocked lanes separate from validated work.
-- Route material contract changes back through research, material base changes back through Pinocchio, and post-proof head changes through fresh review.
-- Preserve the current node as `resume_node` whenever a lane enters `blocked` or `needs_decision`.
+Forbidden: edit files, create/split issues, dispatch agents, claim ownership, restart work, accept reports, or grant authority.
 
-## Start
-
-1. Resolve repository, issues, completion scope, merge authority, project ID, this task's exact ID, and canonical title.
-2. Rename this task `<Project> - Gepetto - <issue or subject>`.
-3. Register this task as `gepetto` with the protocol command.
-4. Reuse matching tasks. Persist the ledger with the protocol `ledger set` command after registering each lane and after each accepted packet or node change.
-
-Delivery authority includes issue persistence and Jiminy merge authority unless the user explicitly requests analysis-only, review-only, review-ready PRs, monitoring-only, or no merge.
-
-## Dispatch
-
-1. Fast path: when scope is plausibly one leaf with a keep decision, research inline in this task (hooks keep Gepetto code-read-only) and persist the same gepetto-research artifact. Create dedicated research tasks only for multi-issue scope or a likely split/consolidate; register every returned task ID before waiting. Children verify rather than re-register.
-2. Accept a `RESEARCH_PACKET` when its artifact status is `persisted` (analysis-only runs: a verified temporary Markdown artifact). Approve the leaf map only when all required research gates pass.
-3. Create one Pinocchio worktree task per approved leaf; register it as `implementation` and accept its `IMPLEMENTATION_PACKET` when the live PR head equals its `pr_head_sha`.
-4. Create one reviewer worktree task per verified PR; register it and accept its final `REVIEW_PACKET` when `ready_for_jiminy` is true and `reviewed_head_sha` matches the live head.
-5. Correct drift through the owning task. Replace a task only when unusable.
-6. Stop a review/fix cycle at the workflow policy limit and enter `needs_decision`; never silently reset its counter.
-
-## Complete
-
-Refresh each persisted artifact digest while assembling `JIMINY_READY`; reload full content only when the bound digest changed. Only now create or reuse one Jiminy task and authoritatively register it (merge-authorized when granted). Bind every ready review lane's transition into `merge` to that registered Jiminy task with the protocol's `--runner-session-id`, then send the task one `JIMINY_READY` packet using the protocol schema. Pass the same live runner ID on every later Jiminy-owned graph transition. Stay available for remediation. A merge is not completion: wait for Jiminy to verify the expected merges and required checks on the refreshed default branch. On `JIMINY_INTEGRATION_FAILED`, create an approved remediation leaf and send it through the same research → Pinocchio → review → Jiminy flow. On `JIMINY_COMPLETE`, verify live PR and linked-issue state, mark this task complete with the protocol command, and finish with clickable PR links, states, merge commits, or exact blockers.
-
-On a lane checkpoint, transfer the ledger entry with `ledger move`; use `ledger set` only for ordinary state changes. Notify Jiminy only if a Jiminy task is live, and resume after any live Jiminy acknowledges the successor.
+Output: a short receipt with facts found, recommended scope, non-goals, risks, and `proceed | revise | stop` decision needed from the coordinator/user.

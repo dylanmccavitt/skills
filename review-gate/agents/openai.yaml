@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Gate"
+  short_description: "Independently review one exact head"
+  default_prompt: "Use $review-gate to independently review this implementation head."

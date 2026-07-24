@@ -25,7 +25,7 @@ test("installs all skills and preserves existing hooks", () => {
   const result = installSuite({ codexHome, sourceRoot: repositoryRoot });
 
   assert.equal(result.codexHome, codexHome);
-  for (const skill of ["gepetto", "pinocchio", "jiminy", "checkpoint"]) {
+  for (const skill of ["gepetto", "implement", "review-gate", "checkpoint", "orchestrate"]) {
     const path = join(codexHome, "skills", skill);
     assert.equal(lstatSync(path).isSymbolicLink(), true);
     assert.equal(existsSync(join(path, "SKILL.md")), true);
@@ -33,16 +33,8 @@ test("installs all skills and preserves existing hooks", () => {
   const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
   assert.equal(hooks.custom, true);
   assert.equal(hooks.hooks.Stop[0].hooks[0].command, "existing");
-  assert.equal(hooks.hooks.Stop.length, 2);
-  const command = hooks.hooks.SessionStart[0].hooks[0].command;
-  const hook = spawnSync(command, {
-    shell: true,
-    env: { ...process.env, CODEX_HOME: codexHome },
-    input: '{"session_id":"unregistered","hook_event_name":"SessionStart","source":"compact"}',
-    encoding: "utf8",
-  });
-  assert.equal(hook.status, 0, hook.stderr);
-  assert.equal(hook.stdout, "");
+  assert.equal(hooks.hooks.Stop.length, 1);
+  assert.equal(hooks.hooks.SessionStart, undefined);
   assert.equal(
     readdirSync(codexHome).some((name) => name.startsWith("hooks.json.backup-")),
     true,
@@ -60,7 +52,7 @@ test("runs through an npm-style binary symlink", () => {
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Installed gepetto, pinocchio, jiminy, checkpoint/);
+  assert.match(result.stdout, /Installed gepetto, implement, review-gate, checkpoint, orchestrate/);
 });
 
 test("repeated installation is idempotent", () => {
@@ -103,15 +95,13 @@ test("uninstall removes managed pieces and preserves foreign entries", () => {
   const result = uninstallSuite({ codexHome, sourceRoot: repositoryRoot });
 
   assert.equal(result.removed.length > 0, true);
-  for (const skill of ["gepetto", "pinocchio", "jiminy", "checkpoint"]) {
+  for (const skill of ["gepetto", "implement", "review-gate", "checkpoint", "orchestrate"]) {
     assert.equal(existsSync(join(codexHome, "skills", skill)), false);
   }
   assert.equal(lstatSync(foreignLink).isSymbolicLink(), true);
   assert.equal(existsSync(join(codexHome, "orchestration-skills")), false);
   const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
   assert.deepEqual(hooks.hooks.Stop, [{ hooks: [{ type: "command", command: "existing" }] }]);
-  assert.equal(hooks.hooks.SessionStart, undefined);
-  assert.equal(hooks.hooks.PreToolUse, undefined);
 });
 
 test("uninstall on an empty home is a no-op", () => {
@@ -144,8 +134,8 @@ test("doctor reports tampered installs and missing installs", () => {
   assert.equal(missing.problems.length > 0, true);
 
   installSuite({ codexHome, sourceRoot: repositoryRoot });
-  writeFileSync(join(codexHome, "hooks.json"), "{\"hooks\":{}}\n");
+  writeFileSync(join(codexHome, "orchestration-skills", ".codex-orchestration-install.json"), "tampered\n");
   const tampered = doctorSuite({ codexHome, sourceRoot: repositoryRoot });
   assert.equal(tampered.ok, false);
-  assert.equal(tampered.problems.some((problem) => problem.includes("hook entr")), true);
+  assert.equal(tampered.problems.some((problem) => problem.includes("marker")), true);
 });
